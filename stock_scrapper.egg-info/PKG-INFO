@@ -1,0 +1,83 @@
+Metadata-Version: 2.4
+Name: stock-scrapper
+Version: 0.1.0
+Summary: A local Phase 1 stock data foundation and reporting tool
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: pandas>=2.2.0
+Requires-Dist: yfinance>=0.2.0
+Requires-Dist: PyYAML>=6.0.2
+Requires-Dist: plotly>=5.18.0
+Requires-Dist: pytest>=8.0.0
+
+# Stock Scrapper
+
+Stock Scrapper is a local Python application for collecting daily market data, storing it in SQLite, validating records, calculating a small set of transparent indicators, and generating CSV and HTML reports.
+
+## What it does now
+
+- Downloads daily historical price data with yfinance
+- Stores data locally in SQLite
+- Updates only missing data on later runs
+- Validates new rows and records issues
+- Calculates returns, moving averages, volatility, drawdown, and status flags
+- Generates CSV and HTML reports
+
+## What it does not do yet
+
+- Machine learning
+- News sentiment analysis
+- Automatic trading
+- Real-money brokerage integration
+- Intraday data collection
+
+## Project structure
+
+- main.py: CLI entry point
+- config/: settings and watchlist
+- stock_scrapper/: application modules
+- data/: database and local data directories
+- reports/: generated reports
+- logs/: log files
+- tests/: pytest tests
+
+## Windows setup
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+## Running the app
+
+```powershell
+python main.py run
+python main.py update
+python main.py report
+python main.py validate
+python main.py status
+```
+
+## Watchlist
+
+The watchlist is stored in config/watchlist.csv and can be edited with any text editor or spreadsheet tool.
+
+## Database
+
+The SQLite database is stored at data/market.db.
+
+## Reports
+
+CSV and HTML reports are written to the reports/ directory.
+
+## Testing
+
+```powershell
+pytest
+```
+
+## Disclaimer
+
+This project is for educational and research purposes only. It is not financial advice.

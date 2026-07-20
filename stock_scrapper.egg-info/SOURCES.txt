@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+stock_scrapper.egg-info/PKG-INFO
+stock_scrapper.egg-info/SOURCES.txt
+stock_scrapper.egg-info/dependency_links.txt
+stock_scrapper.egg-info/requires.txt
+stock_scrapper.egg-info/top_level.txt
+tests/test_config.py
+tests/test_database.py
+tests/test_indicators.py
+tests/test_validation.py
