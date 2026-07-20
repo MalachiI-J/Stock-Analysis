@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import yaml
+
+from stock_scrapper.analysis.engine import analyze_symbol, persist_analysis_results
 from stock_scrapper.collectors.yahoo_prices import YahooPriceCollector
 from stock_scrapper.config import load_config, load_watchlist
 from stock_scrapper.database import (
@@ -24,6 +27,15 @@ from stock_scrapper.processing.indicators import calculate_indicators, classify_
 from stock_scrapper.processing.validation import validate_price_records
 from stock_scrapper.reporting.report_builder import write_csv_report, write_html_report
 from stock_scrapper.utilities.logging_setup import setup_logging
+
+
+def load_scoring_rules(base_dir: Path) -> dict[str, Any]:
+    """Load the scoring rules configuration from YAML if present."""
+    rules_path = base_dir / "config" / "scoring_rules.yaml"
+    if not rules_path.exists():
+        return {}
+    with rules_path.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,6 +54,18 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Run an end-to-end update and report cycle")
     run_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
     run_parser.add_argument("--full-refresh", action="store_true", help="Refresh from the full historical lookback period")
+
+    analyze_parser = subparsers.add_parser("analyze", help="Run deterministic Phase 2 scoring and persistence")
+    analyze_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
+    analyze_parser.add_argument("--as-of-date", help="Optional as-of date (YYYY-MM-DD)")
+
+    explain_parser = subparsers.add_parser("explain", help="Print the explanation for each scored symbol")
+    explain_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
+    explain_parser.add_argument("--as-of-date", help="Optional as-of date (YYYY-MM-DD)")
+
+    scores_parser = subparsers.add_parser("scores", help="Print the scores for each analyzed symbol")
+    scores_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
+    scores_parser.add_argument("--as-of-date", help="Optional as-of date (YYYY-MM-DD)")
 
     subparsers.add_parser("validate", help="Run database-wide validation checks")
     subparsers.add_parser("status", help="Show project and database status")
@@ -183,6 +207,7 @@ def build_reports(
     report_date: str | None = None,
     successful_symbols: list[str] | None = None,
     failed_symbols: list[str] | None = None,
+    analysis_results: list[Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Generate CSV and HTML reports from the stored history."""
     initialize_database(config["database_path"])
@@ -209,6 +234,17 @@ def build_reports(
             metrics["status"] = status
             metrics["flags"] = flags
             metrics["history"] = history_rows
+            if analysis_results:
+                for result in analysis_results:
+                    if result.symbol == symbol:
+                        metrics["classification"] = result.classification
+                        metrics["risk_score"] = result.risk_score
+                        metrics["opportunity_score"] = result.opportunity_score
+                        metrics["confidence_score"] = result.confidence_score
+                        metrics["market_regime"] = result.market_regime
+                        metrics["primary_reason"] = result.primary_reason
+                        metrics["flags"] = flags + result.flags
+                        break
             report_rows.append(metrics)
     finally:
         conn.close()
@@ -229,6 +265,66 @@ def build_reports(
     )
     logger.info("Wrote reports to %s and %s", csv_path, html_path)
     return report_rows
+
+
+def run_analysis(config: dict[str, Any], logger: Any, base_dir: Path, symbols: list[str], as_of_date: str | None = None) -> list[Any]:
+    """Run the Phase 2 scoring workflow and persist the analysis results."""
+    initialize_database(config["database_path"])
+    conn = create_connection(config["database_path"])
+    rules = load_scoring_rules(base_dir)
+    benchmark_symbol = rules.get("benchmark_symbol", "SPY")
+    effective_as_of_date = as_of_date or date.today().strftime("%Y-%m-%d")
+    try:
+        benchmark_history = fetch_price_history(conn, benchmark_symbol)
+        quality_rows = conn.execute(
+            "SELECT symbol, trade_date, issue_type, severity, description, detected_time, resolved_status FROM data_quality_issues WHERE resolved_status = 0 ORDER BY detected_time DESC"
+        ).fetchall()
+        quality_issues = [dict(row) for row in quality_rows]
+        results: list[Any] = []
+        symbols_requested = [symbol.upper() for symbol in symbols]
+        symbols_analyzed: list[str] = []
+        symbols_blocked: list[str] = []
+        for symbol in symbols_requested:
+            history = fetch_price_history(conn, symbol)
+            symbol_issues = [issue for issue in quality_issues if issue.get("symbol") == symbol]
+            result = analyze_symbol(
+                symbol,
+                history,
+                benchmark_history,
+                symbol_issues,
+                as_of_date=effective_as_of_date,
+                rules=rules,
+                minimum_history_days=int(rules.get("minimum_history_days", 60)),
+                minimum_recent_days=int(rules.get("minimum_recent_days", 20)),
+            )
+            results.append(result)
+            if result.eligible_for_scoring:
+                symbols_analyzed.append(symbol)
+            else:
+                symbols_blocked.append(symbol)
+
+        analysis_run_id = f"analysis-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
+        persist_analysis_results(
+            conn,
+            analysis_run_id,
+            results,
+            effective_as_of_date,
+            None,
+            benchmark_symbol,
+            results[0].market_regime if results else "Insufficient Market Data",
+            results[0].market_regime_confidence if results else None,
+            symbols_requested,
+            symbols_analyzed,
+            symbols_blocked,
+            "completed",
+            rules.get("scoring_version", "phase2-v1"),
+            str(hash(str(rules))),
+        )
+        conn.commit()
+        logger.info("Analysis complete for %s symbols", len(results))
+        return results
+    finally:
+        conn.close()
 
 
 def show_status(config: dict[str, Any], logger: Any) -> None:
@@ -277,11 +373,30 @@ def main() -> int:
         build_reports(config, logger, symbols, report_date=getattr(args, "date", None))
         return 0
 
+    if args.command == "analyze":
+        results = run_analysis(config, logger, base_dir, symbols, as_of_date=getattr(args, "as_of_date", None))
+        for result in results:
+            print(f"{result.symbol}: {result.classification} | risk={result.risk_score} opportunity={result.opportunity_score} confidence={result.confidence_score}")
+        return 0
+
+    if args.command == "explain":
+        results = run_analysis(config, logger, base_dir, symbols, as_of_date=getattr(args, "as_of_date", None))
+        for result in results:
+            print(f"{result.symbol}: {result.primary_reason}")
+        return 0
+
+    if args.command == "scores":
+        results = run_analysis(config, logger, base_dir, symbols, as_of_date=getattr(args, "as_of_date", None))
+        for result in results:
+            print(f"{result.symbol}: risk={result.risk_score}, opportunity={result.opportunity_score}, confidence={result.confidence_score}, regime={result.market_regime}")
+        return 0
+
     if args.command == "run":
-        # The run command chains the update, validation, and reporting steps into one workflow.
+        # The run command chains the update, validation, analysis, and reporting steps into one workflow.
         successful, failed, _, _ = update_symbols(config, logger, symbols, full_refresh=getattr(args, "full_refresh", False))
         validate_database(config, logger)
-        build_reports(config, logger, symbols, successful_symbols=successful, failed_symbols=failed)
+        analysis_results = run_analysis(config, logger, base_dir, symbols)
+        build_reports(config, logger, symbols, successful_symbols=successful, failed_symbols=failed, analysis_results=analysis_results)
         return 0
 
     if args.command == "status":

@@ -7,12 +7,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from stock_scrapper.migrations.migration_manager import apply_migrations
+
 
 def initialize_database(db_path: str | Path) -> Path:
     """Create the SQLite database and all required tables."""
     # The schema is intentionally small and modular so more analytics tables can be added later.
     db_file = Path(db_path)
     db_file.parent.mkdir(parents=True, exist_ok=True)
+    apply_migrations(db_file)
     conn = sqlite3.connect(db_file)
     try:
         conn.execute(

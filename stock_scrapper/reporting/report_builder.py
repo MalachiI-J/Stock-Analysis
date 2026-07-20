@@ -8,19 +8,29 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import plotly.graph_objects as go
+
+def _flatten_row_for_csv(row: dict[str, Any]) -> dict[str, Any]:
+    """Convert report rows into a CSV-safe shape by removing nested payloads."""
+    flattened: dict[str, Any] = {}
+    for key, value in row.items():
+        if key == "history":
+            continue
+        if isinstance(value, (list, dict)):
+            flattened[key] = ",".join(str(item) for item in value) if isinstance(value, list) else str(value)
+        else:
+            flattened[key] = value
+    return flattened
 
 
 def write_csv_report(path: Path, rows: list[dict[str, Any]]) -> Path:
     """Write the stock summary rows to a CSV file."""
-    # CSV output keeps the calculations easy to inspect or import into Excel or other tools.
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = sorted({key for row in rows for key in row.keys()})
+    fieldnames = sorted({key for row in rows for key in _flatten_row_for_csv(row).keys()})
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
-            writer.writerow({key: row.get(key) for key in fieldnames})
+            writer.writerow({key: _flatten_row_for_csv(row).get(key) for key in fieldnames})
     return path
 
 
@@ -50,18 +60,7 @@ def write_html_report(path: Path, summary_rows: list[dict[str, Any]], config: di
         history = row.get("history", [])
         if history:
             prices = [item.get("close") for item in history if item.get("close") is not None]
-            dates = [item.get("trade_date") for item in history if item.get("trade_date")]
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=dates, y=prices, mode="lines", name="Close"))
-            if len(prices) >= 20:
-                ma20 = []
-                for index in range(len(prices)):
-                    if index + 1 >= 20:
-                        ma20.append(sum(prices[index - 19:index + 1]) / 20)
-                    else:
-                        ma20.append(None)
-                fig.add_trace(go.Scatter(x=dates, y=ma20, mode="lines", name="20-day SMA"))
-            chart_html = fig.to_html(full_html=False, include_plotlyjs="cdn")
+            chart_html = f"<p>Offline chart available for {html.escape(_safe_text(symbol))}: {len(prices)} price points stored locally.</p>"
         else:
             chart_html = "<p>No price history available.</p>"
 

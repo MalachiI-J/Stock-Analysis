@@ -1,0 +1,59 @@
+app_name: Stock Scrapper
+scoring_version: "phase2-v1"
+benchmark_symbol: SPY
+market_context_symbols:
+  - SPY
+  - QQQ
+  - IWM
+  - TLT
+  - GLD
+minimum_history_days: 60
+minimum_recent_days: 20
+risk_weights:
+  realized_volatility: 20
+  drawdown_risk: 20
+  downside_volatility: 15
+  atr_gap_risk: 10
+  beta_sensitivity: 10
+  trend_deterioration: 10
+  liquidity_risk: 5
+  market_regime_risk: 5
+  data_quality_risk: 5
+opportunity_weights:
+  long_term_trend: 25
+  momentum: 20
+  relative_strength: 20
+  trend_quality: 15
+  volume_participation: 10
+  breakout_positioning: 10
+confidence_weights:
+  history_completeness: 30
+  data_freshness: 20
+  data_quality: 20
+  benchmark_availability: 10
+  indicator_availability: 10
+  signal_agreement: 10
+score_thresholds:
+  strong_candidate: 75
+  candidate: 65
+  watch: 50
+  high_risk: 70
+  avoid: 30
+risk_level_thresholds:
+  low: 25
+  moderate: 45
+  elevated: 60
+  high: 75
+  very_high: 90
+market_regime_thresholds:
+  risk_on: 0.6
+  stress: 0.8
+  breadth_threshold: 0.5
+volatility_thresholds:
+  low: 0.2
+  elevated: 0.35
+  stress: 0.55
+liquidity_thresholds:
+  warning_volume_ratio: 0.5
+  warning_dollar_volume: 1000000
+material_change_threshold: 5.0
