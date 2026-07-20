@@ -1,0 +1,65 @@
+strategy_name: score_v1
+strategy_version: "1.0.0"
+benchmark: SPY
+initial_cash: 100000.0
+warm_up_days: 252
+start_date: 2022-07-20
+end_date: 2026-06-30
+signal_frequency: daily
+rebalancing_frequency: daily
+
+entry_thresholds:
+  classifications:
+    - Candidate
+    - Strong Candidate
+  minimum_opportunity_score: 65.0
+  minimum_average_dollar_volume: 1000000.0
+
+exit_thresholds:
+  classifications:
+    - Data Blocked
+    - Insufficient Data
+    - High Risk
+    - Avoid
+  minimum_opportunity_score: 50.0
+  minimum_confidence_score: 50.0
+  maximum_risk_score: 70.0
+  exit_below_sma200: true
+  exit_on_stress: true
+
+allowed_market_regimes:
+  - Risk-On
+  - Neutral
+minimum_confidence: 60.0
+maximum_risk: 70.0
+maximum_positions: 10
+maximum_position_weight: 0.15
+cash_reserve: 0.05
+fractional_shares: true
+position_sizing: equal_weight
+volatility_lookback_days: 20
+
+commission_basis_points: 1.0
+minimum_commission: 0.0
+slippage_basis_points: 5.0
+stop_loss: 0.10
+trailing_stop: 0.15
+profit_target: null
+maximum_holding_period: 252
+execution_timing: next_open
+
+final_liquidation:
+  enabled: true
+  timing: final_close
+  apply_costs: true
+
+risk_free_rate: 0.0
+annualization_factor: 252
+daily_bar_ambiguity_policy: adverse_first
+
+walk_forward:
+  warm_up_days: 252
+  development_days: 480
+  validation_days: 252
+  final_holdout_days: 252
+  step_days: 252

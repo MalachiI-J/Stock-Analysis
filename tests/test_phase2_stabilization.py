@@ -1,58 +1,43 @@
 import sqlite3
 from pathlib import Path
 
+import pytest
+import yaml
+
 from stock_scrapper.analysis.engine import analyze_symbol
+from stock_scrapper.analysis.opportunity_score import calculate_opportunity_score
 from stock_scrapper.analysis.scoring_config import validate_scoring_config
 from stock_scrapper.database import fetch_price_history, initialize_database, record_quality_issue
 
 
 def test_opportunity_configuration_validation_rejects_mismatches() -> None:
-    rules = {
-        "opportunity_weights": {
-            "momentum": 20,
-            "trend_strength": 20,
-            "relative_strength": 20,
-            "quality": 20,
-            "valuation": 20,
-            "market_regime_bonus": 0,
-        },
-        "risk_weights": {"realized_volatility": 20, "drawdown_risk": 20, "downside_volatility": 15, "atr_gap_risk": 10, "beta_sensitivity": 10, "trend_deterioration": 10, "liquidity_risk": 5, "market_regime_risk": 5, "data_quality_risk": 5},
-    }
+    rules = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "config" / "scoring_rules.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
     validate_scoring_config(rules)
 
     bad_rules = dict(rules)
-    bad_rules["opportunity_weights"] = {"momentum": 20, "trend_strength": 20, "relative_strength": 20, "quality": 20, "wrong_component": 20}
-    try:
-        validate_scoring_config(bad_rules)
-    except ValueError:
-        return
-    raise AssertionError("Expected validation to fail")
-
-
-def test_analyze_symbol_can_reach_candidate_thresholds() -> None:
-    history = [
-        {"trade_date": "2023-01-03", "close": 100.0, "adjusted_close": 100.0, "volume": 2000000},
-        {"trade_date": "2023-01-04", "close": 104.0, "adjusted_close": 104.0, "volume": 2200000},
-        {"trade_date": "2023-01-05", "close": 108.0, "adjusted_close": 108.0, "volume": 2500000},
-    ]
-    result = analyze_symbol(
-        "AAPL",
-        history,
-        history,
-        [],
-        as_of_date="2023-01-05",
-        rules={
-            "minimum_history_days": 3,
-            "market_regime_thresholds": {"breadth_threshold": 0.5},
-            "risk_weights": {"realized_volatility": 20, "drawdown_risk": 20, "downside_volatility": 15, "atr_gap_risk": 10, "beta_sensitivity": 10, "trend_deterioration": 10, "liquidity_risk": 5, "market_regime_risk": 5, "data_quality_risk": 5},
-            "opportunity_weights": {"momentum": 20, "trend_strength": 20, "relative_strength": 20, "quality": 20, "valuation": 20, "market_regime_bonus": 0},
-            "confidence_weights": {"history_completeness": 30, "data_freshness": 20, "data_quality": 20, "benchmark_availability": 10, "indicator_availability": 10, "signal_agreement": 10},
-            "score_thresholds": {"strong_candidate": 75, "candidate": 65, "watch": 50, "high_risk": 70, "avoid": 30},
-        },
-        minimum_history_days=3,
-        minimum_recent_days=2,
+    bad_rules["opportunity_weights"] = dict(rules["opportunity_weights"])
+    bad_rules["opportunity_weights"]["wrong_component"] = bad_rules["opportunity_weights"].pop(
+        "trend_quality"
     )
-    assert result.classification in {"Candidate", "Strong Candidate"}
+    with pytest.raises(ValueError):
+        validate_scoring_config(bad_rules)
+
+
+def test_canonical_opportunity_math_reaches_candidate_threshold() -> None:
+    rules = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "config" / "scoring_rules.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    metrics = {f"{name}_score": 70.0 for name in rules["opportunity_weights"]}
+    score, _, components, _ = calculate_opportunity_score(metrics, rules, "Neutral")
+    assert score == 70.0
+    assert rules["score_thresholds"]["candidate"] <= score
+    assert all(component["available"] for component in components.values())
 
 
 def test_fetch_price_history_honors_as_of_date(tmp_path: Path) -> None:

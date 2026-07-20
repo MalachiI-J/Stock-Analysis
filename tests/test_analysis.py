@@ -2,12 +2,14 @@ import csv
 import sqlite3
 from pathlib import Path
 
+import yaml
+
 from stock_scrapper.analysis.engine import analyze_symbol
 from stock_scrapper.database import initialize_database
 from stock_scrapper.reporting.report_builder import write_csv_report, write_html_report
 
 
-def test_symbol_analysis_returns_deterministic_scores() -> None:
+def test_symbol_analysis_preserves_unavailable_scores_for_short_history() -> None:
     history = [
         {"trade_date": "2023-01-03", "close": 100.0, "adjusted_close": 100.0, "volume": 1000},
         {"trade_date": "2023-01-04", "close": 101.0, "adjusted_close": 101.0, "volume": 1100},
@@ -24,21 +26,20 @@ def test_symbol_analysis_returns_deterministic_scores() -> None:
         benchmark_history,
         [],
         as_of_date="2023-01-05",
-        rules={
-            "minimum_history_days": 3,
-            "market_regime_thresholds": {"breadth_threshold": 0.5},
-            "risk_weights": {"realized_volatility": 20, "drawdown_risk": 20, "downside_volatility": 15, "atr_gap_risk": 10, "beta_sensitivity": 10, "trend_deterioration": 10, "liquidity_risk": 5, "market_regime_risk": 5, "data_quality_risk": 5},
-            "opportunity_weights": {"momentum": 20, "trend_strength": 20, "relative_strength": 20, "quality": 15, "valuation": 15, "market_regime_bonus": 10},
-        },
+        rules=yaml.safe_load(
+            (Path(__file__).resolve().parents[1] / "config" / "scoring_rules.yaml").read_text(
+                encoding="utf-8"
+            )
+        ),
         minimum_history_days=3,
         minimum_recent_days=2,
     )
 
-    assert result.eligible_for_scoring is True
-    assert result.risk_score is not None
-    assert result.opportunity_score is not None
+    assert result.eligible_for_scoring is False
+    assert result.risk_score is None
+    assert result.opportunity_score is None
     assert result.confidence_score is not None
-    assert result.classification in {"Candidate", "Watch", "Avoid", "Strong Candidate"}
+    assert result.classification == "Insufficient Data"
 
 
 def test_reports_are_written_without_history_payload_and_without_cdn(tmp_path: Path) -> None:

@@ -1,5 +1,6 @@
 pandas>=2.2.0
 yfinance>=0.2.0
 PyYAML>=6.0.2
-plotly>=5.18.0
+
+[dev]
 pytest>=8.0.0

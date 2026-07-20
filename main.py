@@ -1,207 +1,378 @@
-"""Command-line entry point for Stock Scrapper."""
+"""Command-line entry point for the local Stock Scrapper research system."""
 
 from __future__ import annotations
 
 import argparse
+import json
+import sqlite3
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from uuid import uuid4
 
 import yaml
 
-from stock_scrapper.analysis.engine import analyze_symbol, persist_analysis_results
-from stock_scrapper.backtesting.engine import run_backtest
+from stock_scrapper.analysis.repository import results_from_saved_run
+from stock_scrapper.analysis.scoring_config import validate_scoring_config
+from stock_scrapper.analysis.service import AnalysisBatch, AnalysisService
+from stock_scrapper.backtesting.config import BacktestConfig, load_backtesting_config
+from stock_scrapper.backtesting.engine import PortfolioBacktestResult, run_portfolio_backtest
+from stock_scrapper.backtesting.persistence import (
+    list_backtest_runs,
+    load_backtest,
+    persist_walk_forward,
+)
+from stock_scrapper.backtesting.reporting import write_backtest_reports
+from stock_scrapper.backtesting.walk_forward import (
+    InsufficientWalkForwardDataError,
+    WalkForwardExecutionResult,
+    run_walk_forward,
+)
 from stock_scrapper.collectors.yahoo_prices import YahooPriceCollector
 from stock_scrapper.config import load_config, load_watchlist
 from stock_scrapper.database import (
     create_connection,
     fetch_price_history,
+    fetch_quality_issues,
+    get_analysis_run,
+    get_latest_analysis_run,
     get_latest_trade_date,
     initialize_database,
     insert_collection_run,
+    list_analysis_runs,
+    quality_issue_fingerprint,
     record_quality_issue,
+    resolve_quality_issues_after_validation,
     upsert_price_history,
 )
-from stock_scrapper.processing.indicators import calculate_indicators, classify_status
+from stock_scrapper.exceptions import (
+    ExitCode,
+    InvalidConfigurationError,
+    InvalidDateError,
+    MissingDataError,
+    OperationFailedError,
+)
 from stock_scrapper.processing.validation import validate_price_records
-from stock_scrapper.reporting.report_builder import write_csv_report, write_html_report
+from stock_scrapper.reporting.report_builder import write_phase2_reports
+from stock_scrapper.utilities.hashing import canonical_json
 from stock_scrapper.utilities.logging_setup import setup_logging
 
 
 def load_scoring_rules(base_dir: Path) -> dict[str, Any]:
-    """Load the scoring rules configuration from YAML if present."""
+    """Load and strictly validate the canonical Phase 2 rules."""
     rules_path = base_dir / "config" / "scoring_rules.yaml"
     if not rules_path.exists():
-        return {}
-    with rules_path.open("r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle) or {}
+        raise InvalidConfigurationError(f"Scoring configuration is missing: {rules_path}")
+    try:
+        with rules_path.open("r", encoding="utf-8") as handle:
+            rules = yaml.safe_load(handle)
+        if not isinstance(rules, dict):
+            raise ValueError("scoring_rules.yaml must contain a mapping")
+        return validate_scoring_config(rules)
+    except (OSError, yaml.YAMLError, ValueError) as exc:
+        raise InvalidConfigurationError(str(exc)) from exc
+
+
+def _add_as_of_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--as-of-date",
+        "--date",
+        dest="as_of_date",
+        help="Inclusive analysis date (YYYY-MM-DD)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Create the CLI argument parser."""
-    parser = argparse.ArgumentParser(description="Stock Scrapper Phase 1")
+    """Create the complete Phase 1-3 CLI."""
+    parser = argparse.ArgumentParser(
+        description="Stock Scrapper: free, local market research and realistic portfolio backtesting"
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    update_parser = subparsers.add_parser("update", help="Collect and store missing market data")
+    update_parser = subparsers.add_parser("update", help="Collect and store missing daily data")
     update_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
-    update_parser.add_argument("--full-refresh", action="store_true", help="Refresh from the full historical lookback period")
+    update_parser.add_argument("--full-refresh", action="store_true")
 
-    report_parser = subparsers.add_parser("report", help="Generate reports using stored data")
+    report_parser = subparsers.add_parser("report", help="Generate an offline Phase 2 report")
     report_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
-    report_parser.add_argument("--date", help="Optional report date (YYYY-MM-DD)")
+    report_parser.add_argument("--date", help="Inclusive report date (YYYY-MM-DD)")
 
-    run_parser = subparsers.add_parser("run", help="Run an end-to-end update and report cycle")
+    run_parser = subparsers.add_parser("run", help="Update, validate, analyze, and report")
     run_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
-    run_parser.add_argument("--full-refresh", action="store_true", help="Refresh from the full historical lookback period")
+    run_parser.add_argument("--full-refresh", action="store_true")
 
-    analyze_parser = subparsers.add_parser("analyze", help="Run deterministic Phase 2 scoring and persistence")
+    analyze_parser = subparsers.add_parser("analyze", help="Run and save canonical Phase 2 analysis")
     analyze_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
-    analyze_parser.add_argument("--as-of-date", help="Optional as-of date (YYYY-MM-DD)")
+    _add_as_of_argument(analyze_parser)
 
-    explain_parser = subparsers.add_parser("explain", help="Print the explanation for each scored symbol")
+    scores_parser = subparsers.add_parser("scores", help="Read the latest saved scores")
+    scores_parser.add_argument("--symbols", nargs="+", help="Optional saved symbols")
+    scores_source = scores_parser.add_mutually_exclusive_group()
+    scores_source.add_argument("--run-id", help="Read one exact saved run")
+    scores_source.add_argument("--recalculate", action="store_true")
+    _add_as_of_argument(scores_parser)
+
+    explain_parser = subparsers.add_parser("explain", help="Explain saved symbol analysis")
+    explain_parser.add_argument("symbol", nargs="*", help="Symbol, e.g. AAPL")
     explain_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
-    explain_parser.add_argument("--as-of-date", help="Optional as-of date (YYYY-MM-DD)")
+    explain_source = explain_parser.add_mutually_exclusive_group()
+    explain_source.add_argument("--run-id", help="Read one exact saved run")
+    explain_source.add_argument("--recalculate", action="store_true")
+    _add_as_of_argument(explain_parser)
 
-    scores_parser = subparsers.add_parser("scores", help="Print the scores for each analyzed symbol")
-    scores_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
-    scores_parser.add_argument("--as-of-date", help="Optional as-of date (YYYY-MM-DD)")
+    subparsers.add_parser("analysis-list", help="List saved Phase 2 runs")
+    analysis_show = subparsers.add_parser("analysis-show", help="Show one saved Phase 2 run")
+    analysis_show.add_argument("--run-id", required=True)
 
-    backtest_parser = subparsers.add_parser("backtest", help="Run a lightweight deterministic Phase 3 backtest")
-    backtest_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
+    backtest = subparsers.add_parser("backtest", help="Run and save a score_v1 portfolio backtest")
+    backtest.add_argument("--strategy", choices=("score_v1",), default="score_v1")
+    backtest.add_argument("--symbols", nargs="+", help="Optional candidate universe")
+    backtest.add_argument("--start", help="Inclusive start date (YYYY-MM-DD)")
+    backtest.add_argument("--end", help="Inclusive end date (YYYY-MM-DD)")
+    backtest.add_argument("--initial-cash", type=float)
+    backtest.add_argument("--commission-bps", type=float)
+    backtest.add_argument("--slippage-bps", type=float)
+    backtest.add_argument("--update", action="store_true", help="Explicitly update data first")
 
-    subparsers.add_parser("validate", help="Run database-wide validation checks")
-    subparsers.add_parser("status", help="Show project and database status")
+    subparsers.add_parser("backtest-list", help="List saved portfolio backtests")
+    for command, help_text in (
+        ("backtest-show", "Show one saved portfolio backtest"),
+        ("backtest-report", "Generate offline reports for a saved backtest"),
+        ("backtest-compare", "Compare a saved backtest with SPY and cash"),
+    ):
+        child = subparsers.add_parser(command, help=help_text)
+        child.add_argument("--run-id", required=True)
+
+    walk = subparsers.add_parser("walk-forward", help="Run fixed-window strategy validation")
+    walk.add_argument("--strategy", choices=("score_v1",), default="score_v1")
+    walk.add_argument("--symbols", nargs="+", help="Optional candidate universe")
+    walk.add_argument("--start", help="First development date (YYYY-MM-DD)")
+    walk.add_argument("--end", help="Final holdout end date (YYYY-MM-DD)")
+
+    subparsers.add_parser("validate", help="Run complete database validation")
+    subparsers.add_parser("status", help="Show local database status")
     return parser
 
 
 def ensure_directories(config: dict[str, Any]) -> None:
-    """Create all required directories from the configuration."""
-    for directory_name in [
-        config["raw_data_dir"],
-        config["processed_data_dir"],
-        config["reports_dir"],
-        config["logs_dir"],
-    ]:
-        Path(directory_name).mkdir(parents=True, exist_ok=True)
+    """Create local output directories configured inside the project."""
+    for key in ("raw_data_dir", "processed_data_dir", "reports_dir", "logs_dir"):
+        Path(config[key]).mkdir(parents=True, exist_ok=True)
 
 
-def update_symbols(config: dict[str, Any], logger: Any, symbols: list[str], full_refresh: bool = False) -> tuple[list[str], list[str], int, int]:
-    """Collect missing data and write it to SQLite."""
-    # This loop intentionally isolates one symbol from the rest so a single network issue does not stop the whole run.
+def _validate_runtime_config(config: dict[str, Any]) -> None:
+    """Fail early when operational settings cannot be used safely."""
+    required_paths = (
+        "watchlist_path",
+        "database_path",
+        "raw_data_dir",
+        "processed_data_dir",
+        "reports_dir",
+        "logs_dir",
+    )
+    for key in required_paths:
+        if not isinstance(config.get(key), str) or not str(config[key]).strip():
+            raise ValueError(f"{key} must be a non-empty path")
+    lookback = config.get("historical_lookback_years")
+    retries = config.get("retry_count")
+    retry_delay = config.get("retry_delay_seconds")
+    if isinstance(lookback, bool) or not isinstance(lookback, int) or lookback <= 0:
+        raise ValueError("historical_lookback_years must be a positive integer")
+    if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+        raise ValueError("retry_count must be a nonnegative integer")
+    if (
+        isinstance(retry_delay, bool)
+        or not isinstance(retry_delay, (int, float))
+        or float(retry_delay) < 0
+    ):
+        raise ValueError("retry_delay_seconds must be a nonnegative number")
+
+
+def _parse_date(value: str | None, *, field: str, default: date | None = None) -> date:
+    if value is None:
+        if default is None:
+            raise InvalidDateError(f"{field} is required")
+        return default
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise InvalidDateError(f"{field} must use YYYY-MM-DD: {value}") from exc
+
+
+def _symbols_from_args(args: argparse.Namespace, watchlist: Sequence[str]) -> list[str]:
+    values: list[str] = []
+    if getattr(args, "symbol", None):
+        values.extend(args.symbol)
+    if getattr(args, "symbols", None):
+        values.extend(args.symbols)
+    if not values:
+        values.extend(watchlist)
+    return list(dict.fromkeys(str(symbol).strip().upper() for symbol in values if str(symbol).strip()))
+
+
+def update_symbols(
+    config: dict[str, Any],
+    logger: Any,
+    symbols: list[str],
+    full_refresh: bool = False,
+) -> tuple[list[str], list[str], int, int]:
+    """Collect daily bars and complete each symbol's quality-issue lifecycle."""
     initialize_database(config["database_path"])
     conn = create_connection(config["database_path"])
-    collector = YahooPriceCollector(max_retries=int(config.get("retry_count", 3)), retry_delay_seconds=float(config.get("retry_delay_seconds", 2)))
-
-    successful_symbols: list[str] = []
-    failed_symbols: list[str] = []
+    collector = YahooPriceCollector(
+        max_retries=int(config.get("retry_count", 3)),
+        retry_delay_seconds=float(config.get("retry_delay_seconds", 2)),
+        historical_lookback_years=int(config.get("historical_lookback_years", 5)),
+    )
+    successful: list[str] = []
+    failed: list[str] = []
     inserted_count = 0
     updated_count = 0
-    run_id = f"run-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
-    start_time = datetime.now(timezone.utc).isoformat()
-
+    run_id = f"collection-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
+    started_at = datetime.now(timezone.utc).isoformat()
     try:
         for symbol in symbols:
-            logger.info("Starting collection for %s", symbol)
             try:
-                start_date: date | None = None
-                if not full_refresh:
-                    latest_date = get_latest_trade_date(conn, symbol)
-                    if latest_date:
-                        start_date = datetime.strptime(latest_date, "%Y-%m-%d").date() + timedelta(days=1)
-
+                latest = None if full_refresh else get_latest_trade_date(conn, symbol)
+                start = date.fromisoformat(latest) + timedelta(days=1) if latest else None
                 frame = collector.collect(
                     symbol=symbol,
-                    start_date=start_date,
+                    start_date=start,
                     end_date=date.today(),
                     full_refresh=full_refresh,
                 )
-                if frame.empty:
-                    logger.info("No new rows returned for %s", symbol)
-                    successful_symbols.append(symbol)
-                    continue
-
-                rows = frame.to_dict(orient="records")
-                issues = validate_price_records(rows, symbol=symbol, now_date=date.today())
                 conn.execute("BEGIN")
                 try:
-                    for row in rows:
+                    symbol_inserted = 0
+                    symbol_updated = 0
+                    for row in frame.to_dict(orient="records"):
                         inserted, updated = upsert_price_history(conn, row)
-                        inserted_count += inserted
-                        updated_count += updated
+                        symbol_inserted += inserted
+                        symbol_updated += updated
+                    complete_history = fetch_price_history(conn, symbol)
+                    if not complete_history:
+                        raise MissingDataError(
+                            f"No stored or newly collected price history exists for {symbol}"
+                        )
+                    issues = validate_price_records(complete_history, symbol=symbol, now_date=date.today())
+                    fingerprints: list[str] = []
                     for issue in issues:
                         record_quality_issue(conn, issue)
+                        fingerprints.append(quality_issue_fingerprint(issue))
+                    resolve_quality_issues_after_validation(conn, symbol, fingerprints)
                     conn.commit()
-                except Exception:  # pragma: no cover - rollback path
+                    inserted_count += symbol_inserted
+                    updated_count += symbol_updated
+                except Exception:
                     conn.rollback()
                     raise
-
-                successful_symbols.append(symbol)
-                logger.info("Stored %s rows for %s", len(rows), symbol)
-            except Exception as exc:  # pragma: no cover - error handling path
-                failed_symbols.append(symbol)
-                logger.exception("Failed to collect %s: %s", symbol, exc)
-    except Exception as exc:  # pragma: no cover - fatal path
-        logger.exception("Collection run failed: %s", exc)
+                successful.append(symbol)
+                logger.info("Collection complete for %s: %s rows returned", symbol, len(frame))
+            except Exception as exc:  # network/provider isolation
+                failed.append(symbol)
+                logger.exception("Collection failed for %s: %s", symbol, exc)
+        status = "completed_with_errors" if failed and successful else ("failed" if failed else "completed")
         insert_collection_run(
             conn,
             {
                 "run_id": run_id,
-                "start_time": start_time,
+                "start_time": started_at,
                 "end_time": datetime.now(timezone.utc).isoformat(),
-                "status": "failed",
+                "status": status,
                 "symbols_requested": ",".join(symbols),
-                "symbols_updated": ",".join(successful_symbols),
-                "symbols_failed": ",".join(failed_symbols),
+                "symbols_updated": ",".join(successful),
+                "symbols_failed": ",".join(failed),
                 "records_inserted": inserted_count,
                 "records_updated": updated_count,
-                "error_summary": str(exc),
-            },
-        )
-        conn.commit()
-    else:
-        insert_collection_run(
-            conn,
-            {
-                "run_id": run_id,
-                "start_time": start_time,
-                "end_time": datetime.now(timezone.utc).isoformat(),
-                "status": "completed_with_errors" if failed_symbols else "completed",
-                "symbols_requested": ",".join(symbols),
-                "symbols_updated": ",".join(successful_symbols),
-                "symbols_failed": ",".join(failed_symbols),
-                "records_inserted": inserted_count,
-                "records_updated": updated_count,
-                "error_summary": "",
+                "error_summary": "Collection failed for: " + ",".join(failed) if failed else "",
             },
         )
         conn.commit()
     finally:
         conn.close()
-
-    return successful_symbols, failed_symbols, inserted_count, updated_count
+    return successful, failed, inserted_count, updated_count
 
 
 def validate_database(config: dict[str, Any], logger: Any) -> list[dict[str, Any]]:
-    """Validate every stored record and store issues in the database."""
+    """Completely validate stored histories, resolving issues no longer detected."""
     initialize_database(config["database_path"])
     conn = create_connection(config["database_path"])
-    issues: list[dict[str, Any]] = []
+    all_issues: list[dict[str, Any]] = []
     try:
-        symbols = load_watchlist(config["watchlist_path"])
-        for symbol in symbols:
+        for symbol in load_watchlist(config["watchlist_path"]):
             history = fetch_price_history(conn, symbol)
-            if not history:
-                continue
-            batch_issues = validate_price_records(history, symbol=symbol, now_date=date.today())
-            for issue in batch_issues:
+            if history:
+                detected = validate_price_records(history, symbol=symbol, now_date=date.today())
+            else:
+                detected = [
+                    {
+                        "symbol": symbol,
+                        "trade_date": None,
+                        "issue_type": "missing_history",
+                        "severity": "critical",
+                        "description": "No stored price history exists for the configured symbol",
+                        "detected_time": datetime.now(timezone.utc).isoformat(),
+                    }
+                ]
+            fingerprints: list[str] = []
+            for issue in detected:
                 record_quality_issue(conn, issue)
-                issues.append(issue)
+                fingerprints.append(quality_issue_fingerprint(issue))
+                all_issues.append(issue)
+            resolve_quality_issues_after_validation(conn, symbol, fingerprints)
         conn.commit()
+        logger.info("Validation complete: %s active detections", len(all_issues))
     finally:
         conn.close()
-    return issues
+    return all_issues
+
+
+def _analysis_batch(
+    config: dict[str, Any],
+    base_dir: Path,
+    symbols: Sequence[str],
+    as_of_date: date,
+    *,
+    persist: bool,
+) -> AnalysisBatch:
+    initialize_database(config["database_path"])
+    conn = create_connection(config["database_path"])
+    try:
+        service = AnalysisService(
+            conn,
+            load_scoring_rules(base_dir),
+            load_watchlist(config["watchlist_path"]),
+        )
+        return service.analyze_many_as_of(symbols, as_of_date, persist=persist)
+    finally:
+        conn.close()
+
+
+def run_analysis(
+    config: dict[str, Any],
+    logger: Any,
+    base_dir: Path,
+    symbols: list[str],
+    as_of_date: str | None = None,
+) -> list[Any]:
+    """Compatibility wrapper for a saved canonical analysis batch."""
+    effective = _parse_date(as_of_date, field="as-of date", default=date.today())
+    batch = _analysis_batch(config, base_dir, symbols, effective, persist=True)
+    logger.info("Analysis %s complete for %s symbols", batch.analysis_run_id, len(batch.results))
+    return batch.results
+
+
+def _previous_analysis(conn: sqlite3.Connection, as_of_date: str) -> list[Any]:
+    row = conn.execute(
+        "SELECT analysis_run_id FROM analysis_runs WHERE status = 'completed' AND as_of_date < ? "
+        "ORDER BY as_of_date DESC, COALESCE(completed_at, started_at) DESC LIMIT 1",
+        (as_of_date,),
+    ).fetchone()
+    if row is None:
+        return []
+    saved = get_analysis_run(conn, str(row["analysis_run_id"]))
+    return results_from_saved_run(saved) if saved else []
 
 
 def build_reports(
@@ -213,221 +384,609 @@ def build_reports(
     failed_symbols: list[str] | None = None,
     analysis_results: list[Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Generate CSV and HTML reports from the stored history."""
-    initialize_database(config["database_path"])
-    conn = create_connection(config["database_path"])
-    report_rows: list[dict[str, Any]] = []
-    quality_issues: list[dict[str, Any]] = []
-    try:
-        cursor = conn.execute("SELECT symbol, trade_date, issue_type, severity, description FROM data_quality_issues ORDER BY detected_time DESC")
-        quality_issues = [dict(row) for row in cursor.fetchall()]
-        for symbol in symbols:
-            history = fetch_price_history(conn, symbol)
-            history_rows = [
-                {
-                    "trade_date": row.get("trade_date"),
-                    "close": row.get("close"),
-                    "adjusted_close": row.get("adjusted_close"),
-                    "volume": row.get("volume"),
-                }
-                for row in history
-            ]
-            metrics = calculate_indicators(history_rows, symbol)
-            status, flags = classify_status(metrics, has_quality_warning=any(issue.get("symbol") == symbol for issue in quality_issues))
-            metrics["symbol"] = symbol
-            metrics["status"] = status
-            metrics["flags"] = flags
-            metrics["history"] = history_rows
-            if analysis_results:
-                for result in analysis_results:
-                    if result.symbol == symbol:
-                        metrics["classification"] = result.classification
-                        metrics["risk_score"] = result.risk_score
-                        metrics["opportunity_score"] = result.opportunity_score
-                        metrics["confidence_score"] = result.confidence_score
-                        metrics["market_regime"] = result.market_regime
-                        metrics["primary_reason"] = result.primary_reason
-                        metrics["flags"] = flags + result.flags
-                        break
-            report_rows.append(metrics)
-    finally:
-        conn.close()
-
-    report_name = f"stock_summary_{report_date or date.today().strftime('%Y-%m-%d')}.csv"
-    html_name = f"stock_summary_{report_date or date.today().strftime('%Y-%m-%d')}.html"
-    csv_path = Path(config["reports_dir"]) / report_name
-    html_path = Path(config["reports_dir"]) / html_name
-    write_csv_report(csv_path, report_rows)
-    write_html_report(
-        html_path,
-        report_rows,
-        config,
-        config.get("data_source", "yfinance"),
-        successful_symbols or [row["symbol"] for row in report_rows],
-        failed_symbols or [],
-        quality_issues,
-    )
-    logger.info("Wrote reports to %s and %s", csv_path, html_path)
-    return report_rows
-
-
-def run_analysis(config: dict[str, Any], logger: Any, base_dir: Path, symbols: list[str], as_of_date: str | None = None) -> list[Any]:
-    """Run the Phase 2 scoring workflow and persist the analysis results."""
-    initialize_database(config["database_path"])
-    conn = create_connection(config["database_path"])
-    rules = load_scoring_rules(base_dir)
-    benchmark_symbol = rules.get("benchmark_symbol", "SPY")
-    effective_as_of_date = as_of_date or date.today().strftime("%Y-%m-%d")
-    try:
-        benchmark_history = fetch_price_history(conn, benchmark_symbol)
-        quality_rows = conn.execute(
-            "SELECT symbol, trade_date, issue_type, severity, description, detected_time, resolved_status FROM data_quality_issues WHERE resolved_status = 0 ORDER BY detected_time DESC"
-        ).fetchall()
-        quality_issues = [dict(row) for row in quality_rows]
-        results: list[Any] = []
-        symbols_requested = [symbol.upper() for symbol in symbols]
-        symbols_analyzed: list[str] = []
-        symbols_blocked: list[str] = []
-        for symbol in symbols_requested:
-            history = fetch_price_history(conn, symbol)
-            symbol_issues = [issue for issue in quality_issues if issue.get("symbol") == symbol]
-            result = analyze_symbol(
-                symbol,
-                history,
-                benchmark_history,
-                symbol_issues,
-                as_of_date=effective_as_of_date,
-                rules=rules,
-                minimum_history_days=int(rules.get("minimum_history_days", 60)),
-                minimum_recent_days=int(rules.get("minimum_recent_days", 20)),
-            )
-            results.append(result)
-            if result.eligible_for_scoring:
-                symbols_analyzed.append(symbol)
-            else:
-                symbols_blocked.append(symbol)
-
-        analysis_run_id = f"analysis-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
-        persist_analysis_results(
-            conn,
-            analysis_run_id,
-            results,
-            effective_as_of_date,
-            None,
-            benchmark_symbol,
-            results[0].market_regime if results else "Insufficient Market Data",
-            results[0].market_regime_confidence if results else None,
-            symbols_requested,
-            symbols_analyzed,
-            symbols_blocked,
-            "completed",
-            rules.get("scoring_version", "phase2-v1"),
-            str(hash(str(rules))),
+    """Generate bounded, self-contained Phase 2 CSV and HTML reports."""
+    del successful_symbols, failed_symbols
+    effective = _parse_date(report_date, field="report date", default=date.today())
+    project_root = Path(config.get("base_dir", Path(__file__).resolve().parent))
+    if analysis_results is not None:
+        for result in analysis_results:
+            result_as_of = str(getattr(result, "as_of_date", ""))[:10]
+            data_through = str(getattr(result, "data_through_date", "") or "")[:10]
+            if result_as_of != effective.isoformat():
+                raise InvalidDateError(
+                    "Supplied analysis results do not match the requested report date"
+                )
+            if data_through and data_through > effective.isoformat():
+                raise InvalidDateError(
+                    "Supplied analysis results contain data after the requested report date"
+                )
+    batch = (
+        None
+        if analysis_results is not None
+        else _analysis_batch(
+            config,
+            project_root,
+            symbols,
+            effective,
+            persist=False,
         )
-        conn.commit()
-        logger.info("Analysis complete for %s symbols", len(results))
-        return results
-    finally:
-        conn.close()
-
-
-def run_backtests(config: dict[str, Any], logger: Any, symbols: list[str]) -> list[Any]:
-    """Run a simple deterministic backtest over the stored history for the requested symbols."""
+    )
+    results = analysis_results if analysis_results is not None else batch.results  # type: ignore[union-attr]
     initialize_database(config["database_path"])
     conn = create_connection(config["database_path"])
     try:
-        histories: dict[str, list[dict[str, Any]]] = {}
-        for symbol in symbols:
-            histories[symbol] = fetch_price_history(conn, symbol)
-        return run_backtest(symbols, histories)
+        histories = {
+            symbol: fetch_price_history(conn, symbol, end_date=effective) for symbol in symbols
+        }
+        issues = fetch_quality_issues(conn, unresolved_only=True, as_of_date=effective)
+        previous = _previous_analysis(conn, effective.isoformat())
+    finally:
+        conn.close()
+    if batch is None:
+        regime = results[0].market_regime if results else "Insufficient Market Data"
+        confidence = results[0].market_regime_confidence if results else None
+        reasons = results[0].market_regime_effects if results else []
+        rules = load_scoring_rules(project_root)
+        metadata = {
+            "as_of_date": effective.isoformat(),
+            "data_through_date": max(
+                (result.data_through_date for result in results if result.data_through_date),
+                default=None,
+            ),
+            "scoring_version": rules.get("scoring_version"),
+            "configuration_hash": AnalysisService(None, rules, symbols).configuration_hash,
+            "benchmark_symbol": rules.get("benchmark_symbol", "SPY"),
+            "market_regime": regime,
+            "market_regime_confidence": confidence,
+            "market_regime_reasons": reasons,
+        }
+    else:
+        rules = load_scoring_rules(project_root)
+        metadata = {
+            "as_of_date": batch.as_of_date,
+            "data_through_date": batch.data_through_date,
+            "scoring_version": rules.get("scoring_version"),
+            "configuration_hash": batch.configuration_hash,
+            "benchmark_symbol": rules.get("benchmark_symbol", "SPY"),
+            "market_regime": batch.market_context.regime,
+            "market_regime_confidence": batch.market_context.confidence,
+            "market_regime_reasons": batch.market_context.reasons,
+        }
+    paths = write_phase2_reports(
+        config["reports_dir"],
+        effective,
+        metadata,
+        results,
+        histories,
+        issues,
+        previous,
+    )
+    logger.info("Wrote Phase 2 reports: %s", paths)
+    return [result.__dict__ if hasattr(result, "__dict__") else dict(result) for result in results]
+def _load_saved_results(
+    config: dict[str, Any],
+    run_id: str | None,
+    required_symbols: Sequence[str] | None,
+) -> tuple[dict[str, Any], list[Any]]:
+    initialize_database(config["database_path"])
+    conn = create_connection(config["database_path"])
+    try:
+        saved = (
+            get_analysis_run(conn, run_id)
+            if run_id
+            else get_latest_analysis_run(conn, required_symbols)
+        )
+    finally:
+        conn.close()
+    if saved is None:
+        raise MissingDataError("No matching saved analysis run exists; use --recalculate")
+    results = results_from_saved_run(saved)
+    if required_symbols:
+        required = {symbol.upper() for symbol in required_symbols}
+        available = {result.symbol for result in results}
+        missing = sorted(required - available)
+        if missing:
+            raise MissingDataError(
+                "The saved analysis does not contain: " + ", ".join(missing)
+            )
+        results = [result for result in results if result.symbol in required]
+    if not results:
+        raise MissingDataError("The saved analysis does not contain the requested symbols")
+    return saved, results
+
+
+def _backtest_config(
+    base_dir: Path,
+    args: argparse.Namespace,
+) -> BacktestConfig:
+    try:
+        config = load_backtesting_config(base_dir / "config" / "backtesting_rules.yaml")
+        overrides: dict[str, Any] = {"strategy_name": args.strategy}
+        if getattr(args, "start", None):
+            overrides["start_date"] = _parse_date(args.start, field="start date")
+        if getattr(args, "end", None):
+            overrides["end_date"] = _parse_date(args.end, field="end date")
+        if getattr(args, "initial_cash", None) is not None:
+            overrides["initial_cash"] = args.initial_cash
+        if getattr(args, "commission_bps", None) is not None:
+            overrides["commission_basis_points"] = args.commission_bps
+        if getattr(args, "slippage_bps", None) is not None:
+            overrides["slippage_basis_points"] = args.slippage_bps
+        configured = config.with_overrides(**overrides)
+        if configured.start_date and configured.end_date and configured.start_date > configured.end_date:
+            raise InvalidDateError("Backtest start date is after end date")
+        return configured
+    except InvalidDateError:
+        raise
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        raise InvalidConfigurationError(str(exc)) from exc
+
+
+def _load_backtest_inputs(
+    conn: sqlite3.Connection,
+    config: dict[str, Any],
+    rules: dict[str, Any],
+    symbols: Sequence[str],
+    backtest_config: BacktestConfig,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
+    end = backtest_config.end_date or date.today()
+    watchlist = load_watchlist(config["watchlist_path"])
+    context = [str(value).upper() for value in rules.get("market_context_symbols", [])]
+    load_symbols = sorted(
+        set(watchlist) | set(symbols) | set(context) | {backtest_config.benchmark.upper()}
+    )
+    histories = {
+        symbol: fetch_price_history(conn, symbol, end_date=end) for symbol in load_symbols
+    }
+    benchmark = backtest_config.benchmark.upper()
+    benchmark_dates = [
+        str(row["trade_date"])[:10] for row in histories.get(benchmark, [])
+    ]
+    if not benchmark_dates:
+        raise MissingDataError(f"No stored benchmark history exists for {benchmark}")
+    start = backtest_config.start_date or date.fromisoformat(benchmark_dates[0])
+    requested_end = backtest_config.end_date or date.fromisoformat(benchmark_dates[-1])
+    if requested_end > date.fromisoformat(benchmark_dates[-1]):
+        raise MissingDataError(
+            f"Stored {benchmark} data ends on {benchmark_dates[-1]}, before the requested end date"
+        )
+    evaluation_dates = [
+        value for value in benchmark_dates if start.isoformat() <= value <= requested_end.isoformat()
+    ]
+    if not evaluation_dates:
+        raise MissingDataError("No benchmark sessions fall inside the requested backtest range")
+    missing = [
+        symbol
+        for symbol in symbols
+        if not any(
+            start.isoformat() <= str(row.get("trade_date", ""))[:10] <= requested_end.isoformat()
+            for row in histories.get(symbol, [])
+        )
+    ]
+    if missing:
+        raise MissingDataError(
+            "No stored price history in the requested range for: " + ", ".join(missing)
+        )
+    issues = fetch_quality_issues(conn, unresolved_only=False, as_of_date=end)
+    quality: dict[str, list[dict[str, Any]]] = {}
+    for issue in issues:
+        quality.setdefault(str(issue.get("symbol", "")).upper(), []).append(issue)
+    return histories, quality
+
+
+def run_backtests(
+    config: dict[str, Any],
+    logger: Any,
+    symbols: list[str],
+    *,
+    base_dir: Path | None = None,
+    backtest_config: BacktestConfig | None = None,
+) -> PortfolioBacktestResult:
+    """Run one persisted shared portfolio using only end-bounded local data."""
+    root = base_dir or Path(__file__).resolve().parent
+    rules = load_scoring_rules(root)
+    typed = backtest_config or load_backtesting_config(root / "config" / "backtesting_rules.yaml")
+    initialize_database(config["database_path"])
+    conn = create_connection(config["database_path"])
+    try:
+        histories, quality = _load_backtest_inputs(conn, config, rules, symbols, typed)
+        result = run_portfolio_backtest(
+            symbols,
+            histories,
+            rules,
+            typed,
+            quality_by_symbol=quality,
+            persist_conn=conn,
+        )
+        logger.info("Backtest %s persisted", result.run.run_id)
+        return result
     finally:
         conn.close()
 
 
 def show_status(config: dict[str, Any], logger: Any) -> None:
-    """Display basic database and run information."""
+    """Display database coverage and saved-run counts."""
     initialize_database(config["database_path"])
     conn = create_connection(config["database_path"])
     try:
-        count = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
-        issue_count = conn.execute("SELECT COUNT(*) FROM data_quality_issues").fetchone()[0]
-        run_count = conn.execute("SELECT COUNT(*) FROM collection_runs").fetchone()[0]
+        values = {
+            "price_rows": conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0],
+            "first_date": conn.execute("SELECT MIN(trade_date) FROM price_history").fetchone()[0],
+            "last_date": conn.execute("SELECT MAX(trade_date) FROM price_history").fetchone()[0],
+            "unresolved_issues": conn.execute("SELECT COUNT(*) FROM data_quality_issues WHERE resolved_status=0").fetchone()[0],
+            "collection_runs": conn.execute("SELECT COUNT(*) FROM collection_runs").fetchone()[0],
+            "analysis_runs": conn.execute("SELECT COUNT(*) FROM analysis_runs").fetchone()[0],
+            "backtest_runs": conn.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0],
+            "walk_forward_runs": conn.execute("SELECT COUNT(*) FROM walk_forward_runs").fetchone()[0],
+        }
         print(f"Database path: {config['database_path']}")
-        print(f"Stored price rows: {count}")
-        print(f"Stored quality issues: {issue_count}")
-        print(f"Collection runs: {run_count}")
+        print(f"Stored price rows: {values['price_rows']}")
+        print(f"Price coverage: {values['first_date']} through {values['last_date']}")
+        print(f"Unresolved quality issues: {values['unresolved_issues']}")
+        print(f"Collection runs: {values['collection_runs']}")
+        print(f"Analysis runs: {values['analysis_runs']}")
+        print(f"Backtest runs: {values['backtest_runs']}")
+        print(f"Walk-forward runs: {values['walk_forward_runs']}")
     finally:
         conn.close()
+    logger.info("Status complete")
 
 
-def main() -> int:
-    """Run the requested CLI command."""
+def _print_scores(results: Sequence[Any]) -> None:
+    for result in sorted(
+        results,
+        key=lambda item: (
+            -(item.opportunity_score if item.opportunity_score is not None else -1),
+            item.symbol,
+        ),
+    ):
+        print(
+            f"{result.symbol}: {result.classification} | risk={result.risk_score} "
+            f"opportunity={result.opportunity_score} confidence={result.confidence_score} "
+            f"regime={result.market_regime}"
+        )
+
+
+def _print_explanations(results: Sequence[Any]) -> None:
+    for result in sorted(results, key=lambda item: item.symbol):
+        print(f"{result.symbol}: {result.classification} — {result.primary_reason}")
+        if result.positive_factors:
+            print("  Positive factors: " + "; ".join(result.positive_factors))
+        if result.risk_factors:
+            print("  Risk factors: " + "; ".join(result.risk_factors))
+        if result.confidence_limitations:
+            print("  Confidence limitations: " + "; ".join(result.confidence_limitations))
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Execute one command and return a documented process exit code."""
     parser = build_parser()
-    args = parser.parse_args()
-
+    args = parser.parse_args(argv)
+    if (
+        args.command in {"scores", "explain"}
+        and getattr(args, "as_of_date", None)
+        and not args.recalculate
+    ):
+        parser.error("--as-of-date/--date requires --recalculate")
     base_dir = Path(__file__).resolve().parent
-    config = load_config(base_dir)
-    ensure_directories(config)
-    logger = setup_logging(config, run_id=datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"))
-    logger.info("Starting Stock Scrapper")
-    logger.info("Loaded configuration from %s", base_dir / "config" / "settings.yaml")
+    logger: Any = None
+    try:
+        try:
+            config = load_config(base_dir)
+            config["base_dir"] = str(base_dir)
+            _validate_runtime_config(config)
+            ensure_directories(config)
+            watchlist = load_watchlist(config["watchlist_path"])
+        except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
+            raise InvalidConfigurationError(str(exc)) from exc
+        logger = setup_logging(config, run_id=datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"))
+        logger.info("Starting Stock Scrapper")
+        symbols = _symbols_from_args(args, watchlist)
+        partial_update = False
 
-    symbols = load_watchlist(config["watchlist_path"]) if args.command not in {"status"} else load_watchlist(config["watchlist_path"])
-    if getattr(args, "symbols", None):
-        symbols = [symbol.upper() for symbol in args.symbols]
+        if args.command == "update":
+            successful, failed, inserted, updated = update_symbols(
+                config, logger, symbols, full_refresh=args.full_refresh
+            )
+            print(f"inserted={inserted} updated={updated} successful={len(successful)} failed={len(failed)}")
+            if failed and successful:
+                return int(ExitCode.PARTIAL_FAILURE)
+            if failed:
+                return int(ExitCode.OPERATION_FAILED)
+            return int(ExitCode.SUCCESS)
 
-    if args.command == "update":
-        successful, failed, inserted, updated = update_symbols(config, logger, symbols, full_refresh=getattr(args, "full_refresh", False))
-        logger.info("Update complete: inserted=%s updated=%s successful=%s failed=%s", inserted, updated, successful, failed)
-        return 0
+        if args.command == "validate":
+            issues = validate_database(config, logger)
+            print(f"Active detections: {len(issues)}")
+            return int(ExitCode.SUCCESS)
 
-    if args.command == "validate":
-        issues = validate_database(config, logger)
-        logger.info("Validation complete: %s issues found", len(issues))
-        return 0
+        if args.command == "analyze":
+            effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
+            batch = _analysis_batch(config, base_dir, symbols, effective, persist=True)
+            _print_scores(batch.results)
+            if not any(result.eligible_for_scoring for result in batch.results):
+                return int(ExitCode.MISSING_DATA)
+            return int(ExitCode.SUCCESS)
 
-    if args.command == "report":
-        build_reports(config, logger, symbols, report_date=getattr(args, "date", None))
-        return 0
+        if args.command in {"scores", "explain"}:
+            explicit = bool(getattr(args, "symbols", None) or getattr(args, "symbol", None))
+            if args.recalculate:
+                effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
+                batch = _analysis_batch(config, base_dir, symbols, effective, persist=True)
+                results = batch.results
+            else:
+                _, results = _load_saved_results(
+                    config,
+                    args.run_id,
+                    symbols if explicit else None,
+                )
+            if args.command == "scores":
+                _print_scores(results)
+            else:
+                _print_explanations(results)
+            return int(ExitCode.SUCCESS)
 
-    if args.command == "analyze":
-        results = run_analysis(config, logger, base_dir, symbols, as_of_date=getattr(args, "as_of_date", None))
-        for result in results:
-            print(f"{result.symbol}: {result.classification} | risk={result.risk_score} opportunity={result.opportunity_score} confidence={result.confidence_score}")
-        return 0
+        if args.command == "analysis-list":
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                runs = list_analysis_runs(conn)
+            finally:
+                conn.close()
+            for run in runs:
+                print(
+                    f"{run['analysis_run_id']} | {run['as_of_date']} | {run['status']} | "
+                    f"regime={run['market_regime']} | through={run['data_through_date']}"
+                )
+            return int(ExitCode.SUCCESS)
 
-    if args.command == "explain":
-        results = run_analysis(config, logger, base_dir, symbols, as_of_date=getattr(args, "as_of_date", None))
-        for result in results:
-            print(f"{result.symbol}: {result.primary_reason}")
-        return 0
+        if args.command == "analysis-show":
+            saved, results = _load_saved_results(config, args.run_id, None)
+            print(canonical_json({key: value for key, value in saved.items() if key not in {"analyses", "regime"}}))
+            _print_scores(results)
+            return int(ExitCode.SUCCESS)
 
-    if args.command == "scores":
-        results = run_analysis(config, logger, base_dir, symbols, as_of_date=getattr(args, "as_of_date", None))
-        for result in results:
-            print(f"{result.symbol}: risk={result.risk_score}, opportunity={result.opportunity_score}, confidence={result.confidence_score}, regime={result.market_regime}")
-        return 0
+        if args.command == "report":
+            effective = _parse_date(args.date, field="report date", default=date.today())
+            batch = _analysis_batch(config, base_dir, symbols, effective, persist=False)
+            scoring_rules = load_scoring_rules(base_dir)
+            conn = create_connection(config["database_path"])
+            try:
+                histories = {symbol: fetch_price_history(conn, symbol, end_date=effective) for symbol in symbols}
+                issues = fetch_quality_issues(conn, unresolved_only=True, as_of_date=effective)
+                previous = _previous_analysis(conn, effective.isoformat())
+            finally:
+                conn.close()
+            paths = write_phase2_reports(
+                config["reports_dir"],
+                effective,
+                {
+                    "as_of_date": batch.as_of_date,
+                    "data_through_date": batch.data_through_date,
+                    "scoring_version": scoring_rules.get("scoring_version"),
+                    "configuration_hash": batch.configuration_hash,
+                    "benchmark_symbol": scoring_rules.get("benchmark_symbol", "SPY"),
+                    "market_regime": batch.market_context.regime,
+                    "market_regime_confidence": batch.market_context.confidence,
+                    "market_regime_reasons": batch.market_context.reasons,
+                },
+                batch.results,
+                histories,
+                issues,
+                previous,
+            )
+            print(f"CSV: {paths['csv']}")
+            print(f"HTML: {paths['html']}")
+            return int(ExitCode.SUCCESS)
 
-    if args.command == "backtest":
-        results = run_backtests(config, logger, symbols)
-        for result in results:
-            print(f"{result.symbol}: total_return={result.total_return:.2%} trades={result.trade_count} win_rate={result.win_rate:.2%} final_value={result.final_value:.2f}")
-        return 0
+        if args.command == "backtest":
+            typed = _backtest_config(base_dir, args)
+            if args.update:
+                update_universe = sorted(set(symbols) | set(watchlist))
+                successful, failed, _, _ = update_symbols(config, logger, update_universe)
+                if failed and not successful:
+                    raise OperationFailedError("Explicit pre-backtest update failed for: " + ", ".join(failed))
+                partial_update = bool(failed)
+            result = run_backtests(
+                config,
+                logger,
+                symbols,
+                base_dir=base_dir,
+                backtest_config=typed,
+            )
+            assert result.metrics is not None
+            print(
+                f"{result.run.run_id}: return={result.metrics.total_return:.2%} "
+                f"ending_equity={result.metrics.ending_equity:.2f} "
+                f"trades={result.metrics.number_of_trades} sharpe={result.metrics.sharpe_ratio}"
+            )
+            return int(ExitCode.PARTIAL_FAILURE if partial_update else ExitCode.SUCCESS)
 
-    if args.command == "run":
-        # The run command chains the update, validation, analysis, and reporting steps into one workflow.
-        successful, failed, _, _ = update_symbols(config, logger, symbols, full_refresh=getattr(args, "full_refresh", False))
-        validate_database(config, logger)
-        analysis_results = run_analysis(config, logger, base_dir, symbols)
-        build_reports(config, logger, symbols, successful_symbols=successful, failed_symbols=failed, analysis_results=analysis_results)
-        return 0
+        if args.command == "backtest-list":
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                runs = list_backtest_runs(conn)
+            finally:
+                conn.close()
+            for run in runs:
+                print(
+                    f"{run['run_id']} | {run['strategy_name']} {run['strategy_version']} | "
+                    f"{run['start_date']}..{run['end_date']} | {run['status']} | equity={run['ending_equity']}"
+                )
+            return int(ExitCode.SUCCESS)
 
-    if args.command == "status":
-        show_status(config, logger)
-        return 0
+        if args.command in {"backtest-show", "backtest-report", "backtest-compare"}:
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                saved = load_backtest(conn, args.run_id)
+            finally:
+                conn.close()
+            if saved is None:
+                raise MissingDataError(f"Backtest run does not exist: {args.run_id}")
+            if args.command == "backtest-show":
+                print(json.dumps(saved, sort_keys=True, indent=2, default=str))
+            elif args.command == "backtest-report":
+                paths = write_backtest_reports(config["reports_dir"], saved)
+                for name, path in paths.items():
+                    print(f"{name}: {path}")
+            else:
+                metrics = saved.get("metrics", {})
+                print(f"Strategy total return: {metrics.get('total_return')}")
+                print(f"SPY buy-and-hold return: {metrics.get('benchmark_total_return')}")
+                print(f"Return versus SPY: {metrics.get('return_vs_benchmark')}")
+                print("Cash return: 0.0")
+                print(f"Drawdown versus SPY: {metrics.get('drawdown_vs_benchmark')}")
+            return int(ExitCode.SUCCESS)
 
-    parser.error("Unsupported command")
-    return 2
+        if args.command == "walk-forward":
+            typed = _backtest_config(base_dir, args)
+            rules = load_scoring_rules(base_dir)
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                histories, quality = _load_backtest_inputs(conn, config, rules, symbols, typed)
+                trading_dates = [
+                    row["trade_date"] for row in histories.get(typed.benchmark.upper(), [])
+                ]
+
+                def executor(window: Any, immutable_config: BacktestConfig) -> WalkForwardExecutionResult:
+                    window_config = immutable_config.with_overrides(
+                        start_date=window.evaluation_start_date,
+                        end_date=window.evaluation_end_date,
+                        warm_up_days=immutable_config.walk_forward.warm_up_days,
+                    )
+                    outcome = run_portfolio_backtest(
+                        symbols,
+                        histories,
+                        rules,
+                        window_config,
+                        quality_by_symbol=quality,
+                        persist_conn=conn,
+                        commit_persistence=False,
+                        run_id=f"backtest-{window.window_id}",
+                    )
+                    return WalkForwardExecutionResult(
+                        backtest_run_id=outcome.run.run_id,
+                        metrics=outcome.metrics,
+                    )
+
+                walk_forward_run_id = (
+                    "wf-"
+                    + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+                    + "-"
+                    + uuid4().hex[:8]
+                )
+                conn.execute("BEGIN")
+                try:
+                    walk_result = run_walk_forward(
+                        typed,
+                        trading_dates,
+                        executor,
+                        symbols=symbols,
+                        walk_forward_run_id=walk_forward_run_id,
+                    )
+                    walk_result.benchmark_symbol = typed.benchmark
+                    walk_result.symbols = list(symbols)
+                    walk_result.configuration_snapshot = typed.to_dict()
+                    persist_walk_forward(conn, walk_result)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+            finally:
+                conn.close()
+            print(f"{walk_result.walk_forward_run_id}: {walk_result.status}")
+            for window in walk_result.windows:
+                print(
+                    f"  {window.window_type}: {window.evaluation_start_date}.."
+                    f"{window.evaluation_end_date} status={window.status} backtest={window.backtest_run_id}"
+                )
+            failed_windows = sum(window.status == "failed" for window in walk_result.windows)
+            if failed_windows == len(walk_result.windows):
+                return int(ExitCode.OPERATION_FAILED)
+            if failed_windows:
+                return int(ExitCode.PARTIAL_FAILURE)
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "run":
+            successful, failed, _, _ = update_symbols(
+                config, logger, symbols, full_refresh=args.full_refresh
+            )
+            validate_database(config, logger)
+            batch = _analysis_batch(config, base_dir, symbols, date.today(), persist=True)
+            scoring_rules = load_scoring_rules(base_dir)
+            conn = create_connection(config["database_path"])
+            try:
+                histories = {
+                    symbol: fetch_price_history(conn, symbol, end_date=date.today())
+                    for symbol in symbols
+                }
+                issues = fetch_quality_issues(
+                    conn,
+                    unresolved_only=True,
+                    as_of_date=date.today(),
+                )
+                previous = _previous_analysis(conn, date.today().isoformat())
+            finally:
+                conn.close()
+            paths = write_phase2_reports(
+                config["reports_dir"],
+                date.today(),
+                {
+                    "analysis_run_id": batch.analysis_run_id,
+                    "as_of_date": batch.as_of_date,
+                    "data_through_date": batch.data_through_date,
+                    "scoring_version": scoring_rules.get("scoring_version"),
+                    "configuration_hash": batch.configuration_hash,
+                    "benchmark_symbol": scoring_rules.get("benchmark_symbol", "SPY"),
+                    "market_regime": batch.market_context.regime,
+                    "market_regime_confidence": batch.market_context.confidence,
+                    "market_regime_reasons": batch.market_context.reasons,
+                },
+                batch.results,
+                histories,
+                issues,
+                previous,
+            )
+            print(f"Reports: {paths}")
+            if failed and successful:
+                return int(ExitCode.PARTIAL_FAILURE)
+            if failed:
+                return int(ExitCode.OPERATION_FAILED)
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "status":
+            show_status(config, logger)
+            return int(ExitCode.SUCCESS)
+        parser.error("Unsupported command")
+        return int(ExitCode.INVALID_ARGUMENTS)
+    except InvalidDateError as exc:
+        print(f"Invalid date: {exc}", file=sys.stderr)
+        return int(ExitCode.INVALID_DATE)
+    except InvalidConfigurationError as exc:
+        print(f"Invalid configuration: {exc}", file=sys.stderr)
+        return int(ExitCode.INVALID_CONFIGURATION)
+    except MissingDataError as exc:
+        print(f"Missing data: {exc}", file=sys.stderr)
+        return int(ExitCode.MISSING_DATA)
+    except InsufficientWalkForwardDataError as exc:
+        print(f"Missing data: {exc}", file=sys.stderr)
+        return int(ExitCode.MISSING_DATA)
+    except sqlite3.Error as exc:
+        print(f"Database failure: {exc}", file=sys.stderr)
+        if logger:
+            logger.exception("Database failure")
+        return int(ExitCode.DATABASE_FAILURE)
+    except OperationFailedError as exc:
+        print(f"Operation failed: {exc}", file=sys.stderr)
+        return int(ExitCode.OPERATION_FAILED)
+    except Exception as exc:
+        print(f"Operation failed: {exc}", file=sys.stderr)
+        if logger:
+            logger.exception("Complete operation failure")
+        return int(ExitCode.OPERATION_FAILED)
 
 
 if __name__ == "__main__":
