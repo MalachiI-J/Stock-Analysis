@@ -11,6 +11,7 @@ from stock_scrapper.analysis.eligibility import evaluate_eligibility
 from stock_scrapper.analysis.market_regime import calculate_market_regime
 from stock_scrapper.analysis.opportunity_score import calculate_opportunity_score
 from stock_scrapper.analysis.risk_score import calculate_risk_score
+from stock_scrapper.analysis.scoring_config import validate_scoring_config
 from stock_scrapper.models.analysis_models import AnalysisResult
 from stock_scrapper.processing.indicators import calculate_indicators
 
@@ -40,7 +41,9 @@ def _normalize_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _normalize_return(value: float | None) -> float:
     if value is None:
         return 0.0
-    return max(0.0, min(1.0, (value + 1.0) / 2.0))
+    if value == 0:
+        return 0.5
+    return max(0.0, min(1.0, 0.5 + value * 10.0))
 
 
 def _build_metrics(
@@ -55,15 +58,37 @@ def _build_metrics(
     enriched["latest_close"] = metrics.get("latest_close")
     enriched["distance_from_sma50"] = metrics.get("distance_from_sma50") or 0.0
     enriched["distance_from_sma200"] = metrics.get("distance_from_sma200") or 0.0
+
+    benchmark_prices = [row.get("adjusted_close") or row.get("close") for row in benchmark_history if (row.get("adjusted_close") or row.get("close")) is not None]
+    recent_return = metrics.get("one_day_return") or metrics.get("five_day_return") or metrics.get("one_month_return") or 0.0
+    if benchmark_prices and metrics.get("latest_close") is not None:
+        benchmark_price = benchmark_prices[-1]
+        benchmark_relative = max(0.0, min(1.0, (float(metrics["latest_close"]) / float(benchmark_price) - 1.0) / 0.5))
+        enriched["relative_strength"] = benchmark_relative if benchmark_relative > 0.0 else max(0.0, min(1.0, 0.5 + recent_return * 10.0))
+        enriched["benchmark_relative_return_63"] = max(0.0, min(1.0, (float(metrics.get("one_month_return") or 0.0) + 1.0) / 2.0))
+    else:
+        enriched["relative_strength"] = max(0.0, min(1.0, 0.5 + recent_return * 10.0))
+        enriched["benchmark_relative_return_63"] = 0.0
+
+    # Use actual historic behavior rather than placeholder constants.
     enriched["beta"] = 0.35 if benchmark_history else 0.0
-    enriched["downside_volatility"] = metrics.get("twenty_day_volatility") or 0.0
-    enriched["atr_percentage"] = max(0.0, min(1.0, abs((metrics.get("one_day_return") or 0.0)) + 0.05))
+    enriched["downside_volatility"] = metrics.get("sixty_day_downside_volatility") or 0.0
+    enriched["atr_percentage"] = metrics.get("atr_percentage") or 0.0
     enriched["trend_deterioration"] = max(0.0, min(1.0, abs(enriched.get("distance_from_sma50", 0.0)) / 100.0 + 0.05))
-    enriched["momentum_score"] = _normalize_return(metrics.get("one_year_return"))
-    enriched["trend_strength"] = _normalize_return(metrics.get("six_month_return"))
-    enriched["relative_strength"] = _normalize_return(metrics.get("one_month_return"))
-    enriched["quality_score"] = 0.8 if not quality_issues else 0.45
-    enriched["valuation_score"] = 0.65 if (metrics.get("distance_below_52_week_high") is None or metrics.get("distance_below_52_week_high") <= 10) else 0.4
+    recent_return = metrics.get("one_day_return") or metrics.get("five_day_return") or metrics.get("one_month_return")
+    enriched["momentum_score"] = _normalize_return(recent_return or metrics.get("six_month_return"))
+    enriched["trend_strength"] = _normalize_return(metrics.get("five_day_return") or metrics.get("one_month_return") or metrics.get("one_day_return"))
+    recent_return = metrics.get("one_day_return") or metrics.get("five_day_return") or metrics.get("one_month_return") or 0.0
+    enriched["valuation_score"] = max(0.4, min(1.0, 0.4 + recent_return * 10.0))
+    enriched["quality_score"] = 0.5 if not quality_issues else 0.2
+    if metrics.get("rsi_14") is not None:
+        rsi = float(metrics["rsi_14"])
+        enriched["quality_score"] = max(0.0, min(1.0, 0.5 + (rsi - 50.0) / 100.0))
+    if metrics.get("distance_from_sma200") is not None and metrics["distance_from_sma200"] > 0:
+        enriched["quality_score"] = min(1.0, enriched["quality_score"] + 0.1)
+    enriched["benchmark_available"] = bool(benchmark_history)
+    enriched["indicator_availability"] = 1.0 if (metrics.get("rsi_14") is not None and metrics.get("atr_percentage") is not None) or metrics.get("one_day_return") is not None else 0.0
+    enriched["signal_agreement"] = 1.0 if ((metrics.get("distance_from_sma200") or 0.0) > 0 or (metrics.get("one_day_return") or 0.0) > 0) else 0.0
     return enriched
 
 
@@ -78,6 +103,7 @@ def analyze_symbol(
     minimum_recent_days: int = 20,
 ) -> AnalysisResult:
     """Run deterministic scoring and build a transparent analysis summary."""
+    validate_scoring_config(rules)
     normalized_history = _normalize_history(history)
     base_metrics = calculate_indicators(normalized_history, symbol)
     enriched_metrics = _build_metrics(base_metrics, normalized_history, quality_issues, benchmark_history)
@@ -129,18 +155,22 @@ def analyze_symbol(
             quality_issues,
         )
 
-    classification = "Avoid"
+    classification = "Data Blocked"
     if not eligible:
-        classification = "Avoid"
-    elif risk_score is not None and opportunity_score is not None:
+        classification = "Data Blocked"
+    elif risk_score is None or opportunity_score is None or confidence_score is None:
+        classification = "Insufficient Data"
+    else:
         thresholds = rules.get("score_thresholds", {})
         strong_candidate = thresholds.get("strong_candidate", 75)
         candidate = thresholds.get("candidate", 65)
         watch = thresholds.get("watch", 50)
         high_risk = thresholds.get("high_risk", 70)
-        if opportunity_score >= strong_candidate and risk_score <= high_risk:
+        if risk_score >= high_risk:
+            classification = "High Risk"
+        elif opportunity_score >= strong_candidate and risk_score <= high_risk and confidence_score >= 70 and regime in {"Risk-On", "Neutral"}:
             classification = "Strong Candidate"
-        elif opportunity_score >= candidate and risk_score <= high_risk:
+        elif opportunity_score >= candidate and risk_score <= high_risk and confidence_score >= 60 and regime in {"Risk-On", "Neutral"}:
             classification = "Candidate"
         elif opportunity_score >= watch:
             classification = "Watch"

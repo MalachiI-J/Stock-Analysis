@@ -6,7 +6,7 @@ from typing import Any
 
 
 def calculate_risk_score(metrics: dict[str, Any], rules: dict[str, Any], market_regime: str, quality_issues: list[dict[str, Any]]) -> tuple[float | None, str, dict[str, Any], list[str]]:
-    """Calculate a transparent risk score from 0 to 100."""
+    """Calculate a transparent risk score from 0 to 100 using actual market metrics."""
     if not metrics or metrics.get("latest_close") is None:
         return None, "Unavailable", {}, ["Missing price data"]
 
@@ -17,10 +17,10 @@ def calculate_risk_score(metrics: dict[str, Any], rules: dict[str, Any], market_
     volatility = metrics.get("twenty_day_volatility") or 0.0
     volatility_score = min(100.0, max(0.0, volatility * 100.0))
 
-    drawdown = metrics.get("max_drawdown") or 0.0
+    drawdown = metrics.get("full_history_max_drawdown") or metrics.get("max_drawdown") or 0.0
     drawdown_score = min(100.0, max(0.0, drawdown * 100.0))
 
-    downside = metrics.get("downside_volatility") or 0.0
+    downside = metrics.get("sixty_day_downside_volatility") or 0.0
     downside_score = min(100.0, max(0.0, downside * 100.0))
 
     atr = metrics.get("atr_percentage") or 0.0

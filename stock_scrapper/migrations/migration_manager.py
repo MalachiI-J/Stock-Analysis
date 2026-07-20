@@ -14,6 +14,8 @@ def apply_migrations(db_path: str | Path) -> None:
     db_file.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_file)
     try:
+        conn.execute("BEGIN")
+        _ensure_base_schema(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS schema_metadata (
@@ -24,14 +26,74 @@ def apply_migrations(db_path: str | Path) -> None:
             """
         )
         current_version = conn.execute("SELECT MAX(schema_version) FROM schema_metadata").fetchone()[0] or 0
-
         if current_version < 1:
             _apply_v1(conn)
-            current_version = 1
-
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
+
+
+def _ensure_base_schema(conn: sqlite3.Connection) -> None:
+    """Create the base Phase 1 tables if they do not exist."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS price_history (
+            symbol TEXT NOT NULL,
+            trade_date TEXT NOT NULL,
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL,
+            adjusted_close REAL,
+            volume INTEGER,
+            dividends REAL,
+            stock_splits REAL,
+            data_source TEXT,
+            collected_at TEXT,
+            PRIMARY KEY (symbol, trade_date)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS collection_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT,
+            status TEXT NOT NULL,
+            symbols_requested TEXT,
+            symbols_updated TEXT,
+            symbols_failed TEXT,
+            records_inserted INTEGER DEFAULT 0,
+            records_updated INTEGER DEFAULT 0,
+            error_summary TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS data_quality_issues (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            trade_date TEXT,
+            issue_type TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            description TEXT NOT NULL,
+            detected_time TEXT NOT NULL,
+            resolved_status INTEGER DEFAULT 0,
+            issue_fingerprint TEXT,
+            resolved_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_price_history_symbol_date ON price_history(symbol, trade_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_quality_symbol_resolved ON data_quality_issues(symbol, resolved_status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_quality_fingerprint ON data_quality_issues(issue_fingerprint)")
 
 
 def _apply_v1(conn: sqlite3.Connection) -> None:
@@ -99,17 +161,6 @@ def _apply_v1(conn: sqlite3.Connection) -> None:
         )
         """
     )
-
-    for column_name, column_sql in {
-        "issue_fingerprint": "TEXT",
-        "resolved_at": "TEXT",
-        "updated_at": "TEXT",
-    }.items():
-        try:
-            conn.execute(f"ALTER TABLE data_quality_issues ADD COLUMN {column_name} {column_sql}")
-        except sqlite3.OperationalError:
-            pass
-
     conn.execute(
         "INSERT INTO schema_metadata (schema_version, applied_at, description) VALUES (?, ?, ?)",
         (1, datetime.now(timezone.utc).isoformat(), "Add Phase 2 analysis tables and issue metadata columns"),

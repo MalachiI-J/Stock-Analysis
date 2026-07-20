@@ -152,12 +152,29 @@ def get_latest_trade_date(conn: sqlite3.Connection, symbol: str) -> str | None:
 
 
 def record_quality_issue(conn: sqlite3.Connection, issue: Mapping[str, Any]) -> None:
-    """Persist a data quality issue into the database."""
+    """Persist a data quality issue into the database without creating duplicate unresolved entries."""
+    fingerprint = "|".join(
+        str(
+            issue.get(key) or ""
+        )
+        for key in ("symbol", "trade_date", "issue_type", "severity", "description")
+    )
+    existing = conn.execute(
+        "SELECT id FROM data_quality_issues WHERE symbol = ? AND issue_fingerprint = ? AND resolved_status = 0",
+        (issue.get("symbol"), fingerprint),
+    ).fetchone()
+    if existing is not None:
+        conn.execute(
+            "UPDATE data_quality_issues SET updated_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), existing[0]),
+        )
+        return
+
     conn.execute(
         """
         INSERT INTO data_quality_issues (
-            symbol, trade_date, issue_type, severity, description, detected_time, resolved_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            symbol, trade_date, issue_type, severity, description, detected_time, resolved_status, issue_fingerprint, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             issue.get("symbol"),
@@ -167,6 +184,8 @@ def record_quality_issue(conn: sqlite3.Connection, issue: Mapping[str, Any]) -> 
             issue.get("description"),
             issue.get("detected_time") or datetime.now(timezone.utc).isoformat(),
             0,
+            fingerprint,
+            datetime.now(timezone.utc).isoformat(),
         ),
     )
 
@@ -194,15 +213,47 @@ def insert_collection_run(conn: sqlite3.Connection, payload: Mapping[str, Any]) 
     )
 
 
-def fetch_price_history(conn: sqlite3.Connection, symbol: str) -> list[dict[str, Any]]:
-    """Load stored price history rows for a single symbol."""
-    rows = conn.execute(
-        """
-        SELECT symbol, trade_date, open, high, low, close, adjusted_close, volume, dividends, stock_splits, data_source, collected_at
-        FROM price_history
-        WHERE symbol = ?
-        ORDER BY trade_date ASC
-        """,
-        (symbol.upper(),),
-    ).fetchall()
-    return [dict(row) for row in rows]
+def fetch_price_history(conn: sqlite3.Connection, symbol: str, end_date: str | None = None) -> list[dict[str, Any]]:
+    """Load stored price history rows for a single symbol, optionally up to an as-of date."""
+    if end_date is None:
+        rows = conn.execute(
+            """
+            SELECT symbol, trade_date, open, high, low, close, adjusted_close, volume, dividends, stock_splits, data_source, collected_at
+            FROM price_history
+            WHERE symbol = ?
+            ORDER BY trade_date ASC
+            """,
+            (symbol.upper(),),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT symbol, trade_date, open, high, low, close, adjusted_close, volume, dividends, stock_splits, data_source, collected_at
+            FROM price_history
+            WHERE symbol = ? AND trade_date <= ?
+            ORDER BY trade_date ASC
+            """,
+            (symbol.upper(), end_date),
+        ).fetchall()
+    normalized_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if isinstance(row, sqlite3.Row):
+            normalized_rows.append(dict(row))
+        else:
+            normalized_rows.append(
+                {
+                    "symbol": row[0],
+                    "trade_date": row[1],
+                    "open": row[2],
+                    "high": row[3],
+                    "low": row[4],
+                    "close": row[5],
+                    "adjusted_close": row[6],
+                    "volume": row[7],
+                    "dividends": row[8],
+                    "stock_splits": row[9],
+                    "data_source": row[10],
+                    "collected_at": row[11],
+                }
+            )
+    return normalized_rows

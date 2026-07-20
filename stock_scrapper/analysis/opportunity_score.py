@@ -6,7 +6,7 @@ from typing import Any
 
 
 def calculate_opportunity_score(metrics: dict[str, Any], rules: dict[str, Any], market_regime: str) -> tuple[float | None, str, dict[str, Any], list[str]]:
-    """Calculate a transparent opportunity score from 0 to 100."""
+    """Calculate a transparent opportunity score from 0 to 100 using actual price-based metrics."""
     if not metrics or metrics.get("latest_close") is None:
         return None, "Unavailable", {}, ["Missing price data"]
 

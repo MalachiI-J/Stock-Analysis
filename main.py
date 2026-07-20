@@ -12,6 +12,7 @@ from uuid import uuid4
 import yaml
 
 from stock_scrapper.analysis.engine import analyze_symbol, persist_analysis_results
+from stock_scrapper.backtesting.engine import run_backtest
 from stock_scrapper.collectors.yahoo_prices import YahooPriceCollector
 from stock_scrapper.config import load_config, load_watchlist
 from stock_scrapper.database import (
@@ -66,6 +67,9 @@ def build_parser() -> argparse.ArgumentParser:
     scores_parser = subparsers.add_parser("scores", help="Print the scores for each analyzed symbol")
     scores_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
     scores_parser.add_argument("--as-of-date", help="Optional as-of date (YYYY-MM-DD)")
+
+    backtest_parser = subparsers.add_parser("backtest", help="Run a lightweight deterministic Phase 3 backtest")
+    backtest_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
 
     subparsers.add_parser("validate", help="Run database-wide validation checks")
     subparsers.add_parser("status", help="Show project and database status")
@@ -327,6 +331,19 @@ def run_analysis(config: dict[str, Any], logger: Any, base_dir: Path, symbols: l
         conn.close()
 
 
+def run_backtests(config: dict[str, Any], logger: Any, symbols: list[str]) -> list[Any]:
+    """Run a simple deterministic backtest over the stored history for the requested symbols."""
+    initialize_database(config["database_path"])
+    conn = create_connection(config["database_path"])
+    try:
+        histories: dict[str, list[dict[str, Any]]] = {}
+        for symbol in symbols:
+            histories[symbol] = fetch_price_history(conn, symbol)
+        return run_backtest(symbols, histories)
+    finally:
+        conn.close()
+
+
 def show_status(config: dict[str, Any], logger: Any) -> None:
     """Display basic database and run information."""
     initialize_database(config["database_path"])
@@ -389,6 +406,12 @@ def main() -> int:
         results = run_analysis(config, logger, base_dir, symbols, as_of_date=getattr(args, "as_of_date", None))
         for result in results:
             print(f"{result.symbol}: risk={result.risk_score}, opportunity={result.opportunity_score}, confidence={result.confidence_score}, regime={result.market_regime}")
+        return 0
+
+    if args.command == "backtest":
+        results = run_backtests(config, logger, symbols)
+        for result in results:
+            print(f"{result.symbol}: total_return={result.total_return:.2%} trades={result.trade_count} win_rate={result.win_rate:.2%} final_value={result.final_value:.2f}")
         return 0
 
     if args.command == "run":
