@@ -1,0 +1,78 @@
+app_name: Stock Scrapper
+scoring_version: "phase2-v2"
+benchmark_symbol: SPY
+market_context_symbols:
+  - SPY
+  - QQQ
+  - IWM
+  - TLT
+  - GLD
+minimum_history_days: 60
+minimum_recent_days: 20
+risk_weights:
+  realized_volatility: 20
+  drawdown_risk: 20
+  downside_volatility: 15
+  atr_gap_risk: 10
+  beta_sensitivity: 10
+  trend_deterioration: 10
+  liquidity_risk: 5
+  market_regime_risk: 5
+  data_quality_risk: 5
+opportunity_weights:
+  long_term_trend: 25
+  multi_period_momentum: 20
+  relative_strength: 20
+  trend_quality: 15
+  volume_participation: 10
+  breakout_positioning: 10
+confidence_weights:
+  history_completeness: 20
+  data_freshness: 15
+  data_quality: 15
+  benchmark_alignment: 10
+  indicator_availability: 15
+  market_context_availability: 10
+  signal_agreement: 15
+critical_risk_components:
+  - realized_volatility
+  - drawdown_risk
+  - downside_volatility
+  - atr_gap_risk
+  - beta_sensitivity
+  - liquidity_risk
+  - market_regime_risk
+score_thresholds:
+  strong_candidate: 75
+  candidate: 65
+  strong_candidate_confidence: 70
+  candidate_confidence: 60
+  watch: 50
+  high_risk: 70
+  avoid: 30
+classification_rules:
+  candidate_market_regimes:
+    - Risk-On
+    - Neutral
+freshness_thresholds:
+  full_business_days: 1
+  stale_business_days: 5
+risk_level_thresholds:
+  low: 25
+  moderate: 45
+  elevated: 60
+  high: 75
+market_regime_thresholds:
+  risk_on_minimum_votes: 6
+  risk_off_minimum_votes: 5
+  breadth_threshold: 0.5
+  defensive_drawdown: -0.10
+  stress_drawdown: -0.15
+volatility_thresholds:
+  low: 0.2
+  elevated: 0.35
+  stress: 0.55
+liquidity_thresholds:
+  warning_volume_ratio: 0.5
+  warning_dollar_volume: 1000000
+material_change_threshold: 5.0

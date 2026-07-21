@@ -1,0 +1,14 @@
+app_name: Stock Scrapper
+watchlist_path: config/watchlist.csv
+database_path: data/market.db
+raw_data_dir: data/raw
+processed_data_dir: data/processed
+reports_dir: reports
+logs_dir: logs
+historical_lookback_years: 5
+data_source: yfinance
+retry_count: 3
+retry_delay_seconds: 2
+logging_level: INFO
+archive_raw_downloads: false
+open_reports_automatically: false
