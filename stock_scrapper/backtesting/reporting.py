@@ -32,7 +32,6 @@ RUN_FIELDS: tuple[str, ...] = (
     "ending_equity",
     "symbols",
     "configuration_hash",
-    "configuration_snapshot",
     "data_hash",
     "deterministic_result_hash",
     "error_summary",
@@ -123,6 +122,14 @@ EQUITY_FIELDS: tuple[str, ...] = (
 )
 
 
+def _field_union(rows: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+    fields: list[str]=[]
+    for row in rows:
+        for key in row:
+            if key not in fields: fields.append(str(key))
+    return tuple(fields or ("status",))
+
+
 def write_backtest_reports(output_dir: str | Path, saved_run: Mapping[str, Any]) -> dict[str, Path]:
     """Render reports from a previously persisted backtest without rerunning it.
 
@@ -174,6 +181,14 @@ def write_backtest_reports(output_dir: str | Path, saved_run: Mapping[str, Any])
         "equity_curve": output_path / f"{stem}_equity_curve.csv",
         "monthly_returns": output_path / f"{stem}_monthly_returns.csv",
         "annual_returns": output_path / f"{stem}_annual_returns.csv",
+        "configuration": output_path / f"{stem}_configuration.json",
+        "provenance": output_path / f"{stem}_provenance.csv",
+        "data_health": output_path / f"{stem}_data_health.csv",
+        "benchmark_metrics": output_path / f"{stem}_benchmark_metrics.csv",
+        "symbol_attribution": output_path / f"{stem}_symbol_attribution.csv",
+        "signal_outcomes": output_path / f"{stem}_signal_outcomes.csv",
+        "exit_diagnostics": output_path / f"{stem}_exit_diagnostics.csv",
+        "daily_diagnostics": output_path / f"{stem}_daily_diagnostics.csv",
     }
 
     _write_csv(paths["summary"], [summary_row], RUN_FIELDS)
@@ -184,6 +199,14 @@ def write_backtest_reports(output_dir: str | Path, saved_run: Mapping[str, Any])
     _write_csv(paths["equity_curve"], equity_curve, EQUITY_FIELDS)
     _write_csv(paths["monthly_returns"], monthly_returns, ("month", "return"))
     _write_csv(paths["annual_returns"], annual_returns, ("year", "return"))
+    _atomic_write_text(paths["configuration"],json.dumps(config,sort_keys=True,indent=2,ensure_ascii=False))
+    provenance={key:payload.get(key) for key in ("application_version","strategy_name","strategy_version","scoring_version","schema_version","git_commit_hash","git_dirty","source_fingerprint","python_version","platform_info","configuration_hash","data_hash","deterministic_result_hash")}
+    _write_csv(paths["provenance"],[provenance],tuple(provenance))
+    health=_json_mapping(payload.get("data_health_snapshot_json")); _write_csv(paths["data_health"],health.get("symbols",[]),_field_union(health.get("symbols",[])))
+    benchmark_rows=[{"metric":k,"value":v} for k,v in metrics.items() if "benchmark" in k or k in {"active_return","tracking_error","information_ratio","upside_capture","downside_capture","beta_to_benchmark","correlation_to_benchmark"}]
+    _write_csv(paths["benchmark_metrics"],benchmark_rows,("metric","value"))
+    for key in ("symbol_attribution","signal_outcomes","exit_diagnostics","daily_diagnostics"):
+        values=[_mapping(v) for v in payload.get(key,[])]; _write_csv(paths[key],values,_field_union(values))
 
     html_content = _render_html(
         payload,
@@ -236,7 +259,6 @@ def _summary_row(
 ) -> dict[str, Any]:
     row = {field: payload.get(field) for field in RUN_FIELDS}
     row["symbols"] = _canonical_json(symbols)
-    row["configuration_snapshot"] = _canonical_json(config)
     row["warmup_start_date"] = payload.get("warmup_start_date") or payload.get("warm_up_start_date")
     row["data_hash"] = payload.get("data_hash") or payload.get("price_data_hash")
     for name, value in sorted(metrics.items()):
@@ -351,6 +373,14 @@ def _render_html(
   <h2>Rejected Signals</h2>{_signal_table(rejected)}
   <h2>Performance by Symbol</h2>{_aggregate_table(performance_by_symbol, 'Symbol')}
   <h2>Performance by Market Regime</h2>{_aggregate_table(performance_by_regime, 'Market regime')}
+
+  <h2>Data-Health Summary</h2>{_key_value_table(_json_mapping(run.get('data_health_snapshot_json')), 'No data-health snapshot was persisted.')}
+  <h2>Requested and Effective Dates</h2>{_key_value_table({'Requested start':run.get('requested_start_date'),'Effective start':run.get('effective_start_date'),'Requested end':run.get('requested_end_date'),'Effective end':run.get('effective_end_date')},'No date evidence persisted.')}
+  <h2>Warm-Up Sufficiency</h2>{_key_value_table({'Policy':run.get('warmup_policy'),'Required sessions':run.get('required_warmup_sessions'),'Available sessions':run.get('available_warmup_sessions'),'Benchmark sufficient':run.get('benchmark_sufficient'),'Warning':run.get('warmup_warning')},'No warm-up evidence persisted.')}
+  <h2>Software Provenance</h2>{_key_value_table({k:run.get(k) for k in ('application_version','strategy_version','scoring_version','schema_version','git_commit_hash','git_dirty','source_fingerprint','python_version','platform_info')},'No provenance persisted.')}
+  <h2>Benchmark Risk-Adjusted Comparison</h2>{_key_value_table({k:metrics.get(k) for k in ('benchmark_cagr','benchmark_annualized_volatility','benchmark_sharpe_ratio','benchmark_sortino_ratio','benchmark_calmar_ratio','active_return','tracking_error','information_ratio','upside_capture','downside_capture','beta_to_benchmark','correlation_to_benchmark')},'No benchmark diagnostics persisted.')}
+  <h2>Symbol Contribution and Profit Concentration</h2>{_key_value_table({'Attribution rows':len(run.get('symbol_attribution') or []),'Signal outcome rows':len(run.get('signal_outcomes') or []),'Daily diagnostic rows':len(run.get('daily_diagnostics') or [])},'No diagnostics persisted.')}
+  <h2>Opportunity-Cost, Signal, and Exit Diagnostics</h2><p>These are post-simulation counterfactual research diagnostics and never alter the historical decisions in this run.</p>
 
   <h2>Limitations and Warnings</h2>
   <div class="warning"><strong>Survivorship-bias warning:</strong> The candidate universe may omit securities that delisted, merged, or otherwise left the available dataset. Results can therefore overstate historical robustness.</div>

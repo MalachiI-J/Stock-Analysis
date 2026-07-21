@@ -1,0 +1,7 @@
+pandas>=2.2.0
+yfinance>=0.2.0
+PyYAML>=6.0.2
+exchange-calendars>=4.5
+
+[dev]
+pytest>=8.0.0

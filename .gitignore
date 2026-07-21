@@ -1,0 +1,81 @@
+# Python bytecode and compiled extensions
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments and local environment files
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+
+# Tests, coverage, linters, and type-checkers
+.pytest_cache/
+.pytest-baseline-*/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Packaging and generated metadata
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+*.whl
+
+# Local SQLite databases, journals, and backups
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.bak
+*.backup
+data/backups/
+
+# Raw/processed data caches
+data/raw/
+data/processed/
+*.parquet
+*.feather
+*.pickle
+*.pkl
+
+# Generated runtime output
+logs/
+reports/
+*.log
+
+# Source archives and compressed artifacts
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+
+# Editor, operating-system, and temporary files
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.tmp
+*.temp
+*.swp
+*.swo
+*.orig
+*.rej
+*~

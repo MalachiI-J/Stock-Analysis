@@ -253,7 +253,7 @@ def test_real_shaped_v1_is_repaired_idempotently_without_price_changes(
             for row in conn.execute(
                 "SELECT schema_version FROM schema_metadata ORDER BY schema_version"
             )
-        ] == [(1,), (2,), (3,)]
+        ] == [(1,), (2,), (3,), (4,), (5,), (6,)]
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 

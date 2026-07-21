@@ -81,7 +81,7 @@ def test_complete_backtest_persists_every_linked_record(monkeypatch: pytest.Monk
             "backtest_fills": len(result.fills),
             "backtest_trades": len(result.trades),
             "backtest_equity_curve": len(result.snapshots),
-            "backtest_metrics": len(result.metrics.to_dict()),
+            "backtest_metrics": len(result.metrics.to_dict()) + 7,  # post-simulation concentration diagnostics
         }
         assert _counts(conn) == expected
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []

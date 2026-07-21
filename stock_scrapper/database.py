@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from stock_scrapper.migrations.migration_manager import apply_migrations
+from stock_scrapper.market_calendar import SessionResolver
+from stock_scrapper.revision_policy import compare_price_rows
 
 
 PRICE_COLUMNS = (
@@ -25,7 +28,27 @@ PRICE_COLUMNS = (
     "stock_splits",
     "data_source",
     "collected_at",
+    "bar_status", "is_complete", "session_close_at", "provider_updated_at",
+    "first_collected_at", "last_collected_at", "revision_count", "row_fingerprint",
 )
+
+FINGERPRINT_FIELDS = ("symbol", "trade_date", "open", "high", "low", "close", "adjusted_close", "volume", "dividends", "stock_splits", "data_source")
+ANALYSIS_CRITICAL_FIELDS = {"open", "high", "low", "close", "adjusted_close", "volume", "dividends", "stock_splits"}
+
+
+def price_row_fingerprint(row: Mapping[str, Any]) -> str:
+    """Stable SHA-256 over canonical provider values, independent of timestamps."""
+    def normalized(key: str, value: Any) -> Any:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return None
+        if key == "symbol": return str(value).strip().upper()
+        if key == "trade_date": return str(value)[:10]
+        if key == "volume": return int(value)
+        if key in {"open", "high", "low", "close", "adjusted_close", "dividends", "stock_splits"}:
+            return format(float(value), ".12g")
+        return str(value).strip()
+    payload = {key: normalized(key, row.get(key)) for key in FINGERPRINT_FIELDS}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
 
 
 def utc_now_iso() -> str:
@@ -49,14 +72,26 @@ def create_connection(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
-def upsert_price_history(conn: sqlite3.Connection, row: Mapping[str, Any]) -> tuple[int, int]:
-    """Insert a daily bar or update the same symbol/date without coercing missing fields."""
+def upsert_price_history(conn: sqlite3.Connection, row: Mapping[str, Any], collection_run_id: str | None = None, revision_policy: Mapping[str, Any] | None = None) -> tuple[int, int]:
+    """Reconcile a bar, preserving an immutable audit record for actual changes."""
     symbol = str(row["symbol"]).strip().upper()
     trade_date = str(row["trade_date"])
     existing = conn.execute(
-        "SELECT 1 FROM price_history WHERE symbol = ? AND trade_date = ?",
+        "SELECT * FROM price_history WHERE symbol = ? AND trade_date = ?",
         (symbol, trade_date),
     ).fetchone()
+    incoming = {**row, "symbol": symbol, "trade_date": trade_date}
+    fingerprint = price_row_fingerprint(incoming)
+    collected = str(row.get("collected_at") or utc_now_iso())
+    resolver = SessionResolver()
+    try:
+        info = resolver.session(trade_date)
+        valid = all(row.get(key) is not None and not (isinstance(row.get(key), float) and math.isnan(row.get(key))) for key in ("open", "high", "low", "close", "volume"))
+        complete = info.is_complete and valid
+        status = "complete" if complete else ("incomplete" if valid else "invalid")
+        session_close = info.closes_at.isoformat()
+    except ValueError:
+        complete, status, session_close = False, "invalid", None
     values = (
         row.get("open"),
         row.get("high"),
@@ -67,27 +102,56 @@ def upsert_price_history(conn: sqlite3.Connection, row: Mapping[str, Any]) -> tu
         row.get("dividends"),
         row.get("stock_splits"),
         row.get("data_source"),
-        row.get("collected_at") or utc_now_iso(),
+        collected,
     )
     if existing is not None:
+        if isinstance(existing, sqlite3.Row):
+            previous = dict(existing)
+        else:
+            names = [str(item[0]) for item in conn.execute("SELECT * FROM price_history LIMIT 0").description]
+            previous = dict(zip(names, existing, strict=True))
+        previous_fingerprint = previous.get("row_fingerprint") or price_row_fingerprint(previous)
+        if previous_fingerprint == fingerprint:
+            conn.execute("UPDATE price_history SET last_collected_at=?, provider_updated_at=?, is_complete=?, bar_status=?, session_close_at=?, row_fingerprint=? WHERE symbol=? AND trade_date=?", (collected, collected, int(complete), status, session_close, fingerprint, symbol, trade_date))
+            return 0, 0
+        comparison = compare_price_rows(previous, incoming, revision_policy)
+        changed = list(comparison.exact_differences)
+        if not comparison.material_differences:
+            conn.execute("UPDATE price_history SET last_collected_at=?, provider_updated_at=?, is_complete=?, bar_status=?, session_close_at=? WHERE symbol=? AND trade_date=?", (collected, collected, int(complete), status, session_close, symbol, trade_date))
+            return 0, 0
+        conn.execute(
+            """INSERT OR IGNORE INTO price_history_revisions
+            (symbol,trade_date,detected_at,previous_fingerprint,new_fingerprint,changed_fields_json,previous_values_json,new_values_json,data_source,collection_run_id,reason,analysis_critical,
+             revision_class,is_material,absolute_deltas_json,relative_deltas_json,review_status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (symbol, trade_date, utc_now_iso(), previous_fingerprint, fingerprint,
+             json.dumps(changed), canonical_values(previous), canonical_values(incoming), row.get("data_source"), collection_run_id,
+             "provider_overlap_reconciliation", int(comparison.analysis_critical), comparison.revision_class, 1,
+             json.dumps(comparison.absolute_deltas, sort_keys=True), json.dumps(comparison.relative_deltas, sort_keys=True), "unreviewed"),
+        )
         conn.execute(
             """
             UPDATE price_history
             SET open = ?, high = ?, low = ?, close = ?, adjusted_close = ?, volume = ?,
-                dividends = ?, stock_splits = ?, data_source = ?, collected_at = ?
+                dividends = ?, stock_splits = ?, data_source = ?, collected_at = ?,
+                bar_status = ?, is_complete = ?, session_close_at = ?, provider_updated_at = ?,
+                first_collected_at = COALESCE(first_collected_at, collected_at), last_collected_at = ?,
+                revision_count = revision_count + 1, row_fingerprint = ?
             WHERE symbol = ? AND trade_date = ?
             """,
-            (*values, symbol, trade_date),
+            (*values, "revised" if complete else status, int(complete), session_close, collected, collected, fingerprint, symbol, trade_date),
         )
         return 0, 1
     conn.execute(
         """
         INSERT INTO price_history (
             symbol, trade_date, open, high, low, close, adjusted_close, volume,
-            dividends, stock_splits, data_source, collected_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            dividends, stock_splits, data_source, collected_at, bar_status, is_complete,
+            session_close_at, provider_updated_at, first_collected_at, last_collected_at,
+            revision_count, row_fingerprint
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
         """,
-        (symbol, trade_date, *values),
+        (symbol, trade_date, *values, status, int(complete), session_close, collected, collected, collected, fingerprint),
     )
     return 1, 0
 
@@ -106,10 +170,16 @@ def fetch_price_history(
     symbol: str,
     start_date: str | date | None = None,
     end_date: str | date | None = None,
+    include_incomplete: bool = False,
 ) -> list[dict[str, Any]]:
     """Load a symbol's daily bars inside an inclusive database-level date range."""
     clauses = ["symbol = ?"]
     parameters: list[Any] = [symbol.strip().upper()]
+    if not include_incomplete and "is_complete" in {str(r[1]) for r in conn.execute("PRAGMA table_info(price_history)")}:
+        # Directly inserted legacy/test fixtures without lifecycle metadata remain
+        # readable; migrated/provider rows always have collection metadata and
+        # therefore must be explicitly complete.
+        clauses.append("(is_complete = 1 OR (bar_status = 'unknown' AND first_collected_at IS NULL AND last_collected_at IS NULL))")
     if start_date is not None:
         clauses.append("trade_date >= ?")
         parameters.append(start_date.isoformat() if isinstance(start_date, date) else str(start_date))
@@ -125,6 +195,30 @@ def fetch_price_history(
         dict(row) if isinstance(row, sqlite3.Row) else dict(zip(PRICE_COLUMNS, row, strict=True))
         for row in rows
     ]
+
+
+def canonical_values(row: Mapping[str, Any]) -> str:
+    """Canonical JSON snapshot used by revision audit rows."""
+    values = {key: (None if isinstance(row.get(key), float) and math.isnan(row.get(key)) else row.get(key)) for key in FINGERPRINT_FIELDS}
+    return json.dumps(values, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str, allow_nan=False)
+
+
+def classify_price_revisions(conn: sqlite3.Connection, policy: Mapping[str, Any] | None = None) -> dict[str, int]:
+    """Classify retained legacy revision rows without deleting audit evidence."""
+    counts: dict[str, int] = {}
+    rows = conn.execute("SELECT revision_id,previous_values_json,new_values_json FROM price_history_revisions").fetchall()
+    for row in rows:
+        previous = json.loads(row["previous_values_json"] or "{}")
+        incoming = json.loads(row["new_values_json"] or "{}")
+        result = compare_price_rows(previous, incoming, policy)
+        material = int(bool(result.material_differences))
+        automatic = result.revision_class in {"precision_noise", "corporate_action_revision"}
+        conn.execute("""UPDATE price_history_revisions SET revision_class=?,is_material=?,
+          absolute_deltas_json=?,relative_deltas_json=?,review_status=CASE WHEN ? THEN 'automatically_classified' ELSE COALESCE(NULLIF(review_status,''),'unreviewed') END
+          WHERE revision_id=?""", (result.revision_class,material,json.dumps(result.absolute_deltas,sort_keys=True),
+          json.dumps(result.relative_deltas,sort_keys=True),int(automatic),row["revision_id"]))
+        counts[result.revision_class] = counts.get(result.revision_class,0)+1
+    return counts
 
 
 def quality_issue_fingerprint(issue: Mapping[str, Any]) -> str:
@@ -279,12 +373,14 @@ def insert_collection_run(conn: sqlite3.Connection, payload: Mapping[str, Any]) 
     )
 
 
-def list_analysis_runs(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]:
+def list_analysis_runs(conn: sqlite3.Connection, limit: int = 50, *, scope: str | None = None, as_of_date: str | None = None, canonical_only: bool = False) -> list[dict[str, Any]]:
     """Return recent saved analysis runs without recalculating them."""
-    rows = conn.execute(
-        "SELECT * FROM analysis_runs ORDER BY COALESCE(completed_at, started_at) DESC LIMIT ?",
-        (max(1, int(limit)),),
-    ).fetchall()
+    clauses=[]; params: list[Any]=[]
+    if scope: clauses.append("analysis_scope=?"); params.append(scope)
+    if as_of_date: clauses.append("as_of_date=?"); params.append(as_of_date)
+    if canonical_only: clauses.append("is_canonical=1")
+    params.append(max(1,int(limit)))
+    rows = conn.execute("SELECT * FROM analysis_runs " + (("WHERE "+" AND ".join(clauses)) if clauses else "") + " ORDER BY COALESCE(completed_at, started_at) DESC LIMIT ?", params).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -332,3 +428,8 @@ def get_latest_analysis_run(
                 continue
         return get_analysis_run(conn, run_id)
     return None
+
+
+def get_latest_canonical_analysis_run(conn: sqlite3.Connection, scope: str = "candidate_universe") -> dict[str, Any] | None:
+    row=conn.execute("SELECT analysis_run_id FROM analysis_runs WHERE status='completed' AND is_canonical=1 AND analysis_scope=? ORDER BY as_of_date DESC,COALESCE(completed_at,started_at) DESC LIMIT 1",(scope,)).fetchone()
+    return get_analysis_run(conn,str(row[0])) if row else None

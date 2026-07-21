@@ -275,6 +275,8 @@ def test_backtest_reports_emit_all_offline_html_and_csv_outputs(tmp_path: Path) 
     assert set(paths) == {
         "html", "summary", "trades", "signals", "rejected_candidates",
         "orders_and_fills", "equity_curve", "monthly_returns", "annual_returns",
+        "configuration", "provenance", "data_health", "benchmark_metrics",
+        "symbol_attribution", "signal_outcomes", "exit_diagnostics", "daily_diagnostics",
     }
     assert all(path.exists() for path in paths.values())
     assert paths["html"].name == "backtest_backtest-test-001.html"
@@ -310,6 +312,11 @@ def test_backtest_reports_emit_all_offline_html_and_csv_outputs(tmp_path: Path) 
         "Rejected Signals",
         "Performance by Symbol",
         "Performance by Market Regime",
+        "Data-Health Summary",
+        "Warm-Up Sufficiency",
+        "Software Provenance",
+        "Benchmark Risk-Adjusted Comparison",
+        "Symbol Contribution and Profit Concentration",
         "Survivorship-bias warning",
         "Static-watchlist warning",
         "Educational Disclaimer",

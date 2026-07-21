@@ -25,6 +25,7 @@ ALLOWED_EXECUTION_TIMINGS = frozenset({"next_open"})
 ALLOWED_FINAL_LIQUIDATION_TIMINGS = frozenset({"final_close"})
 ALLOWED_AMBIGUITY_POLICIES = frozenset({"adverse_first", "favorable_first", "skip_bar"})
 ALLOWED_VOLATILITY_LOOKBACK_DAYS = frozenset({20, 60, 252})
+ALLOWED_WARMUP_POLICIES = frozenset({"reject", "shift_start", "allow_with_warning"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +78,7 @@ class BacktestConfig:
     benchmark: str
     initial_cash: float
     warm_up_days: int
+    warmup_policy: str
     start_date: date | None
     end_date: date | None
     signal_frequency: str
@@ -333,6 +335,7 @@ def validate_backtesting_config(payload: Mapping[str, Any]) -> BacktestConfig:
         benchmark=_text(payload["benchmark"], "benchmark").upper(),
         initial_cash=_number(payload["initial_cash"], "initial_cash", minimum=0.01),
         warm_up_days=_positive_int(payload["warm_up_days"], "warm_up_days"),
+        warmup_policy=_choice(payload["warmup_policy"], "warmup_policy", ALLOWED_WARMUP_POLICIES),
         start_date=start,
         end_date=end,
         signal_frequency=_choice(payload["signal_frequency"], "signal_frequency", ALLOWED_FREQUENCIES),

@@ -24,6 +24,22 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "logging_level": "INFO",
     "archive_raw_downloads": False,
     "open_reports_automatically": False,
+    "market_data": {
+        "exchange": "XNYS", "timezone": "America/New_York",
+        "provider_delay_minutes": 30, "incomplete_bar_policy": "exclude",
+        "recent_overlap_sessions": 10, "corporate_action_refresh_sessions": 90,
+        "scheduled_full_refresh_days": 7,
+    },
+    "universes": {
+        "candidates": ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "TSLA", "JPM", "WMT", "XOM"],
+        "benchmark": {"symbol": "SPY"}, "market_context": ["SPY", "QQQ", "IWM"],
+        "defensive_context": ["TLT", "GLD"],
+    },
+    "warmup": {"sessions": 252, "policy": "shift_start"},
+    "revision_policy": {"version": "revision-v2", "price_absolute_tolerance": 0.0001,
+        "price_relative_tolerance": 0.000001, "adjusted_price_absolute_tolerance": 0.0001,
+        "adjusted_price_relative_tolerance": 0.000001, "dividend_absolute_tolerance": 0.00000001,
+        "split_absolute_tolerance": 0.00000001, "volume_tolerance": 0, "store_precision_noise": False},
 }
 
 
@@ -121,3 +137,26 @@ def load_watchlist(path: str | Path | None = None) -> list[str]:
 
     symbols = [row["symbol"].strip().upper() for row in rows if row.get("symbol", "").strip()]
     return symbols
+
+
+def load_universes(config: dict[str, Any]) -> dict[str, Any]:
+    """Return normalized role-aware universes, falling back to the legacy CSV."""
+    raw = config.get("universes") or {}
+    candidates = raw.get("candidates") or load_watchlist(config["watchlist_path"])
+    benchmark = raw.get("benchmark", {"symbol": "SPY"})
+    benchmark_symbol = benchmark.get("symbol", "SPY") if isinstance(benchmark, dict) else benchmark
+    return {
+        "candidates": list(dict.fromkeys(str(v).strip().upper() for v in candidates)),
+        "benchmark": str(benchmark_symbol).strip().upper(),
+        "market_context": list(dict.fromkeys(str(v).strip().upper() for v in raw.get("market_context", ["SPY", "QQQ", "IWM"]))),
+        "defensive_context": list(dict.fromkeys(str(v).strip().upper() for v in raw.get("defensive_context", ["TLT", "GLD"]))),
+    }
+
+
+def validate_universes(universes: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    if not universes.get("candidates"): warnings.append("Candidate universe is empty")
+    if not universes.get("benchmark"): warnings.append("Benchmark symbol is missing")
+    if universes.get("benchmark") in universes.get("candidates", []):
+        warnings.append("Benchmark is also a candidate; comparisons may be ambiguous")
+    return warnings
