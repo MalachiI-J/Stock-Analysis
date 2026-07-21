@@ -6,11 +6,11 @@ import hashlib
 import platform
 import subprocess
 import sys
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
 from stock_scrapper.migrations.migration_manager import LATEST_SCHEMA_VERSION
+from stock_scrapper import __version__
 
 
 def source_fingerprint(base_dir: str | Path) -> str:
@@ -26,8 +26,7 @@ def source_fingerprint(base_dir: str | Path) -> str:
 
 def collect_provenance(base_dir: str | Path, strategy_name: str = "score_v1", strategy_version: str = "1.0.0", scoring_version: str | None = None) -> dict[str, Any]:
     root = Path(base_dir).resolve()
-    try: app_version = version("stock-scrapper")
-    except PackageNotFoundError: app_version = "unknown"
+    app_version = __version__
     try:
         commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=True).stdout.strip()
         dirty = bool(subprocess.run(["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True, check=True).stdout.strip())

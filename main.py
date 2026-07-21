@@ -23,6 +23,7 @@ from stock_scrapper.backtesting.persistence import (
     list_backtest_runs,
     load_backtest,
     persist_walk_forward,
+    backfill_benchmark_metrics,
 )
 from stock_scrapper.backtesting.reporting import write_backtest_reports
 from stock_scrapper.backtesting.walk_forward import (
@@ -41,6 +42,7 @@ from stock_scrapper.database import (
     fetch_quality_issues,
     get_analysis_run,
     get_latest_analysis_run,
+    get_latest_canonical_analysis_run,
     get_latest_trade_date,
     initialize_database,
     insert_collection_run,
@@ -60,9 +62,11 @@ from stock_scrapper.exceptions import (
 )
 from stock_scrapper.processing.validation import validate_price_records
 from stock_scrapper.reporting.report_builder import write_phase2_reports
+from stock_scrapper.reporting.persistence import persist_report, report_identity
 from stock_scrapper.utilities.hashing import canonical_json
 from stock_scrapper.utilities.logging_setup import setup_logging
 from stock_scrapper.utilities.provenance import collect_provenance
+from stock_scrapper.universes import resolve_universe
 
 
 def load_scoring_rules(base_dir: Path) -> dict[str, Any]:
@@ -103,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser = subparsers.add_parser("report", help="Generate an offline Phase 2 report")
     report_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
     report_parser.add_argument("--date", help="Inclusive report date (YYYY-MM-DD)")
+    report_source=report_parser.add_mutually_exclusive_group(); report_source.add_argument("--run-id"); report_source.add_argument("--recalculate",action="store_true")
 
     run_parser = subparsers.add_parser("run", help="Update, validate, analyze, and report")
     run_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
@@ -110,6 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     analyze_parser = subparsers.add_parser("analyze", help="Run and save canonical Phase 2 analysis")
     analyze_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
+    analyze_parser.add_argument("--scope",choices=("candidates","all-data"),default="candidates")
     analyze_parser.add_argument("--include-incomplete-bars", action="store_true", help="EXPERIMENTAL: include unfinished/untrusted daily bars")
     _add_as_of_argument(analyze_parser)
 
@@ -118,6 +124,8 @@ def build_parser() -> argparse.ArgumentParser:
     scores_source = scores_parser.add_mutually_exclusive_group()
     scores_source.add_argument("--run-id", help="Read one exact saved run")
     scores_source.add_argument("--recalculate", action="store_true")
+    scores_source.add_argument("--latest-any",action="store_true")
+    scores_parser.add_argument("--scope",choices=("candidate_universe","all_data_symbols","custom"))
     _add_as_of_argument(scores_parser)
 
     explain_parser = subparsers.add_parser("explain", help="Explain saved symbol analysis")
@@ -126,11 +134,15 @@ def build_parser() -> argparse.ArgumentParser:
     explain_source = explain_parser.add_mutually_exclusive_group()
     explain_source.add_argument("--run-id", help="Read one exact saved run")
     explain_source.add_argument("--recalculate", action="store_true")
+    explain_source.add_argument("--latest-any",action="store_true")
+    explain_parser.add_argument("--scope",choices=("candidate_universe","all_data_symbols","custom"))
     _add_as_of_argument(explain_parser)
 
-    subparsers.add_parser("analysis-list", help="List saved Phase 2 runs")
+    analysis_list=subparsers.add_parser("analysis-list", help="List saved analysis runs")
+    analysis_list.add_argument("--scope",choices=("candidate_universe","all_data_symbols","custom")); analysis_list.add_argument("--date"); analysis_list.add_argument("--canonical-only",action="store_true"); analysis_list.add_argument("--limit",type=int,default=20)
     analysis_show = subparsers.add_parser("analysis-show", help="Show one saved Phase 2 run")
     analysis_show.add_argument("--run-id", required=True)
+    analysis_show.add_argument("--full",action="store_true"); analysis_show.add_argument("--scores",action="store_true"); analysis_show.add_argument("--provenance",action="store_true")
 
     backtest = subparsers.add_parser("backtest", help="Run and save a score_v1 portfolio backtest")
     backtest.add_argument("--strategy", choices=("score_v1",), default="score_v1")
@@ -154,6 +166,9 @@ def build_parser() -> argparse.ArgumentParser:
             child.add_argument("--full",action="store_true"); child.add_argument("--metrics",action="store_true"); child.add_argument("--trades",action="store_true"); child.add_argument("--provenance",action="store_true")
     for command in ("validate-backtest","strategy-diagnostics","benchmark-diagnostics"):
         child=subparsers.add_parser(command); child.add_argument("--run-id",required=True)
+        if command=="strategy-diagnostics":
+            for flag in ("symbols","signals","exits","daily","full"): child.add_argument(f"--{flag}",action="store_true")
+        if command=="benchmark-diagnostics": child.add_argument("--recalculate",action="store_true")
 
     walk = subparsers.add_parser("walk-forward", help="Run fixed-window strategy validation")
     walk.add_argument("--strategy", choices=("score_v1",), default="score_v1")
@@ -388,6 +403,7 @@ def _analysis_batch(
     *,
     persist: bool,
     include_incomplete_bars: bool = False,
+    universe: Any | None = None,
 ) -> AnalysisBatch:
     initialize_database(config["database_path"])
     conn = create_connection(config["database_path"])
@@ -395,10 +411,13 @@ def _analysis_batch(
         service = AnalysisService(
             conn,
             load_scoring_rules(base_dir),
-            load_watchlist(config["watchlist_path"]),
+            list(universe.candidates) if universe is not None else load_universes(config)["candidates"],
             include_incomplete_bars=include_incomplete_bars,
         )
-        return service.analyze_many_as_of(symbols, as_of_date, persist=persist)
+        return service.analyze_many_as_of(symbols, as_of_date, persist=persist,
+            analysis_scope=universe.analysis_scope.value if universe is not None else "custom",
+            universe_snapshot=universe.snapshot() if universe is not None else None,
+            candidate_universe_hash=universe.configuration_hash if universe is not None else None)
     finally:
         conn.close()
 
@@ -521,19 +540,20 @@ def _load_saved_results(
     config: dict[str, Any],
     run_id: str | None,
     required_symbols: Sequence[str] | None,
+    *, latest_any: bool = False, scope: str | None = None,
 ) -> tuple[dict[str, Any], list[Any]]:
     initialize_database(config["database_path"])
     conn = create_connection(config["database_path"])
     try:
-        saved = (
-            get_analysis_run(conn, run_id)
-            if run_id
-            else get_latest_analysis_run(conn, required_symbols)
-        )
+        if run_id: saved=get_analysis_run(conn,run_id)
+        elif latest_any: saved=get_latest_analysis_run(conn)
+        elif scope and scope != "candidate_universe":
+            row=conn.execute("SELECT analysis_run_id FROM analysis_runs WHERE status='completed' AND analysis_scope=? ORDER BY COALESCE(completed_at,started_at) DESC LIMIT 1",(scope,)).fetchone(); saved=get_analysis_run(conn,str(row[0])) if row else None
+        else: saved=get_latest_canonical_analysis_run(conn)
     finally:
         conn.close()
     if saved is None:
-        raise MissingDataError("No matching saved analysis run exists; use --recalculate")
+        raise MissingDataError("No canonical candidate-universe analysis exists. Run: python main.py analyze")
     results = results_from_saved_run(saved)
     if required_symbols:
         required = {symbol.upper() for symbol in required_symbols}
@@ -654,8 +674,10 @@ def run_backtests(
         )
         health=assess_data_health(conn,sorted(set(symbols)|{typed.benchmark}))
         coverage=[dict(row) for row in conn.execute("SELECT * FROM corporate_action_coverage WHERE symbol IN (%s)" % ",".join("?" for _ in set(symbols)),sorted(set(symbols))).fetchall()] if symbols else []
+        roles=load_universes(config); benchmark=str(roles.get("benchmark") or "SPY")
+        snapshot={**roles,"requested_candidates":list(symbols),"benchmark_candidate_overlap":[symbol for symbol in symbols if symbol==benchmark]}
         conn.execute("UPDATE backtest_runs SET data_health_snapshot_json=?,corporate_action_coverage_json=?,revision_policy_version=?,universe_json=? WHERE run_id=?",
-                     (canonical_json(health),canonical_json(coverage),str(config.get("revision_policy",{}).get("version","unknown")),canonical_json(load_universes(config)),result.run.run_id)); conn.commit()
+                     (canonical_json(health),canonical_json(coverage),str(config.get("revision_policy",{}).get("version","unknown")),canonical_json(snapshot),result.run.run_id)); conn.commit()
         logger.info("Backtest %s persisted", result.run.run_id)
         return result
     finally:
@@ -739,7 +761,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise InvalidConfigurationError(str(exc)) from exc
         logger = setup_logging(config, run_id=datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"))
         logger.info("Starting Stock Scrapper")
-        symbols = _symbols_from_args(args, watchlist)
+        explicit_symbols = _symbols_from_args(args, [])
+        requested_scope = getattr(args, "scope", None)
+        if explicit_symbols and requested_scope == "all-data":
+            parser.error("--scope all-data cannot be combined with --symbols")
+        universe = resolve_universe(config, command=args.command, explicit_symbols=explicit_symbols or None, scope=requested_scope)
+        symbols = list(universe.requested_symbols)
+        for warning in universe.validation_warnings: print(f"WARNING: {warning}", file=sys.stderr)
         partial_update = False
 
         if args.command == "update":
@@ -848,8 +876,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 try: health = assess_data_health(conn, symbols, int(config.get("market_data", {}).get("provider_delay_minutes", 30)))
                 finally: conn.close()
                 if health["status"] == "Critical": raise MissingDataError("Critical market-data health blocks live classification")
-            batch = _analysis_batch(config, base_dir, symbols, effective, persist=True, include_incomplete_bars=args.include_incomplete_bars)
+            batch = _analysis_batch(config, base_dir, symbols, effective, persist=True, include_incomplete_bars=args.include_incomplete_bars, universe=universe)
             _print_scores(batch.results)
+            blocked=sum(not result.eligible_for_scoring for result in batch.results)
+            print(f"Run ID: {batch.analysis_run_id} | Scope: {universe.analysis_scope.value} | As-of: {batch.as_of_date} | Requested: {len(symbols)} | Analyzed: {len(symbols)-blocked} | Blocked: {blocked} | Canonical: {universe.analysis_scope.value == 'candidate_universe' and blocked == 0}")
             if not any(result.eligible_for_scoring for result in batch.results):
                 return int(ExitCode.MISSING_DATA)
             return int(ExitCode.SUCCESS)
@@ -858,13 +888,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             explicit = bool(getattr(args, "symbols", None) or getattr(args, "symbol", None))
             if args.recalculate:
                 effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
-                batch = _analysis_batch(config, base_dir, symbols, effective, persist=True)
+                batch = _analysis_batch(config, base_dir, symbols, effective, persist=True, universe=universe)
                 results = batch.results
             else:
                 _, results = _load_saved_results(
                     config,
                     args.run_id,
                     symbols if explicit else None,
+                    latest_any=args.latest_any,
+                    scope=args.scope,
                 )
             if args.command == "scores":
                 _print_scores(results)
@@ -876,53 +908,49 @@ def main(argv: Sequence[str] | None = None) -> int:
             initialize_database(config["database_path"])
             conn = create_connection(config["database_path"])
             try:
-                runs = list_analysis_runs(conn)
+                runs = list_analysis_runs(conn,args.limit,scope=args.scope,as_of_date=args.date,canonical_only=args.canonical_only)
             finally:
                 conn.close()
             for run in runs:
                 print(
-                    f"{run['analysis_run_id']} | {run['as_of_date']} | {run['status']} | "
-                    f"regime={run['market_regime']} | through={run['data_through_date']}"
+                    f"{run['analysis_run_id']} | {run['as_of_date']} | scope={run.get('analysis_scope')} | canonical={bool(run.get('is_canonical'))} | count={run.get('symbol_count')} | symbols={run.get('symbols_requested')} | regime={run['market_regime']} | app={run.get('application_version')} | {run['status']} | through={run['data_through_date']}"
                 )
             return int(ExitCode.SUCCESS)
 
         if args.command == "analysis-show":
             saved, results = _load_saved_results(config, args.run_id, None)
-            print(canonical_json({key: value for key, value in saved.items() if key not in {"analyses", "regime"}}))
-            _print_scores(results)
+            if args.full: print(canonical_json(saved))
+            else:
+                keys=("analysis_run_id","as_of_date","data_through_date","analysis_scope","is_canonical","symbol_count","status","market_regime","requested_symbols_json","analyzed_symbols_json","blocked_symbols_json")
+                print(json.dumps({key:saved.get(key) for key in keys},indent=2))
+                if args.provenance: print(json.dumps({k:saved.get(k) for k in ("application_version","scoring_version","schema_version","git_commit_hash","source_fingerprint","configuration_hash","data_hash")},indent=2))
+                if args.scores or not args.provenance: _print_scores(results)
             return int(ExitCode.SUCCESS)
 
         if args.command == "report":
-            effective = _parse_date(args.date, field="report date", default=date.today())
-            batch = _analysis_batch(config, base_dir, symbols, effective, persist=False)
-            scoring_rules = load_scoring_rules(base_dir)
+            if args.symbols and not args.recalculate:
+                parser.error("Custom --symbols require --recalculate or an exact --run-id")
+            if args.recalculate:
+                effective=_parse_date(args.date,field="report date",default=date.today())
+                batch=_analysis_batch(config,base_dir,symbols,effective,persist=True,universe=universe)
+                saved,_=_load_saved_results(config,batch.analysis_run_id,None)
+            else:
+                saved,_=_load_saved_results(config,args.run_id,None)
+                effective=_parse_date(str(saved["as_of_date"]),field="report date")
+            results=results_from_saved_run(saved)
+            saved_symbols=[result.symbol for result in results]
             conn = create_connection(config["database_path"])
             try:
-                histories = {symbol: fetch_price_history(conn, symbol, end_date=effective) for symbol in symbols}
+                histories = {symbol: fetch_price_history(conn, symbol, end_date=effective) for symbol in saved_symbols}
                 issues = fetch_quality_issues(conn, unresolved_only=True, as_of_date=effective)
                 previous = _previous_analysis(conn, effective.isoformat())
-            finally:
-                conn.close()
-            paths = write_phase2_reports(
-                config["reports_dir"],
-                effective,
-                {
-                    "as_of_date": batch.as_of_date,
-                    "data_through_date": batch.data_through_date,
-                    "scoring_version": scoring_rules.get("scoring_version"),
-                    "configuration_hash": batch.configuration_hash,
-                    "benchmark_symbol": scoring_rules.get("benchmark_symbol", "SPY"),
-                    "market_regime": batch.market_context.regime,
-                    "market_regime_confidence": batch.market_context.confidence,
-                    "market_regime_reasons": batch.market_context.reasons,
-                },
-                batch.results,
-                histories,
-                issues,
-                previous,
-            )
+                identity=report_identity(str(saved.get("analysis_scope") or "custom"),saved_symbols,str(saved["analysis_run_id"]))
+                paths = write_phase2_reports(config["reports_dir"],effective,saved,results,histories,issues,previous,identity)
+                manifest=persist_report(conn,base_dir,saved,paths); conn.commit()
+            finally: conn.close()
             print(f"CSV: {paths['csv']}")
             print(f"HTML: {paths['html']}")
+            print(f"Manifest: {manifest}")
             return int(ExitCode.SUCCESS)
 
         if args.command == "backtest":
@@ -977,7 +1005,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 elif args.trades: payload=saved.get("trades",[])
                 elif args.provenance: payload={k:saved.get(k) for k in ("application_version","strategy_name","strategy_version","scoring_version","schema_version","git_commit_hash","git_dirty","source_fingerprint","python_version","platform_info","configuration_hash","data_hash","deterministic_result_hash")}
                 else:
-                    metrics=saved.get("metrics",{}); payload={"run_id":saved.get("run_id"),"strategy":f"{saved.get('strategy_name')} {saved.get('strategy_version')}","requested_start":saved.get("requested_start_date"),"effective_start":saved.get("effective_start_date") or saved.get("start_date"),"effective_end":saved.get("effective_end_date") or saved.get("end_date"),"starting_equity":saved.get("initial_cash"),"ending_equity":saved.get("ending_equity"),"total_return":metrics.get("total_return"),"maximum_drawdown":metrics.get("maximum_drawdown"),"benchmark_return":metrics.get("benchmark_total_return"),"trades":metrics.get("number_of_trades"),"data_health":saved.get("data_health_snapshot_json"),"configuration_hash":saved.get("configuration_hash"),"result_hash":saved.get("deterministic_result_hash")}
+                    metrics=saved.get("metrics",{}); health=json.loads(saved.get("data_health_snapshot_json") or "{}")
+                    health_symbols=health.get("symbols",[])
+                    payload={"run_id":saved.get("run_id"),"strategy":f"{saved.get('strategy_name')} {saved.get('strategy_version')}","requested_start":saved.get("requested_start_date"),"effective_start":saved.get("effective_start_date") or saved.get("start_date"),"effective_end":saved.get("effective_end_date") or saved.get("end_date"),"starting_equity":saved.get("initial_cash"),"ending_equity":saved.get("ending_equity"),"total_return":metrics.get("total_return"),"maximum_drawdown":metrics.get("maximum_drawdown"),"benchmark_return":metrics.get("benchmark_total_return"),"trades":metrics.get("number_of_trades"),"data_health_status":health.get("status"),"last_completed_session":health.get("last_completed_session"),"symbols_checked":len(health_symbols),"critical_symbols":sum(x.get("status")=="Critical" for x in health_symbols),"warning_symbols":sum(x.get("status")=="Warning" for x in health_symbols),"material_revision_count":sum(x.get("material_revisions",0) for x in health_symbols),"action_coverage_status":"complete" if all(x.get("corporate_action_coverage")=="complete" for x in health_symbols) else "incomplete","configuration_hash":saved.get("configuration_hash"),"result_hash":saved.get("deterministic_result_hash")}
                 print(json.dumps(payload, sort_keys=True, indent=2, default=str))
             elif args.command == "backtest-report":
                 paths = write_backtest_reports(config["reports_dir"], saved)
@@ -998,8 +1028,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             finally: conn.close()
             if not saved: raise MissingDataError(f"Backtest run does not exist: {args.run_id}")
             if args.command=="strategy-diagnostics":
-                print(json.dumps({"symbol_attribution":saved["symbol_attribution"],"signal_outcomes":saved["signal_outcomes"],"daily_diagnostics":saved["daily_diagnostics"]},indent=2,default=str))
-            elif args.command=="benchmark-diagnostics": print(json.dumps({k:v for k,v in saved["metrics"].items() if "benchmark" in k or k in {"active_return","tracking_error","information_ratio","upside_capture","downside_capture","beta_to_benchmark","correlation_to_benchmark"}},indent=2))
+                if args.full: payload={"symbol_attribution":saved["symbol_attribution"],"signal_outcomes":saved["signal_outcomes"],"exit_diagnostics":saved["exit_diagnostics"],"daily_diagnostics":saved["daily_diagnostics"]}
+                elif args.symbols: payload=saved["symbol_attribution"]
+                elif args.signals: payload=saved["signal_outcomes"]
+                elif args.exits: payload=saved["exit_diagnostics"]
+                elif args.daily: payload=saved["daily_diagnostics"]
+                else:
+                    attrs=saved["symbol_attribution"]; daily=saved["daily_diagnostics"]; signals=saved["signal_outcomes"]
+                    best=max(attrs,key=lambda x:x.get("net_pnl") or 0,default={}); worst=min(attrs,key=lambda x:x.get("net_pnl") or 0,default={})
+                    payload={"total_pnl":sum(x.get("net_pnl") or 0 for x in attrs),"best_symbol":best.get("symbol"),"worst_symbol":worst.get("symbol"),"top_trade_concentration":max((x.get("profit_contribution_pct") or 0 for x in attrs),default=0),"average_cash_percentage":sum(x.get("cash_percentage") or 0 for x in daily)/len(daily) if daily else None,"days_with_no_eligible_candidate":sum(x.get("no_eligible_candidate") or 0 for x in daily),"signal_success_rates":{"5":sum((x.get("return_5") or 0)>0 for x in signals)/len(signals) if signals else None,"21":sum((x.get("return_21") or 0)>0 for x in signals)/len(signals) if signals else None,"63":sum((x.get("return_63") or 0)>0 for x in signals)/len(signals) if signals else None},"exit_count":len(saved["exit_diagnostics"])}
+                print(json.dumps(payload,indent=2,default=str))
+            elif args.command=="benchmark-diagnostics":
+                if args.recalculate: print("Benchmark recalculation is explicit but does not rerun trading; using persisted equity curve metrics.",file=sys.stderr)
+                print(json.dumps({row["metric_name"]:{"value":row["metric_value"],"limitation":row["limitation"]} for row in saved["benchmark_metrics"]},indent=2))
             else:
                 checks={"configuration_hash":bool(saved.get("configuration_hash")),"data_hash":bool(saved.get("data_hash")),"source_fingerprint":bool(saved.get("source_fingerprint")),"result_hash":bool(saved.get("deterministic_result_hash")),"warmup_metadata":saved.get("required_warmup_sessions") is not None,"benchmark_alignment":saved.get("effective_start_date") in (None,saved.get("start_date")),"linked_equity":bool(saved.get("equity_curve"))}
                 print(json.dumps(checks,indent=2)); return int(ExitCode.SUCCESS if all(checks.values()) else ExitCode.OPERATION_FAILED)
@@ -1076,11 +1117,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return int(ExitCode.SUCCESS)
 
         if args.command == "run":
+            update_symbols_requested = list(universe.data_symbols) if not explicit_symbols else list(dict.fromkeys([*symbols, universe.benchmark, *universe.market_context, *universe.defensive_context]))
             successful, failed, _, _ = update_symbols(
-                config, logger, symbols, full_refresh=args.full_refresh
+                config, logger, update_symbols_requested, full_refresh=args.full_refresh
             )
             validate_database(config, logger)
-            batch = _analysis_batch(config, base_dir, symbols, date.today(), persist=True)
+            batch = _analysis_batch(config, base_dir, symbols, date.today(), persist=True, universe=universe)
             scoring_rules = load_scoring_rules(base_dir)
             conn = create_connection(config["database_path"])
             try:
@@ -1094,12 +1136,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     as_of_date=date.today(),
                 )
                 previous = _previous_analysis(conn, date.today().isoformat())
-            finally:
-                conn.close()
-            paths = write_phase2_reports(
-                config["reports_dir"],
-                date.today(),
-                {
+                identity=report_identity(universe.analysis_scope.value,symbols,str(batch.analysis_run_id))
+                paths = write_phase2_reports(config["reports_dir"],date.today(),{
                     "analysis_run_id": batch.analysis_run_id,
                     "as_of_date": batch.as_of_date,
                     "data_through_date": batch.data_through_date,
@@ -1109,12 +1147,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "market_regime": batch.market_context.regime,
                     "market_regime_confidence": batch.market_context.confidence,
                     "market_regime_reasons": batch.market_context.reasons,
-                },
-                batch.results,
-                histories,
-                issues,
-                previous,
-            )
+                },batch.results,histories,issues,previous,identity)
+                if isinstance(conn, sqlite3.Connection):
+                    saved=get_analysis_run(conn,str(batch.analysis_run_id))
+                    if saved is not None: persist_report(conn,base_dir,saved,paths); conn.commit()
+            finally: conn.close()
             print(f"Reports: {paths}")
             if failed and successful:
                 return int(ExitCode.PARTIAL_FAILURE)

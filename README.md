@@ -1,6 +1,6 @@
 # Stock Scrapper
 
-Stock Scrapper 0.5.0 is a free, local, explainable stock-market research and historical-backtesting application. It collects daily market data, preserves it in SQLite, calculates transparent technical evidence, saves reproducible analysis runs, and simulates a long-only strategy in one shared portfolio.
+Stock Scrapper 0.6.0 is a free, local, explainable stock-market research and historical-backtesting application. It collects daily market data, preserves it in SQLite, calculates transparent technical evidence, saves reproducible analysis runs, and simulates a long-only strategy in one shared portfolio.
 
 ## Phase 3.2 calibration and diagnostics
 
@@ -166,6 +166,32 @@ python main.py report --symbols AAPL MSFT --date 2024-12-31
 ```
 
 `scores` and `explain` are read-only by default. Recalculation occurs only when requested. Invalid dates, invalid configuration, missing data, partial failure, database failure, and complete failure return nonzero exit status rather than silently reporting success.
+
+### Universe-aware analyses and canonical runs
+
+The configured **candidate universe** is the 10 stocks eligible for analysis and trading. The **data universe** is the ordered union of candidates, SPY, market context (SPY/QQQ/IWM), and defensive context (TLT/GLD). Data collection, reconciliation, validation, and health commands default to all 15 data symbols. Analysis, reporting, backtesting, and walk-forward commands default to the 10 candidates; context assets are still loaded internally for relative strength, beta, breadth, correlation, and regime calculations.
+
+```powershell
+# Analyze and save the configured candidates as the canonical daily run
+python main.py analyze
+python main.py scores
+python main.py report
+
+# Deliberate alternatives
+python main.py analyze --scope all-data
+python main.py analyze --symbols AAPL MSFT
+python main.py scores --latest-any
+python main.py scores --run-id <analysis-run-id>
+python main.py report --run-id <analysis-run-id>
+```
+
+An explicit symbol list creates a custom run. A custom smoke test—even a newer one—never replaces the default canonical candidate result. `scores`, `explain`, and `report` select the latest canonical candidate-universe run unless `--run-id`, `--latest-any`, or a scope filter explicitly requests another saved run. Symbol filters apply to the already selected run and fail clearly when it does not contain a requested symbol.
+
+Use `analysis-list --scope custom`, `analysis-list --date YYYY-MM-DD`, `analysis-list --canonical-only`, and `analysis-list --limit 20` to catalog saved runs. `analysis-show --run-id <id>` is concise; add `--scores`, `--provenance`, or `--full` for detail.
+
+Analysis reports are rendered from exact stored scores and explanations. Their identity includes the as-of date, scope, and short run ID—for example `stock_summary_2026-07-21_candidates_47eed0ae.html`—so same-day candidate and custom reports coexist. Each report has a JSON manifest and a persisted `analysis_reports` record linking hashes and paths to its source run.
+
+Benchmark risk-adjusted metrics are persisted at backtest completion in `backtest_benchmark_metrics`; `benchmark-diagnostics` reads those rows by default. The Phase 3.3 default-universe correction changes CLI orchestration, not the `score_v1` rules or calculations, so strategy version 1.1.0 remains unchanged.
 
 ### Backtesting
 

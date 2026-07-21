@@ -102,6 +102,9 @@ class AnalysisService:
         symbols: Sequence[str],
         as_of_date: str | date,
         persist: bool = False,
+        analysis_scope: str = "custom",
+        universe_snapshot: Mapping[str, Any] | None = None,
+        candidate_universe_hash: str | None = None,
     ) -> AnalysisBatch:
         """Load every input with ``trade_date <= as_of_date`` at SQL level."""
         if self.conn is None:
@@ -128,7 +131,8 @@ class AnalysisService:
             histories,
             as_of,
             quality_by_symbol=quality_by_symbol,
-            persist=persist,
+            persist=persist, analysis_scope=analysis_scope, universe_snapshot=universe_snapshot,
+            candidate_universe_hash=candidate_universe_hash,
         )
 
     def analyze_loaded_many_as_of(
@@ -139,6 +143,9 @@ class AnalysisService:
         *,
         quality_by_symbol: Mapping[str, list[dict[str, Any]]] | None = None,
         persist: bool = False,
+        analysis_scope: str = "custom",
+        universe_snapshot: Mapping[str, Any] | None = None,
+        candidate_universe_hash: str | None = None,
     ) -> AnalysisBatch:
         """Analyze preloaded, end-bounded histories for efficient backtests."""
         as_of = _as_of(as_of_date)
@@ -257,8 +264,9 @@ class AnalysisService:
                 market_regime_reasons=market_context.reasons,
                 provenance=collect_provenance(Path(__file__).resolve().parents[2],scoring_version=str(self.rules.get("scoring_version","phase2-v2"))),
                 data_health_status=assess_data_health(self.conn,sorted(histories))["status"],
-                universe_snapshot={"candidates":self.watchlist,"benchmark":benchmark,"market_context":sorted(context_symbols)},
+                universe_snapshot=universe_snapshot or {"candidates":self.watchlist,"benchmark":benchmark,"market_context":sorted(context_symbols),"requested_analysis_symbols":requested,"analysis_scope":analysis_scope},
                 data_hash=stable_sha256({symbol:histories.get(symbol,[]) for symbol in sorted(histories)}),
+                analysis_scope=analysis_scope,candidate_universe_hash=candidate_universe_hash,
             )
             self.conn.commit()
         return AnalysisBatch(

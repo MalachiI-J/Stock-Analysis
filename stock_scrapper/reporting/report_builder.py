@@ -92,6 +92,7 @@ def write_phase2_reports(
     histories: Mapping[str, Any],
     quality_issues: Iterable[Mapping[str, Any] | Any],
     previous_results: Iterable[Mapping[str, Any] | Any] | Mapping[str, Any] | None = None,
+    report_identity: str | None = None,
 ) -> dict[str, Path]:
     """Write Phase 2 summary CSV and HTML reports.
 
@@ -183,8 +184,9 @@ def write_phase2_reports(
         entries.append(entry)
         csv_rows.append(_phase2_csv_row(report_date_text, metadata, entry))
 
-    csv_path = output_path / f"stock_summary_{report_date_text}.csv"
-    html_path = output_path / f"stock_summary_{report_date_text}.html"
+    suffix = f"_{report_identity}" if report_identity else ""
+    csv_path = output_path / f"stock_summary_{report_date_text}{suffix}.csv"
+    html_path = output_path / f"stock_summary_{report_date_text}{suffix}.html"
     _write_phase2_csv(csv_path, csv_rows)
     html_path.write_text(
         _render_phase2_html(report_date_text, metadata, entries, candidate_order, risk_order, normalized_issues),

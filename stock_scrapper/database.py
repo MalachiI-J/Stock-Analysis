@@ -212,10 +212,11 @@ def classify_price_revisions(conn: sqlite3.Connection, policy: Mapping[str, Any]
         incoming = json.loads(row["new_values_json"] or "{}")
         result = compare_price_rows(previous, incoming, policy)
         material = int(bool(result.material_differences))
+        automatic = result.revision_class in {"precision_noise", "corporate_action_revision"}
         conn.execute("""UPDATE price_history_revisions SET revision_class=?,is_material=?,
-          absolute_deltas_json=?,relative_deltas_json=?,review_status=COALESCE(NULLIF(review_status,''),'unreviewed')
+          absolute_deltas_json=?,relative_deltas_json=?,review_status=CASE WHEN ? THEN 'automatically_classified' ELSE COALESCE(NULLIF(review_status,''),'unreviewed') END
           WHERE revision_id=?""", (result.revision_class,material,json.dumps(result.absolute_deltas,sort_keys=True),
-          json.dumps(result.relative_deltas,sort_keys=True),row["revision_id"]))
+          json.dumps(result.relative_deltas,sort_keys=True),int(automatic),row["revision_id"]))
         counts[result.revision_class] = counts.get(result.revision_class,0)+1
     return counts
 
@@ -372,12 +373,14 @@ def insert_collection_run(conn: sqlite3.Connection, payload: Mapping[str, Any]) 
     )
 
 
-def list_analysis_runs(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]:
+def list_analysis_runs(conn: sqlite3.Connection, limit: int = 50, *, scope: str | None = None, as_of_date: str | None = None, canonical_only: bool = False) -> list[dict[str, Any]]:
     """Return recent saved analysis runs without recalculating them."""
-    rows = conn.execute(
-        "SELECT * FROM analysis_runs ORDER BY COALESCE(completed_at, started_at) DESC LIMIT ?",
-        (max(1, int(limit)),),
-    ).fetchall()
+    clauses=[]; params: list[Any]=[]
+    if scope: clauses.append("analysis_scope=?"); params.append(scope)
+    if as_of_date: clauses.append("as_of_date=?"); params.append(as_of_date)
+    if canonical_only: clauses.append("is_canonical=1")
+    params.append(max(1,int(limit)))
+    rows = conn.execute("SELECT * FROM analysis_runs " + (("WHERE "+" AND ".join(clauses)) if clauses else "") + " ORDER BY COALESCE(completed_at, started_at) DESC LIMIT ?", params).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -425,3 +428,8 @@ def get_latest_analysis_run(
                 continue
         return get_analysis_run(conn, run_id)
     return None
+
+
+def get_latest_canonical_analysis_run(conn: sqlite3.Connection, scope: str = "candidate_universe") -> dict[str, Any] | None:
+    row=conn.execute("SELECT analysis_run_id FROM analysis_runs WHERE status='completed' AND is_canonical=1 AND analysis_scope=? ORDER BY as_of_date DESC,COALESCE(completed_at,started_at) DESC LIMIT 1",(scope,)).fetchone()
+    return get_analysis_run(conn,str(row[0])) if row else None

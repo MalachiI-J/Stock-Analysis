@@ -259,7 +259,8 @@ def persist_backtest(
                 ),
             )
 
-        for name, value in _mapping(metrics).items():
+        metric_payload=_mapping(metrics)
+        for name, value in metric_payload.items():
             scalar = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
             serialized = None if scalar is not None or value is None else canonical_json(value)
             conn.execute(
@@ -267,6 +268,11 @@ def persist_backtest(
                 "VALUES (?, ?, ?, ?)",
                 (payload["run_id"], name, scalar, serialized),
             )
+        benchmark_names=("benchmark_total_return","benchmark_cagr","benchmark_annualized_volatility","benchmark_maximum_drawdown","benchmark_sharpe_ratio","benchmark_sortino_ratio","benchmark_calmar_ratio","active_return","tracking_error","information_ratio","upside_capture","downside_capture","positive_benchmark_sessions_captured","beta_to_benchmark","correlation_to_benchmark")
+        limitation=canonical_json(metric_payload.get("metric_limitations",[]))
+        for name in benchmark_names:
+            value=metric_payload.get(name)
+            conn.execute("INSERT OR REPLACE INTO backtest_benchmark_metrics(run_id,metric_name,metric_value,limitation) VALUES(?,?,?,?)",(payload["run_id"],name,float(value) if isinstance(value,(int,float)) else None,limitation))
         conn.execute("RELEASE SAVEPOINT persist_backtest")
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT persist_backtest")
@@ -317,6 +323,17 @@ def load_backtest(conn: sqlite3.Connection, run_id: str) -> dict[str, Any] | Non
     for key,table,order in (("symbol_attribution","backtest_symbol_attribution","symbol"),("signal_outcomes","backtest_signal_outcomes","signal_date,symbol"),("exit_diagnostics","backtest_exit_diagnostics","trade_id"),("daily_diagnostics","backtest_daily_diagnostics","trade_date"),("benchmark_metrics","backtest_benchmark_metrics","metric_name")):
         result[key]=[dict(row) for row in conn.execute(f"SELECT * FROM {table} WHERE run_id=? ORDER BY {order}",(run_id,)).fetchall()]
     return result
+
+
+def backfill_benchmark_metrics(conn: sqlite3.Connection) -> int:
+    """Populate the normalized benchmark table from compatible saved metrics."""
+    names=("benchmark_total_return","benchmark_cagr","benchmark_annualized_volatility","benchmark_maximum_drawdown","benchmark_sharpe_ratio","benchmark_sortino_ratio","benchmark_calmar_ratio","active_return","tracking_error","information_ratio","upside_capture","downside_capture","positive_benchmark_sessions_captured","beta_to_benchmark","correlation_to_benchmark")
+    count=0
+    for row in conn.execute("SELECT run_id,metric_name,metric_value FROM backtest_metrics WHERE metric_name IN (%s)" % ",".join("?" for _ in names),names):
+        before=conn.total_changes
+        conn.execute("INSERT OR IGNORE INTO backtest_benchmark_metrics(run_id,metric_name,metric_value,limitation) VALUES(?,?,?,?)",(row[0],row[1],row[2],"Backfilled from persisted Phase 3.2 metric"))
+        count+=conn.total_changes-before
+    return count
 
 
 def persist_walk_forward(conn: sqlite3.Connection, run: Any) -> None:

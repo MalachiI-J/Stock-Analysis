@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-LATEST_SCHEMA_VERSION = 5
+LATEST_SCHEMA_VERSION = 6
 
 
 def _utc_now() -> str:
@@ -102,6 +102,10 @@ def apply_migrations(db_path: str | Path) -> None:
             _apply_v5(conn)
         else:
             _ensure_phase32_tables(conn)
+        if current_version < 6:
+            _apply_v6(conn)
+        else:
+            _ensure_phase33_tables(conn)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -922,3 +926,46 @@ def _apply_v5(conn: sqlite3.Connection) -> None:
     _ensure_phase32_tables(conn)
     conn.execute("INSERT INTO schema_metadata(schema_version,applied_at,description) VALUES(?,?,?)",
                  (5,_utc_now(),"Add Phase 3.2 revision calibration, action coverage, run evidence, and diagnostics"))
+
+
+def _ensure_phase33_tables(conn: sqlite3.Connection) -> None:
+    """Add universe-aware analysis identity and exact-run report persistence."""
+    for definition in (
+        "analysis_scope TEXT", "is_canonical INTEGER NOT NULL DEFAULT 0",
+        "requested_symbols_json TEXT", "analyzed_symbols_json TEXT",
+        "blocked_symbols_json TEXT", "symbol_count INTEGER",
+        "candidate_universe_hash TEXT", "universe_configuration_json TEXT",
+        "report_manifest_json TEXT", "supersedes_run_id TEXT",
+        "legacy_scope_inferred INTEGER NOT NULL DEFAULT 0",
+    ):
+        _add_column(conn, "analysis_runs", definition)
+    conn.execute("""CREATE TABLE IF NOT EXISTS analysis_reports (
+      report_id TEXT PRIMARY KEY, analysis_run_id TEXT NOT NULL,
+      generated_at TEXT NOT NULL, scope TEXT NOT NULL, csv_path TEXT,
+      html_path TEXT, manifest_path TEXT, csv_sha256 TEXT, html_sha256 TEXT,
+      report_version INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL,
+      error_summary TEXT, UNIQUE(analysis_run_id,report_version),
+      FOREIGN KEY(analysis_run_id) REFERENCES analysis_runs(analysis_run_id) ON DELETE RESTRICT)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_analysis_runs_scope_canonical ON analysis_runs(analysis_scope,is_canonical,status,completed_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_analysis_reports_run ON analysis_reports(analysis_run_id,generated_at)")
+    candidate = {"AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","JPM","WMT","XOM"}
+    all_data = candidate | {"SPY","QQQ","IWM","TLT","GLD"}
+    import json
+    for row in conn.execute("SELECT analysis_run_id FROM analysis_runs WHERE analysis_scope IS NULL OR requested_symbols_json IS NULL").fetchall():
+        run_id = str(row[0])
+        symbols = [str(item[0]).upper() for item in conn.execute("SELECT symbol FROM stock_analysis WHERE analysis_run_id=? ORDER BY rowid", (run_id,))]
+        symbol_set = set(symbols)
+        scope = "candidate_universe" if symbol_set == candidate else ("all_data_symbols" if symbol_set == all_data else "custom")
+        conn.execute("""UPDATE analysis_runs SET analysis_scope=?,requested_symbols_json=COALESCE(requested_symbols_json,?),
+          analyzed_symbols_json=COALESCE(analyzed_symbols_json,?),blocked_symbols_json=COALESCE(blocked_symbols_json,'[]'),
+          symbol_count=COALESCE(symbol_count,?),legacy_scope_inferred=1 WHERE analysis_run_id=?""",
+          (scope,json.dumps(symbols),json.dumps(symbols),len(symbols),run_id))
+    conn.execute("""UPDATE price_history_revisions SET review_status='automatically_classified'
+      WHERE revision_class IN ('precision_noise','corporate_action_revision')
+        AND COALESCE(review_status,'unreviewed') IN ('','unreviewed')""")
+
+
+def _apply_v6(conn: sqlite3.Connection) -> None:
+    _ensure_phase33_tables(conn)
+    conn.execute("INSERT INTO schema_metadata(schema_version,applied_at,description) VALUES(?,?,?)",
+                 (6,_utc_now(),"Add Phase 3.3 universe scope, canonical selection, report persistence, and review classification"))
