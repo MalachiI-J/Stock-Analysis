@@ -391,6 +391,27 @@ class BacktestRun(DictSerializable):
     price_data_hash: str | None = None
     deterministic_result_hash: str | None = None
     error_summary: str | None = None
+    application_version: str | None = None
+    scoring_version: str | None = None
+    schema_version: int | None = None
+    git_commit_hash: str | None = None
+    git_dirty: bool | None = None
+    source_fingerprint: str | None = None
+    python_version: str | None = None
+    platform_info: str | None = None
+    requested_start_date: str | None = None
+    effective_start_date: str | None = None
+    requested_end_date: str | None = None
+    effective_end_date: str | None = None
+    required_warmup_sessions: int | None = None
+    available_warmup_sessions: int | None = None
+    warmup_policy: str | None = None
+    warmup_warning: str | None = None
+    benchmark_sufficient: bool | None = None
+    excluded_symbols: list[str] = field(default_factory=list)
+    exclusion_reasons: dict[str, str] = field(default_factory=dict)
+    universe_snapshot: dict[str, Any] = field(default_factory=dict)
+    strategy_version_warning: str | None = None
 
     @property
     def config_hash(self) -> str:
@@ -421,6 +442,27 @@ class BacktestRun(DictSerializable):
             "data_hash": self.price_data_hash,
             "deterministic_result_hash": self.deterministic_result_hash,
             "error_summary": self.error_summary,
+            "application_version": self.application_version,
+            "scoring_version": self.scoring_version,
+            "schema_version": self.schema_version,
+            "git_commit_hash": self.git_commit_hash,
+            "git_dirty": self.git_dirty,
+            "source_fingerprint": self.source_fingerprint,
+            "python_version": self.python_version,
+            "platform_info": self.platform_info,
+            "requested_start_date": self.requested_start_date,
+            "effective_start_date": self.effective_start_date,
+            "requested_end_date": self.requested_end_date,
+            "effective_end_date": self.effective_end_date,
+            "required_warmup_sessions": self.required_warmup_sessions,
+            "available_warmup_sessions": self.available_warmup_sessions,
+            "warmup_policy": self.warmup_policy,
+            "warmup_warning": self.warmup_warning,
+            "benchmark_sufficient": self.benchmark_sufficient,
+            "excluded_symbols": self.excluded_symbols,
+            "exclusion_reasons": self.exclusion_reasons,
+            "universe_snapshot": self.universe_snapshot,
+            "strategy_version_warning": self.strategy_version_warning,
         }
 
 
@@ -460,6 +502,19 @@ class PerformanceMetrics(DictSerializable):
     benchmark_maximum_drawdown: float | None = None
     return_vs_benchmark: float | None = None
     drawdown_vs_benchmark: float | None = None
+    benchmark_cagr: float | None = None
+    benchmark_annualized_volatility: float | None = None
+    benchmark_sharpe_ratio: float | None = None
+    benchmark_sortino_ratio: float | None = None
+    benchmark_calmar_ratio: float | None = None
+    active_return: float | None = None
+    tracking_error: float | None = None
+    information_ratio: float | None = None
+    upside_capture: float | None = None
+    downside_capture: float | None = None
+    positive_benchmark_sessions_captured: float | None = None
+    beta_to_benchmark: float | None = None
+    correlation_to_benchmark: float | None = None
     cash_total_return: float = 0.0
     limitations: list[str] = field(default_factory=list)
 

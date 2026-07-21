@@ -2,8 +2,10 @@ README.md
 pyproject.toml
 stock_scrapper/__init__.py
 stock_scrapper/config.py
+stock_scrapper/data_health.py
 stock_scrapper/database.py
 stock_scrapper/exceptions.py
+stock_scrapper/revision_policy.py
 stock_scrapper.egg-info/PKG-INFO
 stock_scrapper.egg-info/SOURCES.txt
 stock_scrapper.egg-info/dependency_links.txt
@@ -23,6 +25,7 @@ stock_scrapper/analysis/service.py
 stock_scrapper/backtesting/__init__.py
 stock_scrapper/backtesting/config.py
 stock_scrapper/backtesting/corporate_actions.py
+stock_scrapper/backtesting/diagnostics.py
 stock_scrapper/backtesting/engine.py
 stock_scrapper/backtesting/metrics.py
 stock_scrapper/backtesting/models.py
@@ -31,7 +34,11 @@ stock_scrapper/backtesting/reporting.py
 stock_scrapper/backtesting/walk_forward.py
 stock_scrapper/collectors/__init__.py
 stock_scrapper/collectors/base.py
+stock_scrapper/collectors/corporate_actions.py
 stock_scrapper/collectors/yahoo_prices.py
+stock_scrapper/market_calendar/__init__.py
+stock_scrapper/market_calendar/nyse_calendar.py
+stock_scrapper/market_calendar/session_resolver.py
 stock_scrapper/migrations/migration_manager.py
 stock_scrapper/models/analysis_models.py
 stock_scrapper/processing/__init__.py
@@ -44,6 +51,7 @@ stock_scrapper/reporting/report_builder.py
 stock_scrapper/utilities/__init__.py
 stock_scrapper/utilities/hashing.py
 stock_scrapper/utilities/logging_setup.py
+stock_scrapper/utilities/provenance.py
 tests/test_analysis.py
 tests/test_analysis_service.py
 tests/test_backtest_reporting.py
@@ -62,6 +70,8 @@ tests/test_market_context.py
 tests/test_migration_integrity.py
 tests/test_phase2_reporting.py
 tests/test_phase2_stabilization.py
+tests/test_phase31_integrity.py
+tests/test_phase32_revision_policy.py
 tests/test_quality_lifecycle.py
 tests/test_relative_strength.py
 tests/test_scoring_math.py

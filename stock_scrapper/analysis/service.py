@@ -20,6 +20,9 @@ from stock_scrapper.database import fetch_price_history, fetch_quality_issues
 from stock_scrapper.models.analysis_models import AnalysisResult
 from stock_scrapper.processing.historical_features import HistoricalFeatureCache
 from stock_scrapper.utilities.hashing import stable_sha256
+from stock_scrapper.utilities.provenance import collect_provenance
+from stock_scrapper.data_health import assess_data_health
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -61,10 +64,12 @@ class AnalysisService:
         conn: sqlite3.Connection | None,
         rules: dict[str, Any],
         watchlist: Sequence[str],
+        include_incomplete_bars: bool = False,
     ) -> None:
         self.conn = conn
         self.rules = validate_scoring_config(rules)
         self.watchlist = list(dict.fromkeys(symbol.upper() for symbol in watchlist))
+        self.include_incomplete_bars = include_incomplete_bars
         self.configuration_hash = stable_sha256(self.rules)
         self._historical_features: HistoricalFeatureCache | None = None
 
@@ -109,7 +114,7 @@ class AnalysisService:
         }
         load_symbols = set(self.watchlist) | set(requested) | context_symbols | {benchmark}
         histories = {
-            symbol: fetch_price_history(self.conn, symbol, end_date=as_of)
+            symbol: fetch_price_history(self.conn, symbol, end_date=as_of, include_incomplete=self.include_incomplete_bars)
             for symbol in sorted(load_symbols)
         }
         quality = fetch_quality_issues(
@@ -250,6 +255,10 @@ class AnalysisService:
                 configuration_snapshot=self.rules,
                 market_regime_metrics=market_context.metrics,
                 market_regime_reasons=market_context.reasons,
+                provenance=collect_provenance(Path(__file__).resolve().parents[2],scoring_version=str(self.rules.get("scoring_version","phase2-v2"))),
+                data_health_status=assess_data_health(self.conn,sorted(histories))["status"],
+                universe_snapshot={"candidates":self.watchlist,"benchmark":benchmark,"market_context":sorted(context_symbols)},
+                data_hash=stable_sha256({symbol:histories.get(symbol,[]) for symbol in sorted(histories)}),
             )
             self.conn.commit()
         return AnalysisBatch(

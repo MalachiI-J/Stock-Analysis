@@ -1,8 +1,9 @@
 strategy_name: score_v1
-strategy_version: "1.0.0"
+strategy_version: "1.1.0"
 benchmark: SPY
 initial_cash: 100000.0
 warm_up_days: 252
+warmup_policy: shift_start
 start_date: 2022-07-20
 end_date: 2026-06-30
 signal_frequency: daily

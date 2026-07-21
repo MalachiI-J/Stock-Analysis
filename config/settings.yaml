@@ -12,3 +12,30 @@ retry_delay_seconds: 2
 logging_level: INFO
 archive_raw_downloads: false
 open_reports_automatically: false
+market_data:
+  exchange: XNYS
+  timezone: America/New_York
+  provider_delay_minutes: 30
+  incomplete_bar_policy: exclude
+  recent_overlap_sessions: 10
+  corporate_action_refresh_sessions: 90
+  scheduled_full_refresh_days: 7
+universes:
+  candidates: [AAPL, MSFT, AMZN, GOOGL, META, NVDA, TSLA, JPM, WMT, XOM]
+  benchmark:
+    symbol: SPY
+  market_context: [SPY, QQQ, IWM]
+  defensive_context: [TLT, GLD]
+warmup:
+  sessions: 252
+  policy: shift_start
+revision_policy:
+  version: revision-v2
+  price_absolute_tolerance: 0.0001
+  price_relative_tolerance: 0.000001
+  adjusted_price_absolute_tolerance: 0.0001
+  adjusted_price_relative_tolerance: 0.000001
+  dividend_absolute_tolerance: 0.00000001
+  split_absolute_tolerance: 0.00000001
+  volume_tolerance: 0
+  store_precision_noise: false

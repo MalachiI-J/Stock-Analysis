@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -30,7 +31,10 @@ from stock_scrapper.backtesting.walk_forward import (
     run_walk_forward,
 )
 from stock_scrapper.collectors.yahoo_prices import YahooPriceCollector
-from stock_scrapper.config import load_config, load_watchlist
+from stock_scrapper.collectors.corporate_actions import action_records, upsert_actions, record_action_coverage
+from stock_scrapper.market_calendar import SessionResolver
+from stock_scrapper.config import load_config, load_watchlist, load_universes, validate_universes
+from stock_scrapper.data_health import assess_data_health
 from stock_scrapper.database import (
     create_connection,
     fetch_price_history,
@@ -42,6 +46,7 @@ from stock_scrapper.database import (
     insert_collection_run,
     list_analysis_runs,
     quality_issue_fingerprint,
+    classify_price_revisions,
     record_quality_issue,
     resolve_quality_issues_after_validation,
     upsert_price_history,
@@ -57,6 +62,7 @@ from stock_scrapper.processing.validation import validate_price_records
 from stock_scrapper.reporting.report_builder import write_phase2_reports
 from stock_scrapper.utilities.hashing import canonical_json
 from stock_scrapper.utilities.logging_setup import setup_logging
+from stock_scrapper.utilities.provenance import collect_provenance
 
 
 def load_scoring_rules(base_dir: Path) -> dict[str, Any]:
@@ -104,6 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     analyze_parser = subparsers.add_parser("analyze", help="Run and save canonical Phase 2 analysis")
     analyze_parser.add_argument("--symbols", nargs="+", help="Optional symbol list")
+    analyze_parser.add_argument("--include-incomplete-bars", action="store_true", help="EXPERIMENTAL: include unfinished/untrusted daily bars")
     _add_as_of_argument(analyze_parser)
 
     scores_parser = subparsers.add_parser("scores", help="Read the latest saved scores")
@@ -143,6 +150,10 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         child = subparsers.add_parser(command, help=help_text)
         child.add_argument("--run-id", required=True)
+        if command == "backtest-show":
+            child.add_argument("--full",action="store_true"); child.add_argument("--metrics",action="store_true"); child.add_argument("--trades",action="store_true"); child.add_argument("--provenance",action="store_true")
+    for command in ("validate-backtest","strategy-diagnostics","benchmark-diagnostics"):
+        child=subparsers.add_parser(command); child.add_argument("--run-id",required=True)
 
     walk = subparsers.add_parser("walk-forward", help="Run fixed-window strategy validation")
     walk.add_argument("--strategy", choices=("score_v1",), default="score_v1")
@@ -152,6 +163,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("validate", help="Run complete database validation")
     subparsers.add_parser("status", help="Show local database status")
+    subparsers.add_parser("market-session", help="Show official XNYS session state")
+    health = subparsers.add_parser("data-health", help="Show offline market-data health")
+    health.add_argument("--symbols", nargs="+")
+    health_report = subparsers.add_parser("data-health-report", help="Write offline data-health JSON report")
+    health_report.add_argument("--symbols", nargs="+")
+    reconcile = subparsers.add_parser("reconcile-prices", help="Refresh and audit recent provider history")
+    reconcile.add_argument("--symbols", nargs="+")
+    reconcile.add_argument("--sessions", type=int)
+    reconcile.add_argument("--full", action="store_true")
+    revisions = subparsers.add_parser("revisions", help="Show recorded price revisions")
+    revisions.add_argument("--symbol")
+    revisions.add_argument("--material-only", action="store_true")
+    revisions.add_argument("--class", dest="revision_class")
+    subparsers.add_parser("revisions-classify", help="Classify retained revision audit rows")
+    actions = subparsers.add_parser("corporate-actions", help="Show explicitly stored corporate actions")
+    actions.add_argument("--symbol")
+    action_refresh = subparsers.add_parser("corporate-actions-refresh", help="Refresh explicit corporate actions and checked coverage")
+    action_refresh.add_argument("--symbols", nargs="+")
+    action_refresh.add_argument("--full", action="store_true")
+    subparsers.add_parser("universe-show", help="Show role-aware symbol universes")
+    subparsers.add_parser("universe-validate", help="Validate symbol universe roles")
+    subparsers.add_parser("provenance", help="Show current software provenance")
     return parser
 
 
@@ -231,25 +264,44 @@ def update_symbols(
     updated_count = 0
     run_id = f"collection-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
     started_at = datetime.now(timezone.utc).isoformat()
+    market_settings = config.get("market_data", {})
+    resolver = SessionResolver(int(market_settings.get("provider_delay_minutes", 30)))
+    completed_end = resolver.previous_completed_session()
     try:
         for symbol in symbols:
             try:
                 latest = None if full_refresh else get_latest_trade_date(conn, symbol)
-                start = date.fromisoformat(latest) + timedelta(days=1) if latest else None
+                if latest:
+                    overlap = int(market_settings.get("recent_overlap_sessions", 10))
+                    anchor = min(date.fromisoformat(latest), completed_end)
+                    start = resolver.overlap_start(anchor, overlap)
+                else:
+                    start = None
                 frame = collector.collect(
                     symbol=symbol,
                     start_date=start,
-                    end_date=date.today(),
+                    end_date=completed_end,
                     full_refresh=full_refresh,
                 )
+                if frame.empty and (start is None or start <= completed_end):
+                    raise MissingDataError(
+                        f"Provider returned no rows for {symbol} through completed session {completed_end}"
+                    )
+                actions_frame = frame
+                if not full_refresh:
+                    action_sessions = int(market_settings.get("corporate_action_refresh_sessions", 90))
+                    action_start = resolver.overlap_start(completed_end, action_sessions)
+                    if start is not None and action_start < start:
+                        actions_frame = collector.collect(symbol=symbol, start_date=action_start, end_date=completed_end)
                 conn.execute("BEGIN")
                 try:
                     symbol_inserted = 0
                     symbol_updated = 0
                     for row in frame.to_dict(orient="records"):
-                        inserted, updated = upsert_price_history(conn, row)
+                        inserted, updated = upsert_price_history(conn, row, collection_run_id=run_id, revision_policy=config.get("revision_policy"))
                         symbol_inserted += inserted
                         symbol_updated += updated
+                    upsert_actions(conn, action_records(symbol, actions_frame))
                     complete_history = fetch_price_history(conn, symbol)
                     if not complete_history:
                         raise MissingDataError(
@@ -335,6 +387,7 @@ def _analysis_batch(
     as_of_date: date,
     *,
     persist: bool,
+    include_incomplete_bars: bool = False,
 ) -> AnalysisBatch:
     initialize_database(config["database_path"])
     conn = create_connection(config["database_path"])
@@ -343,6 +396,7 @@ def _analysis_batch(
             conn,
             load_scoring_rules(base_dir),
             load_watchlist(config["watchlist_path"]),
+            include_incomplete_bars=include_incomplete_bars,
         )
         return service.analyze_many_as_of(symbols, as_of_date, persist=persist)
     finally:
@@ -598,6 +652,10 @@ def run_backtests(
             quality_by_symbol=quality,
             persist_conn=conn,
         )
+        health=assess_data_health(conn,sorted(set(symbols)|{typed.benchmark}))
+        coverage=[dict(row) for row in conn.execute("SELECT * FROM corporate_action_coverage WHERE symbol IN (%s)" % ",".join("?" for _ in set(symbols)),sorted(set(symbols))).fetchall()] if symbols else []
+        conn.execute("UPDATE backtest_runs SET data_health_snapshot_json=?,corporate_action_coverage_json=?,revision_policy_version=?,universe_json=? WHERE run_id=?",
+                     (canonical_json(health),canonical_json(coverage),str(config.get("revision_policy",{}).get("version","unknown")),canonical_json(load_universes(config)),result.run.run_id)); conn.commit()
         logger.info("Backtest %s persisted", result.run.run_id)
         return result
     finally:
@@ -700,9 +758,97 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Active detections: {len(issues)}")
             return int(ExitCode.SUCCESS)
 
+        if args.command == "market-session":
+            resolver = SessionResolver(int(config.get("market_data", {}).get("provider_delay_minutes", 30)))
+            now = datetime.now(timezone.utc)
+            completed = resolver.previous_completed_session(now)
+            today = now.astimezone(ZoneInfo("America/New_York")).date()
+            payload = {"exchange": "XNYS", "now": now.isoformat(), "today_is_session": resolver.is_session(today), "last_completed_session": completed.isoformat()}
+            if resolver.is_session(today): payload["today"] = resolver.session(today, now).__dict__ if hasattr(resolver.session(today, now), "__dict__") else {key: str(getattr(resolver.session(today, now), key)) for key in ("session_date","opens_at","closes_at","completion_at","is_early_close","is_complete")}
+            print(json.dumps(payload, indent=2, default=str)); return int(ExitCode.SUCCESS)
+
+        if args.command in {"universe-show", "universe-validate"}:
+            universes = load_universes(config); warnings = validate_universes(universes)
+            print(json.dumps({"universes": universes, "warnings": warnings}, indent=2))
+            return int(ExitCode.PARTIAL_FAILURE if warnings else ExitCode.SUCCESS)
+
+        if args.command == "provenance":
+            print(json.dumps(collect_provenance(base_dir,scoring_version=str(load_scoring_rules(base_dir).get("scoring_version"))), indent=2, default=str)); return int(ExitCode.SUCCESS)
+
+        if args.command in {"data-health", "data-health-report"}:
+            initialize_database(config["database_path"]); conn = create_connection(config["database_path"])
+            try: health = assess_data_health(conn, symbols, int(config.get("market_data", {}).get("provider_delay_minutes", 30)))
+            finally: conn.close()
+            print(json.dumps(health, indent=2, default=str))
+            if args.command == "data-health-report":
+                target = Path(config["reports_dir"]) / f"data_health_{date.today().isoformat()}.json"
+                target.write_text(json.dumps(health, indent=2, default=str), encoding="utf-8"); print(f"Report: {target}")
+                html_target=target.with_suffix(".html")
+                rows="".join(f"<tr><td>{item['symbol']}</td><td>{item['status']}</td><td>{item['complete_bars']}</td><td>{len(item['missing_expected_sessions'])}</td><td>{item['material_revisions']}</td><td>{item['precision_noise_revisions']}</td><td>{item['corporate_action_coverage']}</td></tr>" for item in health["symbols"])
+                html_target.write_text(f"<!doctype html><meta charset='utf-8'><title>Data health</title><style>body{{font-family:system-ui;margin:2rem}}table{{border-collapse:collapse}}td,th{{border:1px solid #bbb;padding:.4rem}}</style><h1>Data health: {health['status']}</h1><p>Last completed XNYS session: {health['last_completed_session']}</p><table><tr><th>Symbol</th><th>Status</th><th>Complete bars</th><th>Missing</th><th>Material revisions</th><th>Precision noise</th><th>Action coverage</th></tr>{rows}</table>",encoding="utf-8"); print(f"HTML: {html_target}")
+            return int(ExitCode.OPERATION_FAILED if health["status"] == "Critical" else (ExitCode.PARTIAL_FAILURE if health["status"] == "Warning" else ExitCode.SUCCESS))
+
+        if args.command == "reconcile-prices":
+            if args.sessions is not None:
+                if args.sessions < 1: parser.error("--sessions must be positive")
+                config["market_data"]["recent_overlap_sessions"] = args.sessions
+            successful, failed, inserted, updated = update_symbols(config, logger, symbols, full_refresh=args.full)
+            print(f"inserted={inserted} revised={updated} unchanged rows are not counted successful={len(successful)} failed={len(failed)}")
+            return int(ExitCode.PARTIAL_FAILURE if failed and successful else (ExitCode.OPERATION_FAILED if failed else ExitCode.SUCCESS))
+
+        if args.command == "corporate-actions-refresh":
+            initialize_database(config["database_path"]); conn=create_connection(config["database_path"])
+            collector=YahooPriceCollector(max_retries=int(config.get("retry_count",3)),retry_delay_seconds=float(config.get("retry_delay_seconds",2)),historical_lookback_years=int(config.get("historical_lookback_years",5)))
+            failures=[]; total=0
+            try:
+                for symbol in symbols:
+                    coverage=conn.execute("SELECT MIN(trade_date),MAX(trade_date) FROM price_history WHERE symbol=?",(symbol,)).fetchone()
+                    if not coverage or not coverage[0]: failures.append(symbol); continue
+                    end=date.fromisoformat(coverage[1]); start=date.fromisoformat(coverage[0]) if args.full else SessionResolver().overlap_start(end,int(config.get("market_data",{}).get("corporate_action_refresh_sessions",90)))
+                    try:
+                        frame=collector.collect(symbol,start_date=start,end_date=end)
+                        if frame.empty: raise MissingDataError(f"Provider returned no coverage response for {symbol}")
+                        records=action_records(symbol,frame); total+=upsert_actions(conn,records)
+                        record_action_coverage(conn,symbol,"yfinance",start.isoformat(),end.isoformat(),records)
+                        conn.commit()
+                    except Exception as exc:
+                        conn.rollback(); failures.append(symbol)
+                        record_action_coverage(conn,symbol,"yfinance",start.isoformat(),end.isoformat(),[],status="failed",error=str(exc)); conn.commit()
+            finally: conn.close()
+            print(f"actions_upserted={total} symbols={len(symbols)} failed={len(failures)}")
+            return int(ExitCode.PARTIAL_FAILURE if failures else ExitCode.SUCCESS)
+
+        if args.command == "revisions-classify":
+            initialize_database(config["database_path"]); conn=create_connection(config["database_path"])
+            try:
+                counts=classify_price_revisions(conn,config.get("revision_policy")); conn.commit()
+            finally: conn.close()
+            print(json.dumps(counts,indent=2,sort_keys=True)); return int(ExitCode.SUCCESS)
+
+        if args.command in {"revisions", "corporate-actions"}:
+            initialize_database(config["database_path"]); conn = create_connection(config["database_path"])
+            try:
+                if args.command == "revisions":
+                    clauses=[]; params=[]
+                    if args.symbol: clauses.append("symbol=?"); params.append(args.symbol.upper())
+                    if args.material_only: clauses.append("is_material=1")
+                    if args.revision_class: clauses.append("revision_class=?"); params.append(args.revision_class)
+                    rows = conn.execute("SELECT * FROM price_history_revisions" + ((" WHERE "+" AND ".join(clauses)) if clauses else "") + " ORDER BY detected_at DESC", params).fetchall()
+                else:
+                    rows = conn.execute("SELECT * FROM corporate_actions" + (" WHERE symbol=?" if args.symbol else "") + " ORDER BY action_date DESC", ((args.symbol.upper(),) if args.symbol else ())).fetchall()
+            finally: conn.close()
+            print(json.dumps([dict(row) for row in rows], indent=2, default=str)); return int(ExitCode.SUCCESS)
+
         if args.command == "analyze":
             effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
-            batch = _analysis_batch(config, base_dir, symbols, effective, persist=True)
+            if args.include_incomplete_bars:
+                print("WARNING: EXPERIMENTAL analysis includes incomplete/untrusted daily bars", file=sys.stderr)
+            else:
+                conn = create_connection(config["database_path"])
+                try: health = assess_data_health(conn, symbols, int(config.get("market_data", {}).get("provider_delay_minutes", 30)))
+                finally: conn.close()
+                if health["status"] == "Critical": raise MissingDataError("Critical market-data health blocks live classification")
+            batch = _analysis_batch(config, base_dir, symbols, effective, persist=True, include_incomplete_bars=args.include_incomplete_bars)
             _print_scores(batch.results)
             if not any(result.eligible_for_scoring for result in batch.results):
                 return int(ExitCode.MISSING_DATA)
@@ -826,7 +972,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             if saved is None:
                 raise MissingDataError(f"Backtest run does not exist: {args.run_id}")
             if args.command == "backtest-show":
-                print(json.dumps(saved, sort_keys=True, indent=2, default=str))
+                if args.full: payload=saved
+                elif args.metrics: payload=saved.get("metrics",{})
+                elif args.trades: payload=saved.get("trades",[])
+                elif args.provenance: payload={k:saved.get(k) for k in ("application_version","strategy_name","strategy_version","scoring_version","schema_version","git_commit_hash","git_dirty","source_fingerprint","python_version","platform_info","configuration_hash","data_hash","deterministic_result_hash")}
+                else:
+                    metrics=saved.get("metrics",{}); payload={"run_id":saved.get("run_id"),"strategy":f"{saved.get('strategy_name')} {saved.get('strategy_version')}","requested_start":saved.get("requested_start_date"),"effective_start":saved.get("effective_start_date") or saved.get("start_date"),"effective_end":saved.get("effective_end_date") or saved.get("end_date"),"starting_equity":saved.get("initial_cash"),"ending_equity":saved.get("ending_equity"),"total_return":metrics.get("total_return"),"maximum_drawdown":metrics.get("maximum_drawdown"),"benchmark_return":metrics.get("benchmark_total_return"),"trades":metrics.get("number_of_trades"),"data_health":saved.get("data_health_snapshot_json"),"configuration_hash":saved.get("configuration_hash"),"result_hash":saved.get("deterministic_result_hash")}
+                print(json.dumps(payload, sort_keys=True, indent=2, default=str))
             elif args.command == "backtest-report":
                 paths = write_backtest_reports(config["reports_dir"], saved)
                 for name, path in paths.items():
@@ -838,6 +990,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"Return versus SPY: {metrics.get('return_vs_benchmark')}")
                 print("Cash return: 0.0")
                 print(f"Drawdown versus SPY: {metrics.get('drawdown_vs_benchmark')}")
+            return int(ExitCode.SUCCESS)
+
+        if args.command in {"validate-backtest","strategy-diagnostics","benchmark-diagnostics"}:
+            initialize_database(config["database_path"]); conn=create_connection(config["database_path"])
+            try: saved=load_backtest(conn,args.run_id)
+            finally: conn.close()
+            if not saved: raise MissingDataError(f"Backtest run does not exist: {args.run_id}")
+            if args.command=="strategy-diagnostics":
+                print(json.dumps({"symbol_attribution":saved["symbol_attribution"],"signal_outcomes":saved["signal_outcomes"],"daily_diagnostics":saved["daily_diagnostics"]},indent=2,default=str))
+            elif args.command=="benchmark-diagnostics": print(json.dumps({k:v for k,v in saved["metrics"].items() if "benchmark" in k or k in {"active_return","tracking_error","information_ratio","upside_capture","downside_capture","beta_to_benchmark","correlation_to_benchmark"}},indent=2))
+            else:
+                checks={"configuration_hash":bool(saved.get("configuration_hash")),"data_hash":bool(saved.get("data_hash")),"source_fingerprint":bool(saved.get("source_fingerprint")),"result_hash":bool(saved.get("deterministic_result_hash")),"warmup_metadata":saved.get("required_warmup_sessions") is not None,"benchmark_alignment":saved.get("effective_start_date") in (None,saved.get("start_date")),"linked_equity":bool(saved.get("equity_curve"))}
+                print(json.dumps(checks,indent=2)); return int(ExitCode.SUCCESS if all(checks.values()) else ExitCode.OPERATION_FAILED)
             return int(ExitCode.SUCCESS)
 
         if args.command == "walk-forward":

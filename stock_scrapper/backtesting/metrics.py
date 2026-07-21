@@ -501,6 +501,8 @@ def calculate_performance_metrics(
     benchmark_drawdown: float | None = None
     return_vs_benchmark: float | None = None
     drawdown_vs_benchmark: float | None = None
+    benchmark_cagr=benchmark_volatility=benchmark_sharpe=benchmark_sortino=benchmark_calmar=None
+    tracking_error=information_ratio=upside_capture=downside_capture=positive_capture=beta=correlation=None
     if effective_benchmark_curve is not None:
         benchmark_points = _normalize_equity_curve(effective_benchmark_curve)
         aligned_strategy, aligned_benchmark = _aligned_values(points, benchmark_points)
@@ -513,6 +515,27 @@ def calculate_performance_metrics(
                 return_vs_benchmark = aligned_strategy_return - benchmark_total_return
             if aligned_strategy_drawdown is not None and benchmark_drawdown is not None:
                 drawdown_vs_benchmark = aligned_strategy_drawdown - benchmark_drawdown
+            benchmark_cagr=calculate_cagr(aligned_benchmark[0],aligned_benchmark[-1],years)
+            strategy_daily,_=_daily_returns(aligned_strategy); benchmark_daily,_=_daily_returns(aligned_benchmark)
+            benchmark_volatility=calculate_annualized_volatility(benchmark_daily,annualization_factor)
+            benchmark_sharpe=calculate_sharpe_ratio(benchmark_daily,risk_free_rate,annualization_factor)
+            benchmark_sortino=calculate_sortino_ratio(benchmark_daily,risk_free_rate,annualization_factor)
+            benchmark_calmar=calculate_calmar_ratio(benchmark_cagr,benchmark_drawdown)
+            if len(strategy_daily)==len(benchmark_daily) and len(strategy_daily)>=2:
+                active=[s-b for s,b in zip(strategy_daily,benchmark_daily)]
+                active_std=stdev(active); tracking_error=active_std*sqrt(annualization_factor)
+                information_ratio=(mean(active)/active_std*sqrt(annualization_factor)) if active_std else None
+                up=[i for i,b in enumerate(benchmark_daily) if b>0]; down=[i for i,b in enumerate(benchmark_daily) if b<0]
+                up_den=sum(benchmark_daily[i] for i in up); down_den=sum(benchmark_daily[i] for i in down)
+                upside_capture=sum(strategy_daily[i] for i in up)/up_den if up and up_den else None
+                downside_capture=sum(strategy_daily[i] for i in down)/down_den if down and down_den else None
+                positive_capture=sum(strategy_daily[i]>0 for i in up)/len(up) if up else None
+                bmean=mean(benchmark_daily); smean=mean(strategy_daily)
+                covariance=sum((s-smean)*(b-bmean) for s,b in zip(strategy_daily,benchmark_daily))/(len(strategy_daily)-1)
+                bvar=sum((b-bmean)**2 for b in benchmark_daily)/(len(benchmark_daily)-1)
+                beta=covariance/bvar if bvar else None
+                sdev=stdev(strategy_daily); bdev=stdev(benchmark_daily)
+                correlation=covariance/(sdev*bdev) if sdev and bdev else None
 
     limitations: list[str] = []
     limitations.extend(trade_limitations)
@@ -554,6 +577,12 @@ def calculate_performance_metrics(
         benchmark_maximum_drawdown=benchmark_drawdown,
         return_vs_benchmark=return_vs_benchmark,
         drawdown_vs_benchmark=drawdown_vs_benchmark,
+        benchmark_cagr=benchmark_cagr,benchmark_annualized_volatility=benchmark_volatility,
+        benchmark_sharpe_ratio=benchmark_sharpe,benchmark_sortino_ratio=benchmark_sortino,
+        benchmark_calmar_ratio=benchmark_calmar,active_return=return_vs_benchmark,
+        tracking_error=tracking_error,information_ratio=information_ratio,upside_capture=upside_capture,
+        downside_capture=downside_capture,positive_benchmark_sessions_captured=positive_capture,
+        beta_to_benchmark=beta,correlation_to_benchmark=correlation,
         limitations=limitations,
         **trade_stats,
     )

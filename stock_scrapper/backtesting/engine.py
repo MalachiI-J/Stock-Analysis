@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Mapping, Sequence
@@ -28,6 +29,8 @@ from stock_scrapper.backtesting.models import (
 from stock_scrapper.backtesting.persistence import persist_backtest
 from stock_scrapper.models.analysis_models import AnalysisResult
 from stock_scrapper.utilities.hashing import stable_sha256
+from stock_scrapper.utilities.provenance import collect_provenance
+from stock_scrapper.backtesting.diagnostics import calculate_diagnostics, persist_diagnostics
 
 
 @dataclass(slots=True)
@@ -139,8 +142,25 @@ class _PortfolioSimulator:
         available_sessions = benchmark_sessions or universe_sessions
         if not available_sessions:
             raise ValueError("No stored trading sessions are available for the requested universe")
-        start = _effective_date(config.start_date, available_sessions[0])
+        requested_start = _effective_date(config.start_date, available_sessions[0])
         end = _effective_date(config.end_date, available_sessions[-1])
+        prior_benchmark=[session for session in benchmark_sessions if session < requested_start.isoformat()]
+        self.requested_start_date=requested_start.isoformat(); self.requested_end_date=end.isoformat()
+        self.available_warmup_sessions=len(prior_benchmark); self.required_warmup_sessions=config.warm_up_days
+        self.warmup_policy=config.warmup_policy; self.warmup_warning=None
+        start=requested_start
+        if len(prior_benchmark) < config.warm_up_days:
+            if config.warmup_policy == "reject":
+                raise ValueError(f"Benchmark has {len(prior_benchmark)} warm-up sessions; {config.warm_up_days} required")
+            if config.warmup_policy == "shift_start":
+                if len(benchmark_sessions) <= config.warm_up_days:
+                    raise ValueError(f"Benchmark cannot supply {config.warm_up_days} warm-up sessions")
+                shifted=benchmark_sessions[config.warm_up_days]
+                start=date.fromisoformat(max(requested_start.isoformat(),shifted))
+                self.warmup_warning=f"Effective start shifted from {requested_start} to {start} for {config.warm_up_days} completed warm-up sessions"
+                self.available_warmup_sessions=len([s for s in benchmark_sessions if s < start.isoformat()])
+            else:
+                self.warmup_warning=f"Run allowed with {len(prior_benchmark)} of {config.warm_up_days} required warm-up sessions"
         self.sessions = [session for session in available_sessions if start.isoformat() <= session <= end.isoformat()]
         if not self.sessions:
             raise ValueError("No stored trading sessions fall inside the requested backtest dates")
@@ -907,7 +927,17 @@ class _PortfolioSimulator:
                     for symbol in sorted(self.histories)
                 }
             ),
+            requested_start_date=self.requested_start_date, effective_start_date=self.start_date,
+            requested_end_date=self.requested_end_date, effective_end_date=self.end_date,
+            required_warmup_sessions=self.required_warmup_sessions,
+            available_warmup_sessions=self.available_warmup_sessions, warmup_policy=self.warmup_policy,
+            warmup_warning=self.warmup_warning, benchmark_sufficient=self.available_warmup_sessions >= self.required_warmup_sessions,
+            excluded_symbols=[], exclusion_reasons={},
+            universe_snapshot={"candidates":self.symbols,"benchmark":self.config.benchmark},
         )
+        provenance = collect_provenance(Path(__file__).resolve().parents[2], self.config.strategy_name, self.config.strategy_version, str(self.analysis_rules.get("scoring_version") or "unknown"))
+        for key, value in provenance.items():
+            if hasattr(run, key): setattr(run, key, value)
         normalized = {
             "signals": [
                 {key: value for key, value in signal.to_dict().items() if key not in {"run_id", "signal_id"}}
@@ -940,6 +970,10 @@ class _PortfolioSimulator:
                 for snapshot in self.snapshots
             ],
             "metrics": metrics.to_dict(),
+            "configuration_hash": run.configuration_hash,
+            "data_hash": run.price_data_hash,
+            "source_fingerprint": run.source_fingerprint,
+            "strategy_version": run.strategy_version,
         }
         run.deterministic_result_hash = stable_sha256(normalized)
         return PortfolioBacktestResult(
@@ -989,6 +1023,9 @@ def run_portfolio_backtest(
     )
     result = simulator.run()
     if persist_conn is not None:
+        prior=persist_conn.execute("SELECT source_fingerprint FROM backtest_runs WHERE strategy_name=? AND strategy_version=? AND source_fingerprint IS NOT NULL ORDER BY started_at DESC LIMIT 1",(result.run.strategy_name,result.run.strategy_version)).fetchone()
+        if prior is not None and str(prior[0]) != str(result.run.source_fingerprint):
+            result.run.strategy_version_warning="Source implementation changed without a strategy-version change"
         persist_backtest(
             persist_conn,
             result.run,
@@ -1000,6 +1037,8 @@ def run_portfolio_backtest(
             result.snapshots,
             result.metrics,
         )
+        diagnostics=calculate_diagnostics(result.run.run_id,result.trades,result.signals,result.snapshots,result.rejected_candidates,histories,config.maximum_positions)
+        persist_diagnostics(persist_conn,diagnostics)
         if commit_persistence:
             persist_conn.commit()
     return result
