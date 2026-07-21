@@ -38,6 +38,7 @@ def _config(
     payload.update(
         initial_cash=initial_cash,
         warm_up_days=2,
+        warmup_policy="allow_with_warning",
         start_date=sessions[0],
         end_date=sessions[-1],
         signal_frequency="daily",

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-LATEST_SCHEMA_VERSION = 3
+LATEST_SCHEMA_VERSION = 6
 
 
 def _utc_now() -> str:
@@ -94,6 +94,18 @@ def apply_migrations(db_path: str | Path) -> None:
             _apply_v3(conn)
         else:
             _ensure_phase3_tables(conn)
+        if current_version < 4:
+            _apply_v4(conn)
+        else:
+            _ensure_phase31_tables(conn)
+        if current_version < 5:
+            _apply_v5(conn)
+        else:
+            _ensure_phase32_tables(conn)
+        if current_version < 6:
+            _apply_v6(conn)
+        else:
+            _ensure_phase33_tables(conn)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -794,3 +806,166 @@ def _apply_v3(conn: sqlite3.Connection) -> None:
         "INSERT INTO schema_metadata (schema_version, applied_at, description) VALUES (?, ?, ?)",
         (3, _utc_now(), "Add Phase 3 portfolio backtest and walk-forward tables"),
     )
+
+
+def _ensure_phase31_tables(conn: sqlite3.Connection) -> None:
+    """Add auditable daily-bar lifecycle, revisions, actions, and provenance."""
+    for definition in (
+        "bar_status TEXT NOT NULL DEFAULT 'unknown' CHECK(bar_status IN ('complete','incomplete','revised','invalid','unknown'))",
+        "is_complete INTEGER NOT NULL DEFAULT 0 CHECK(is_complete IN (0,1))",
+        "session_close_at TEXT",
+        "provider_updated_at TEXT",
+        "first_collected_at TEXT",
+        "last_collected_at TEXT",
+        "revision_count INTEGER NOT NULL DEFAULT 0 CHECK(revision_count >= 0)",
+        "row_fingerprint TEXT",
+    ):
+        _add_column(conn, "price_history", definition)
+    conn.execute("UPDATE price_history SET first_collected_at=COALESCE(first_collected_at,collected_at), last_collected_at=COALESCE(last_collected_at,collected_at)")
+    # Conservative legacy classification: validated older rows are complete, while
+    # every symbol's latest pre-migration row remains unknown pending reconciliation.
+    conn.execute(
+        """UPDATE price_history AS prices SET bar_status='complete', is_complete=1
+        WHERE bar_status='unknown' AND open IS NOT NULL AND high IS NOT NULL
+          AND low IS NOT NULL AND close IS NOT NULL AND volume IS NOT NULL
+          AND high >= MAX(open, close, low) AND low <= MIN(open, close, high)
+          AND trade_date < (SELECT MAX(latest.trade_date) FROM price_history AS latest WHERE latest.symbol=prices.symbol)"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS price_history_revisions (
+        revision_id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL,
+        trade_date TEXT NOT NULL, detected_at TEXT NOT NULL,
+        previous_fingerprint TEXT NOT NULL, new_fingerprint TEXT NOT NULL,
+        changed_fields_json TEXT NOT NULL, previous_values_json TEXT NOT NULL,
+        new_values_json TEXT NOT NULL, data_source TEXT, collection_run_id TEXT,
+        reason TEXT NOT NULL, analysis_critical INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(symbol, trade_date, previous_fingerprint, new_fingerprint)
+        )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_price_revisions_symbol_date ON price_history_revisions(symbol,trade_date,detected_at)")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS corporate_actions (
+        action_id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL,
+        action_date TEXT NOT NULL, action_type TEXT NOT NULL CHECK(action_type IN ('dividend','split')),
+        dividend_amount REAL, split_ratio REAL, source TEXT NOT NULL,
+        collected_at TEXT NOT NULL, provider_reference TEXT,
+        UNIQUE(symbol, action_date, action_type, source)
+        )"""
+    )
+    for definition in (
+        "application_version TEXT", "scoring_version TEXT", "schema_version INTEGER",
+        "git_commit_hash TEXT", "git_dirty INTEGER", "source_fingerprint TEXT",
+        "python_version TEXT", "platform_info TEXT", "requested_start_date TEXT",
+        "effective_start_date TEXT", "required_warmup_sessions INTEGER",
+        "available_warmup_sessions INTEGER", "warmup_policy TEXT",
+        "warmup_warning TEXT", "universe_json TEXT", "benchmark_sufficient INTEGER",
+    ):
+        _add_column(conn, "backtest_runs", definition)
+    for definition in (
+        "application_version TEXT", "schema_version INTEGER", "git_commit_hash TEXT",
+        "git_dirty INTEGER", "source_fingerprint TEXT", "python_version TEXT",
+        "platform_info TEXT", "data_health_status TEXT", "universe_json TEXT",
+    ):
+        _add_column(conn, "analysis_runs", definition)
+
+
+def _apply_v4(conn: sqlite3.Connection) -> None:
+    _ensure_phase31_tables(conn)
+    conn.execute(
+        "INSERT INTO schema_metadata (schema_version, applied_at, description) VALUES (?, ?, ?)",
+        (4, _utc_now(), "Add Phase 3.1 session integrity, revisions, corporate actions, warm-up, and provenance"),
+    )
+
+
+def _ensure_phase32_tables(conn: sqlite3.Connection) -> None:
+    for definition in (
+        "revision_class TEXT", "is_material INTEGER", "absolute_deltas_json TEXT",
+        "relative_deltas_json TEXT", "review_status TEXT NOT NULL DEFAULT 'unreviewed'",
+        "review_notes TEXT",
+    ): _add_column(conn, "price_history_revisions", definition)
+    conn.execute("""CREATE TABLE IF NOT EXISTS corporate_action_coverage (
+      symbol TEXT NOT NULL, data_source TEXT NOT NULL, requested_start_date TEXT NOT NULL,
+      requested_end_date TEXT NOT NULL, earliest_action_date TEXT, latest_action_date TEXT,
+      last_successful_collection_time TEXT, last_attempted_collection_time TEXT NOT NULL,
+      collection_status TEXT NOT NULL, error_summary TEXT, coverage_confidence TEXT NOT NULL,
+      response_hash TEXT, PRIMARY KEY(symbol,data_source))""")
+    for definition in (
+        "requested_end_date TEXT", "effective_end_date TEXT", "excluded_symbols_json TEXT",
+        "exclusion_reasons_json TEXT", "data_health_snapshot_json TEXT",
+        "corporate_action_coverage_json TEXT", "revision_policy_version TEXT",
+        "strategy_version_warning TEXT",
+    ): _add_column(conn, "backtest_runs", definition)
+    _add_column(conn, "analysis_runs", "data_hash TEXT")
+    conn.execute("""CREATE TABLE IF NOT EXISTS backtest_symbol_attribution (
+      run_id TEXT NOT NULL, symbol TEXT NOT NULL, trades INTEGER NOT NULL, gross_pnl REAL,
+      net_pnl REAL, profit_contribution_pct REAL, win_rate REAL, average_trade REAL,
+      average_holding_period REAL, commission REAL, slippage REAL,
+      PRIMARY KEY(run_id,symbol), FOREIGN KEY(run_id) REFERENCES backtest_runs(run_id) ON DELETE CASCADE)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS backtest_signal_outcomes (
+      run_id TEXT NOT NULL, signal_id TEXT NOT NULL, symbol TEXT NOT NULL, signal_date TEXT NOT NULL,
+      return_5 REAL, return_21 REAL, return_63 REAL, maximum_favorable_excursion REAL,
+      maximum_adverse_excursion REAL, PRIMARY KEY(run_id,signal_id),
+      FOREIGN KEY(run_id) REFERENCES backtest_runs(run_id) ON DELETE CASCADE)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS backtest_exit_diagnostics (
+      run_id TEXT NOT NULL, trade_id TEXT NOT NULL, symbol TEXT NOT NULL, exit_reason TEXT,
+      realized_pnl REAL, maximum_before_exit REAL, maximum_after_exit REAL,
+      research_window_return REAL, hold_to_end_return REAL, avoided_later_loss INTEGER,
+      exited_before_later_gain INTEGER, PRIMARY KEY(run_id,trade_id),
+      FOREIGN KEY(run_id) REFERENCES backtest_runs(run_id) ON DELETE CASCADE)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS backtest_daily_diagnostics (
+      run_id TEXT NOT NULL, trade_date TEXT NOT NULL, cash_percentage REAL,
+      fully_invested INTEGER, below_maximum_positions INTEGER, no_eligible_candidate INTEGER,
+      rejected_eligible_candidates INTEGER, benchmark_return REAL,
+      PRIMARY KEY(run_id,trade_date), FOREIGN KEY(run_id) REFERENCES backtest_runs(run_id) ON DELETE CASCADE)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS backtest_benchmark_metrics (
+      run_id TEXT NOT NULL, metric_name TEXT NOT NULL, metric_value REAL, limitation TEXT,
+      PRIMARY KEY(run_id,metric_name), FOREIGN KEY(run_id) REFERENCES backtest_runs(run_id) ON DELETE CASCADE)""")
+
+
+def _apply_v5(conn: sqlite3.Connection) -> None:
+    _ensure_phase32_tables(conn)
+    conn.execute("INSERT INTO schema_metadata(schema_version,applied_at,description) VALUES(?,?,?)",
+                 (5,_utc_now(),"Add Phase 3.2 revision calibration, action coverage, run evidence, and diagnostics"))
+
+
+def _ensure_phase33_tables(conn: sqlite3.Connection) -> None:
+    """Add universe-aware analysis identity and exact-run report persistence."""
+    for definition in (
+        "analysis_scope TEXT", "is_canonical INTEGER NOT NULL DEFAULT 0",
+        "requested_symbols_json TEXT", "analyzed_symbols_json TEXT",
+        "blocked_symbols_json TEXT", "symbol_count INTEGER",
+        "candidate_universe_hash TEXT", "universe_configuration_json TEXT",
+        "report_manifest_json TEXT", "supersedes_run_id TEXT",
+        "legacy_scope_inferred INTEGER NOT NULL DEFAULT 0",
+    ):
+        _add_column(conn, "analysis_runs", definition)
+    conn.execute("""CREATE TABLE IF NOT EXISTS analysis_reports (
+      report_id TEXT PRIMARY KEY, analysis_run_id TEXT NOT NULL,
+      generated_at TEXT NOT NULL, scope TEXT NOT NULL, csv_path TEXT,
+      html_path TEXT, manifest_path TEXT, csv_sha256 TEXT, html_sha256 TEXT,
+      report_version INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL,
+      error_summary TEXT, UNIQUE(analysis_run_id,report_version),
+      FOREIGN KEY(analysis_run_id) REFERENCES analysis_runs(analysis_run_id) ON DELETE RESTRICT)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_analysis_runs_scope_canonical ON analysis_runs(analysis_scope,is_canonical,status,completed_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_analysis_reports_run ON analysis_reports(analysis_run_id,generated_at)")
+    candidate = {"AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","JPM","WMT","XOM"}
+    all_data = candidate | {"SPY","QQQ","IWM","TLT","GLD"}
+    import json
+    for row in conn.execute("SELECT analysis_run_id FROM analysis_runs WHERE analysis_scope IS NULL OR requested_symbols_json IS NULL").fetchall():
+        run_id = str(row[0])
+        symbols = [str(item[0]).upper() for item in conn.execute("SELECT symbol FROM stock_analysis WHERE analysis_run_id=? ORDER BY rowid", (run_id,))]
+        symbol_set = set(symbols)
+        scope = "candidate_universe" if symbol_set == candidate else ("all_data_symbols" if symbol_set == all_data else "custom")
+        conn.execute("""UPDATE analysis_runs SET analysis_scope=?,requested_symbols_json=COALESCE(requested_symbols_json,?),
+          analyzed_symbols_json=COALESCE(analyzed_symbols_json,?),blocked_symbols_json=COALESCE(blocked_symbols_json,'[]'),
+          symbol_count=COALESCE(symbol_count,?),legacy_scope_inferred=1 WHERE analysis_run_id=?""",
+          (scope,json.dumps(symbols),json.dumps(symbols),len(symbols),run_id))
+    conn.execute("""UPDATE price_history_revisions SET review_status='automatically_classified'
+      WHERE revision_class IN ('precision_noise','corporate_action_revision')
+        AND COALESCE(review_status,'unreviewed') IN ('','unreviewed')""")
+
+
+def _apply_v6(conn: sqlite3.Connection) -> None:
+    _ensure_phase33_tables(conn)
+    conn.execute("INSERT INTO schema_metadata(schema_version,applied_at,description) VALUES(?,?,?)",
+                 (6,_utc_now(),"Add Phase 3.3 universe scope, canonical selection, report persistence, and review classification"))

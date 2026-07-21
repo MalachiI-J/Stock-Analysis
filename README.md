@@ -1,8 +1,74 @@
 # Stock Scrapper
 
-Stock Scrapper 0.3.0 is a free, local, explainable stock-market research and historical-backtesting application. It collects daily market data, preserves it in SQLite, calculates transparent technical evidence, saves reproducible analysis runs, and simulates a long-only strategy in one shared portfolio.
+Stock Scrapper 0.6.0 is a free, local, explainable stock-market research and historical-backtesting application. It collects daily market data, preserves it in SQLite, calculates transparent technical evidence, saves reproducible analysis runs, and simulates a long-only strategy in one shared portfolio.
+
+## Phase 3.2 calibration and diagnostics
+
+Revision policy `revision-v2` uses configurable absolute and relative tolerances.
+Exact differences are retained as evidence, while sub-tolerance floating-point
+changes are classified as `precision_noise`, do not increment material revision
+counts, and do not overwrite the stable stored value. `revisions-classify`
+classifies retained legacy audit rows without deleting them.
+
+`corporate-actions-refresh --full` records the complete period checked for every
+symbol, including successful responses containing no actions. Data health now
+checks expected XNYS sessions, non-session dates, action coverage, adjustment
+factors, revision materiality, freshness, invalid bars, and unresolved issues.
+
+Backtests enforce the configured `reject`, `shift_start`, or
+`allow_with_warning` warm-up policy using completed benchmark sessions. New runs
+persist requested/effective dates, warm-up evidence, universe, health, action
+coverage, revision policy, and software provenance. Strategy `score_v1` is now
+version 1.1.0 because warm-up behavior affects simulation eligibility.
+
+Benchmark diagnostics include CAGR, volatility, Sharpe, Sortino, Calmar,
+tracking error, information ratio, capture ratios, beta, and correlation from
+the same effective dates as the strategy. Symbol attribution, concentration,
+cash/exposure evidence, forward signal outcomes, and exit diagnostics are
+calculated only after the simulation and cannot influence its decisions.
 
 The project is educational research software. It does not provide personalized financial advice, place orders, connect to a brokerage, or guarantee investment performance.
+
+## Phase 3.1 market-data integrity
+
+Daily bars use the official `XNYS` calendar in `America/New_York`. A bar is
+complete only after the official close (including early closes), the configured
+provider delay, and OHLCV validation. Incomplete, invalid, and unreconciled
+latest bars are excluded from normal analysis and all backtests.
+`analyze --include-incomplete-bars` is an explicitly warned diagnostic override.
+
+Updates revisit a configurable recent-session overlap and compare stable SHA-256
+row fingerprints. Changes create immutable `price_history_revisions` audit rows;
+identical rows are untouched. Use `reconcile-prices --sessions 30` for a recent
+repair or `reconcile-prices --full` for an intentional full refresh. History is
+never silently rewritten. Explicit actions are stored in `corporate_actions`
+when supplied. yfinance can revise adjusted prices or omit actions, so missing
+actions mean unavailable—not proof no action occurred. Backtests use adjusted
+OHLC and do not separately credit dividends, avoiding double counting.
+
+Candidate, benchmark, market-context, and defensive roles are separate. Only
+candidates trade; `universe-validate` warns about benchmark/candidate overlap.
+Persisted runs carry configuration, data, deterministic-result, source-code,
+application, strategy, Git, Python, platform, and schema provenance. Increment
+the strategy version whenever entry/exit, ranking, sizing, costs, stops, regime,
+score, or classification behavior changes.
+
+```powershell
+python main.py market-session
+python main.py data-health
+python main.py data-health-report
+python main.py reconcile-prices --sessions 30
+python main.py revisions --symbol AAPL
+python main.py corporate-actions --symbol AAPL
+python main.py universe-show
+python main.py provenance
+```
+
+Critical market-data health blocks normal live classifications. Benchmark and
+strategy comparisons must use the same effective session and adjusted-price
+basis. Counterfactual diagnostics are research aids, not automatic optimization;
+strategy underperformance must remain visible. Historical performance does not
+guarantee future results.
 
 ## Phase 1 through Phase 3
 
@@ -100,6 +166,32 @@ python main.py report --symbols AAPL MSFT --date 2024-12-31
 ```
 
 `scores` and `explain` are read-only by default. Recalculation occurs only when requested. Invalid dates, invalid configuration, missing data, partial failure, database failure, and complete failure return nonzero exit status rather than silently reporting success.
+
+### Universe-aware analyses and canonical runs
+
+The configured **candidate universe** is the 10 stocks eligible for analysis and trading. The **data universe** is the ordered union of candidates, SPY, market context (SPY/QQQ/IWM), and defensive context (TLT/GLD). Data collection, reconciliation, validation, and health commands default to all 15 data symbols. Analysis, reporting, backtesting, and walk-forward commands default to the 10 candidates; context assets are still loaded internally for relative strength, beta, breadth, correlation, and regime calculations.
+
+```powershell
+# Analyze and save the configured candidates as the canonical daily run
+python main.py analyze
+python main.py scores
+python main.py report
+
+# Deliberate alternatives
+python main.py analyze --scope all-data
+python main.py analyze --symbols AAPL MSFT
+python main.py scores --latest-any
+python main.py scores --run-id <analysis-run-id>
+python main.py report --run-id <analysis-run-id>
+```
+
+An explicit symbol list creates a custom run. A custom smoke test—even a newer one—never replaces the default canonical candidate result. `scores`, `explain`, and `report` select the latest canonical candidate-universe run unless `--run-id`, `--latest-any`, or a scope filter explicitly requests another saved run. Symbol filters apply to the already selected run and fail clearly when it does not contain a requested symbol.
+
+Use `analysis-list --scope custom`, `analysis-list --date YYYY-MM-DD`, `analysis-list --canonical-only`, and `analysis-list --limit 20` to catalog saved runs. `analysis-show --run-id <id>` is concise; add `--scores`, `--provenance`, or `--full` for detail.
+
+Analysis reports are rendered from exact stored scores and explanations. Their identity includes the as-of date, scope, and short run ID—for example `stock_summary_2026-07-21_candidates_47eed0ae.html`—so same-day candidate and custom reports coexist. Each report has a JSON manifest and a persisted `analysis_reports` record linking hashes and paths to its source run.
+
+Benchmark risk-adjusted metrics are persisted at backtest completion in `backtest_benchmark_metrics`; `benchmark-diagnostics` reads those rows by default. The Phase 3.3 default-universe correction changes CLI orchestration, not the `score_v1` rules or calculations, so strategy version 1.1.0 remains unchanged.
 
 ### Backtesting
 

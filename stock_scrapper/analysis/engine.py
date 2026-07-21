@@ -341,6 +341,12 @@ def persist_analysis_results(
     configuration_snapshot: Mapping[str, Any] | None = None,
     market_regime_metrics: Mapping[str, Any] | None = None,
     market_regime_reasons: list[str] | None = None,
+    provenance: Mapping[str, Any] | None = None,
+    data_health_status: str | None = None,
+    universe_snapshot: Mapping[str, Any] | None = None,
+    data_hash: str | None = None,
+    analysis_scope: str = "custom",
+    candidate_universe_hash: str | None = None,
 ) -> None:
     """Persist a complete run and exactly one shared market-regime row."""
     now = datetime.now(timezone.utc).isoformat()
@@ -350,8 +356,13 @@ def persist_analysis_results(
             analysis_run_id, started_at, completed_at, as_of_date, data_through_date,
             benchmark_symbol, market_regime, market_regime_confidence, symbols_requested,
             symbols_analyzed, symbols_blocked, status, scoring_version, configuration_hash,
-            error_summary, configuration_snapshot_json, market_regime_reasons_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            error_summary, configuration_snapshot_json, market_regime_reasons_json,
+            application_version,schema_version,git_commit_hash,git_dirty,source_fingerprint,
+            python_version,platform_info,data_health_status,universe_json,data_hash,
+            analysis_scope,is_canonical,requested_symbols_json,analyzed_symbols_json,
+            blocked_symbols_json,symbol_count,candidate_universe_hash,universe_configuration_json,
+            legacy_scope_inferred
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             analysis_run_id,
@@ -371,6 +382,13 @@ def persist_analysis_results(
             error_summary,
             canonical_json(configuration_snapshot or {}),
             canonical_json(market_regime_reasons or []),
+            (provenance or {}).get("application_version"),(provenance or {}).get("schema_version"),
+            (provenance or {}).get("git_commit_hash"),None if (provenance or {}).get("git_dirty") is None else int((provenance or {}).get("git_dirty")),
+            (provenance or {}).get("source_fingerprint"),(provenance or {}).get("python_version"),(provenance or {}).get("platform_info"),
+            data_health_status,canonical_json(universe_snapshot or {}),data_hash,
+            analysis_scope,0,canonical_json(symbols_requested),canonical_json(symbols_analyzed),
+            canonical_json(symbols_blocked),len(symbols_requested),candidate_universe_hash,
+            canonical_json(universe_snapshot or {}),0,
         ),
     )
     for result in results:
@@ -434,3 +452,7 @@ def persist_analysis_results(
             now,
         ),
     )
+    if analysis_scope == "candidate_universe" and status == "completed" and not symbols_blocked:
+        prior = conn.execute("SELECT analysis_run_id FROM analysis_runs WHERE is_canonical=1 AND as_of_date=? AND analysis_run_id<>?", (as_of_date,analysis_run_id)).fetchone()
+        conn.execute("UPDATE analysis_runs SET is_canonical=0 WHERE is_canonical=1 AND as_of_date=?", (as_of_date,))
+        conn.execute("UPDATE analysis_runs SET is_canonical=1,supersedes_run_id=? WHERE analysis_run_id=?", (str(prior[0]) if prior else None,analysis_run_id))
