@@ -32,9 +32,7 @@ def validate_prediction_config(rules: dict[str, Any]) -> dict[str, Any]:
     iterations = _positive_int("iterations")
     minimum_training_samples = _positive_int("minimum_training_samples")
 
-    train_fraction = rules.get("train_fraction")
-    if isinstance(train_fraction, bool) or not isinstance(train_fraction, (int, float)) or not (0.0 < train_fraction < 1.0):
-        raise ValueError("train_fraction must be a number strictly between 0 and 1")
+    walk_forward_folds = _positive_int("walk_forward_folds")
 
     feature_keys = rules.get("feature_keys")
     if not isinstance(feature_keys, list) or not feature_keys or not all(isinstance(key, str) and key.strip() for key in feature_keys):
@@ -49,7 +47,7 @@ def validate_prediction_config(rules: dict[str, Any]) -> dict[str, Any]:
         "horizon_days": horizon_days,
         "lookback_years": float(lookback_years),
         "sample_stride_sessions": sample_stride_sessions,
-        "train_fraction": float(train_fraction),
+        "walk_forward_folds": walk_forward_folds,
         "l2_lambda": float(l2_lambda),
         "learning_rate": learning_rate,
         "iterations": iterations,

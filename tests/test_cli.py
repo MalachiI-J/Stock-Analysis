@@ -672,6 +672,8 @@ def test_cleanup_logs_include_reports_deletes_only_unreferenced_patterns(
     unreferenced_old = [
         reports_dir / "digest_2024-01-01.txt",
         reports_dir / "digest_2024-01-01.summary.json",
+        reports_dir / "recommendations_2024-01-01.txt",
+        reports_dir / "recommendations_2024-01-01.summary.json",
         reports_dir / "data_health_2024-01-01.json",
         reports_dir / "data_health_2024-01-01.html",
         reports_dir / "stock_summary_2024-01-01_screen-abc12345.csv",
@@ -702,7 +704,7 @@ def test_cleanup_logs_include_reports_deletes_only_unreferenced_patterns(
         assert path.exists(), f"{path} must never be deleted"
     assert recent_digest.exists()
     captured = capsys.readouterr()
-    assert "Deleted 6 unreferenced report file(s)" in captured.out
+    assert "Deleted 8 unreferenced report file(s)" in captured.out
 
 
 def test_cleanup_logs_without_include_reports_leaves_reports_alone(
@@ -790,6 +792,181 @@ def test_portfolio_compare_reports_none_recorded(
     assert cli.main(["portfolio-compare"]) == int(ExitCode.SUCCESS)
     captured = capsys.readouterr()
     assert "No portfolio lots recorded" in captured.out
+
+
+def _install_recommend_saved_run(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    saved = {
+        "analysis_run_id": "saved-run",
+        "as_of_date": "2024-12-31",
+        "data_through_date": "2024-12-31",
+        "market_regime": "Neutral",
+        "market_regime_confidence": 80.0,
+    }
+    results = [
+        AnalysisResult(
+            symbol="AAA", as_of_date="2024-12-31", classification="Strong Candidate",
+            primary_reason="Strong trend", opportunity_score=90.0,
+        ),
+        AnalysisResult(
+            symbol="BBB", as_of_date="2024-12-31", classification="Avoid",
+            primary_reason="Weak trend", opportunity_score=10.0,
+        ),
+    ]
+    monkeypatch.setattr(cli, "_load_saved_results", lambda *_args, **_kwargs: (saved, results))
+    return saved
+
+
+def _install_recommend_trading_rules(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> dict[str, Any]:
+    rules = {
+        "trading_rules_version": "test",
+        "starting_capital": 1000.0,
+        "max_position_weight": 0.5,
+        "cash_reserve": 0.0,
+        "max_open_positions": 10,
+        "max_trade_dollar_amount": 1000.0,
+        "min_trade_dollar_amount": 10.0,
+        "max_new_buys_per_run": 3,
+        "require_strong_candidate_for_buy": True,
+        "auto_execute": False,
+    }
+    rules.update(overrides)
+    monkeypatch.setattr(cli, "load_trading_rules", lambda _base_dir: rules)
+    return rules
+
+
+def test_recommend_command_writes_sized_buy_recommendation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from stock_scrapper.database import create_connection, initialize_database, upsert_price_history
+
+    _install_startup(monkeypatch, tmp_path)
+    _install_recommend_saved_run(monkeypatch)
+    _install_recommend_trading_rules(monkeypatch)
+    config = _config(tmp_path)
+    initialize_database(config["database_path"])
+    conn = create_connection(config["database_path"])
+    try:
+        upsert_price_history(conn, _seed_price_row("AAA", "2024-12-31", 50.0))
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert cli.main(["recommend", "--run-id", "saved-run", "--no-model"]) == int(ExitCode.SUCCESS)
+
+    captured = capsys.readouterr()
+    assert "BUY — 1" in captured.out
+    assert "SELL — 0" in captured.out
+    assert "AAA" in captured.out and "500.00" in captured.out
+    assert "BBB" not in captured.out.split("BUY — 1")[1].split("Considered")[0]
+
+    target = tmp_path / "reports" / "recommendations_2024-12-31.txt"
+    assert target.exists()
+    summary_path = tmp_path / "reports" / "recommendations_2024-12-31.summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["recommendations"] == [
+        {
+            "symbol": "AAA", "action": "BUY", "shares": 10.0,
+            "estimated_dollars": 500.0, "reason": "Strong trend", "model_probability": None,
+        }
+    ]
+
+
+def test_recommend_command_no_save_skips_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    _install_recommend_saved_run(monkeypatch)
+    _install_recommend_trading_rules(monkeypatch)
+
+    assert cli.main(["recommend", "--run-id", "saved-run", "--no-model", "--no-save"]) == int(ExitCode.SUCCESS)
+
+    assert not (tmp_path / "reports" / "recommendations_2024-12-31.txt").exists()
+    assert not (tmp_path / "reports" / "recommendations_2024-12-31.summary.json").exists()
+
+
+def test_recommend_command_respects_max_trade_dollar_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from stock_scrapper.database import create_connection, initialize_database, upsert_price_history
+
+    _install_startup(monkeypatch, tmp_path)
+    _install_recommend_saved_run(monkeypatch)
+    _install_recommend_trading_rules(monkeypatch, max_trade_dollar_amount=100.0)
+    config = _config(tmp_path)
+    initialize_database(config["database_path"])
+    conn = create_connection(config["database_path"])
+    try:
+        upsert_price_history(conn, _seed_price_row("AAA", "2024-12-31", 50.0))
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert cli.main(["recommend", "--run-id", "saved-run", "--no-model"]) == int(ExitCode.SUCCESS)
+
+    summary_path = tmp_path / "reports" / "recommendations_2024-12-31.summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["recommendations"][0]["shares"] == 2.0  # $100 cap / $50 price
+    assert summary["recommendations"][0]["estimated_dollars"] == 100.0
+
+
+def test_recommend_review_reports_hit_rate_against_actual_prices(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from stock_scrapper.database import create_connection, initialize_database, upsert_price_history
+
+    _install_startup(monkeypatch, tmp_path)
+    config = _config(tmp_path)
+    reports_dir = Path(config["reports_dir"])
+    reports_dir.mkdir(parents=True)
+    summary_path = reports_dir / "recommendations_2024-12-31.summary.json"
+    summary_path.write_text(
+        json.dumps({
+            "as_of_date": "2024-12-31",
+            "recommendations": [
+                {
+                    "symbol": "AAPL", "action": "BUY", "shares": 10.0, "estimated_dollars": 1000.0,
+                    "reason": "test", "model_probability": None,
+                },
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    initialize_database(config["database_path"])
+    conn = create_connection(config["database_path"])
+    try:
+        upsert_price_history(conn, _seed_price_row("SPY", "2024-12-31", 400.0))
+        upsert_price_history(conn, _seed_price_row("SPY", "2025-01-31", 408.0))  # SPY +2%
+        upsert_price_history(conn, _seed_price_row("AAPL", "2025-01-31", 110.0))  # entry 100 -> +10%
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert cli.main(
+        ["recommend-review", "--recommendation-date", "2024-12-31", "--as-of-date", "2025-01-31"]
+    ) == int(ExitCode.SUCCESS)
+
+    captured = capsys.readouterr()
+    assert "AAPL" in captured.out and "beat the benchmark" in captured.out
+    assert "BUY hit rate" in captured.out and "100%" in captured.out
+
+
+def test_recommend_review_reports_missing_data_when_no_file_exists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+
+    assert cli.main(
+        ["recommend-review", "--recommendation-date", "2024-12-31"]
+    ) == int(ExitCode.MISSING_DATA)
 
 
 def test_new_screening_symbols_excludes_tracked_and_dedupes() -> None:
@@ -932,7 +1109,7 @@ def test_predict_command_reports_coefficients_and_ranked_predictions(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    from stock_scrapper.prediction.service import PredictionRunResult, SymbolPrediction
+    from stock_scrapper.prediction.service import PredictionRunResult, SymbolPrediction, WalkForwardFold
 
     _install_predict_startup(monkeypatch, tmp_path)
     result = PredictionRunResult(
@@ -944,9 +1121,11 @@ def test_predict_command_reports_coefficients_and_ranked_predictions(
         holdout_samples=100,
         training_start_date="2023-01-01",
         training_end_date="2025-11-01",
+        positive_label_rate=0.52,
         holdout_accuracy=0.55,
         holdout_brier_score=0.24,
-        coefficients=[("rsi_14", 0.42), ("beta", -0.13)],
+        walk_forward_folds=[WalkForwardFold(1, 200, 50, 0.55, 0.24), WalkForwardFold(2, 300, 50, 0.55, 0.24)],
+        coefficients=[("rsi_14", 0.42), ("beta", -0.13), ("atr_percentage", 0.001)],
         predictions=[
             SymbolPrediction("AAPL", 0.71, None),
             SymbolPrediction("MSFT", 0.30, None),
@@ -958,8 +1137,11 @@ def test_predict_command_reports_coefficients_and_ranked_predictions(
     assert cli.main(["predict", "--symbols", "AAPL", "MSFT", "ZZZZ"]) == int(ExitCode.SUCCESS)
     captured = capsys.readouterr()
     assert "EXPERIMENTAL STATISTICAL FORECAST" in captured.err
-    assert "Holdout accuracy: 55.0%" in captured.out
+    assert "Walk-forward holdout accuracy: 55.0%" in captured.out
+    assert "base rate 52.0%" in captured.out
+    assert "fold 1: trained on 200, tested on 50" in captured.out
     assert "rsi_14" in captured.out and "+0.4200" in captured.out
+    assert "Near-zero influence" in captured.out and "atr_percentage" in captured.out
     lines = captured.out.splitlines()
     aapl_line = next(line for line in lines if line.strip().startswith("AAPL"))
     msft_line = next(line for line in lines if line.strip().startswith("MSFT"))
@@ -967,3 +1149,36 @@ def test_predict_command_reports_coefficients_and_ranked_predictions(
     assert lines.index(aapl_line) < lines.index(msft_line) < lines.index(zzzz_line)
     assert "71.0%" in aapl_line
     assert "unavailable" in zzzz_line
+
+
+def test_predict_command_horizon_days_override_replaces_config_value(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from stock_scrapper.prediction.service import PredictionRunResult
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    captured_rules: dict[str, Any] = {}
+
+    def _fake_run_prediction(*_args: Any, **kwargs: Any) -> PredictionRunResult:
+        captured_rules.update(kwargs["rules"])
+        return PredictionRunResult(
+            status="insufficient_data", message="x", as_of_date="2026-01-01",
+            horizon_days=kwargs["rules"]["horizon_days"],
+        )
+
+    monkeypatch.setattr(cli, "run_prediction", _fake_run_prediction)
+
+    cli.main(["predict", "--symbols", "AAPL", "--horizon-days", "5"])
+
+    assert captured_rules["horizon_days"] == 5
+
+
+def test_predict_command_rejects_nonpositive_horizon_days(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_predict_startup(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["predict", "--symbols", "AAPL", "--horizon-days", "0"])
+    assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)

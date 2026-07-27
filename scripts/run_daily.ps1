@@ -1,8 +1,10 @@
 <#
 Runs the daily Stock Scrapper pipeline unattended: collects/validates/analyzes/reports
-(`main.py run`), writes a plain-language buy/watch/sell digest (`main.py digest`) and
-shows it as a Windows toast notification, then deletes log files and unreferenced
-report artifacts (old digest/data-health/screener files; never analysis/backtest
+(`main.py run`), writes a plain-language buy/watch/sell digest (`main.py digest`),
+computes sized advisory trade recommendations (`main.py recommend` — suggestions
+only, nothing is ever bought or sold automatically), shows a combined summary as a
+Windows toast notification, then deletes log files and unreferenced report artifacts
+(old digest/recommendations/data-health/screener files; never analysis/backtest
 reports tied to a saved run) older than the configured retention window
 (`main.py cleanup-logs --include-reports`). Intended to be invoked by Windows Task
 Scheduler once per day, after the market close plus the configured provider delay
@@ -40,8 +42,12 @@ $runExit = $LASTEXITCODE
 cmd.exe /c "`"$pythonExe`" main.py digest >> `"$logFile`" 2>&1"
 $digestExit = $LASTEXITCODE
 
+cmd.exe /c "`"$pythonExe`" main.py recommend >> `"$logFile`" 2>&1"
+$recommendExit = $LASTEXITCODE
+
 $today = Get-Date -Format "yyyy-MM-dd"
 $summaryPath = Join-Path $RepoRoot "reports\digest_$today.summary.json"
+$recommendPath = Join-Path $RepoRoot "reports\recommendations_$today.summary.json"
 if (Test-Path $summaryPath) {
     try {
         $summary = Get-Content $summaryPath -Raw | ConvertFrom-Json
@@ -51,6 +57,13 @@ if (Test-Path $summaryPath) {
         $lines = @("Buy: $($summary.buy_count)  Sell: $($summary.sell_count)  Watch: $($summary.watch_count)")
         if ($sellSymbols.Count -gt 0) { $lines += "Consider selling: " + ($sellSymbols -join ", ") }
         if ($changes.Count -gt 0) { $lines += ($changes | Select-Object -First 3) -join "; " }
+        if (Test-Path $recommendPath) {
+            $recommend = Get-Content $recommendPath -Raw | ConvertFrom-Json
+            $recs = @($recommend.recommendations)
+            $buyCount = ($recs | Where-Object { $_.action -eq "BUY" }).Count
+            $sellCount = ($recs | Where-Object { $_.action -eq "SELL" }).Count
+            $lines += "Recommend (advisory, unproven model): $buyCount buy / $sellCount sell - review before acting"
+        }
         $message = $lines -join "`n"
         & (Join-Path $PSScriptRoot "send_toast.ps1") -Title $title -Message $message *>> $logFile
     } catch {
@@ -63,6 +76,6 @@ if (Test-Path $summaryPath) {
 cmd.exe /c "`"$pythonExe`" main.py cleanup-logs --include-reports >> `"$logFile`" 2>&1"
 $cleanupExit = $LASTEXITCODE
 
-Add-Content -Path $logFile -Value "=== Stock Scrapper daily run finished $(Get-Date -Format o): run=$runExit digest=$digestExit cleanup=$cleanupExit ==="
+Add-Content -Path $logFile -Value "=== Stock Scrapper daily run finished $(Get-Date -Format o): run=$runExit digest=$digestExit recommend=$recommendExit cleanup=$cleanupExit ==="
 
-exit ([Math]::Max($runExit, [Math]::Max($digestExit, $cleanupExit)))
+exit ([Math]::Max($runExit, [Math]::Max($digestExit, [Math]::Max($recommendExit, $cleanupExit))))
