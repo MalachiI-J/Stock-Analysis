@@ -13,6 +13,7 @@ from uuid import uuid4
 from stock_scrapper.analysis.service import AnalysisService
 from stock_scrapper.backtesting.config import BacktestConfig
 from stock_scrapper.backtesting.corporate_actions import AdjustedOHLC, build_adjusted_ohlc
+from stock_scrapper.backtesting.exit_rules import evaluate_rule_based_exit
 from stock_scrapper.backtesting.metrics import calculate_performance_metrics
 from stock_scrapper.backtesting.models import (
     BacktestRun,
@@ -622,26 +623,7 @@ class _PortfolioSimulator:
         return None
 
     def _exit_reason(self, result: AnalysisResult, position: Position) -> str | None:
-        thresholds = self.config.exit_thresholds
-        if thresholds.exit_on_stress and result.market_regime == "Stress":
-            return "Market entered Stress"
-        if result.classification in set(thresholds.classifications):
-            return f"Classification became {result.classification}"
-        if result.risk_score is None or result.risk_score > thresholds.maximum_risk_score:
-            return "Risk score exceeded the exit maximum or became unavailable"
-        if result.opportunity_score is None or result.opportunity_score < thresholds.minimum_opportunity_score:
-            return "Opportunity score fell below the exit threshold"
-        if result.confidence_score is None or result.confidence_score < thresholds.minimum_confidence_score:
-            return "Confidence score fell below the exit threshold"
-        distance200 = _number(result.indicators.get("distance_from_sma200"))
-        if thresholds.exit_below_sma200 and distance200 is not None and distance200 < 0:
-            return "Price closed below the 200-day moving average"
-        if (
-            self.config.maximum_holding_period is not None
-            and position.holding_period_days >= self.config.maximum_holding_period
-        ):
-            return "Maximum holding period reached"
-        return None
+        return evaluate_rule_based_exit(self.config, result, position.holding_period_days)
 
     def _rank(self, result: AnalysisResult) -> tuple[Any, ...]:
         relative = _number(result.indicators.get("benchmark_relative_return_252"))

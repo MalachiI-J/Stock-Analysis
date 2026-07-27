@@ -8,7 +8,7 @@ import sqlite3
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -37,6 +37,7 @@ from stock_scrapper.market_calendar import SessionResolver
 from stock_scrapper.config import load_config, load_watchlist, load_universes, validate_universes
 from stock_scrapper.data_health import assess_data_health
 from stock_scrapper.database import (
+    close_portfolio_lots_fifo,
     create_connection,
     fetch_price_history,
     fetch_quality_issues,
@@ -46,7 +47,11 @@ from stock_scrapper.database import (
     get_latest_trade_date,
     initialize_database,
     insert_collection_run,
+    insert_portfolio_lot,
     list_analysis_runs,
+    list_open_portfolio_symbols,
+    list_portfolio_lots,
+    list_portfolio_sales,
     quality_issue_fingerprint,
     classify_price_revisions,
     record_quality_issue,
@@ -60,10 +65,11 @@ from stock_scrapper.exceptions import (
     MissingDataError,
     OperationFailedError,
 )
+from stock_scrapper.portfolio import HoldingAssessment, aggregate_open_lots, evaluate_holding
 from stock_scrapper.processing.validation import validate_price_records
 from stock_scrapper.reporting.report_builder import write_phase2_reports
 from stock_scrapper.reporting.persistence import persist_report, report_identity
-from stock_scrapper.reporting.digest import build_digest, render_digest_text
+from stock_scrapper.reporting.digest import build_digest, format_holding_line, render_digest_text
 from stock_scrapper.utilities.hashing import canonical_json
 from stock_scrapper.utilities.logging_setup import setup_logging
 from stock_scrapper.utilities.provenance import collect_provenance
@@ -148,6 +154,25 @@ def build_parser() -> argparse.ArgumentParser:
     digest_parser.add_argument("--scope", choices=("candidate_universe", "all_data_symbols", "custom"))
     digest_parser.add_argument("--no-save", action="store_true", help="Print only; do not write a digest file to reports_dir")
     _add_as_of_argument(digest_parser)
+
+    portfolio_buy = subparsers.add_parser("portfolio-buy", help="Record a real buy as a new open lot")
+    portfolio_buy.add_argument("--symbol", required=True)
+    portfolio_buy.add_argument("--shares", type=float, required=True)
+    portfolio_buy.add_argument("--price", type=float, required=True, help="Cost basis per share")
+    portfolio_buy.add_argument("--date", required=True, help="Purchase date (YYYY-MM-DD)")
+    portfolio_buy.add_argument("--notes")
+
+    portfolio_sell = subparsers.add_parser("portfolio-sell", help="Record a real sell, closing the oldest open lots first")
+    portfolio_sell.add_argument("--symbol", required=True)
+    portfolio_sell.add_argument("--shares", type=float, required=True)
+    portfolio_sell.add_argument("--price", type=float, required=True, help="Sale price per share")
+    portfolio_sell.add_argument("--date", required=True, help="Sale date (YYYY-MM-DD)")
+    portfolio_sell.add_argument("--notes")
+
+    portfolio_show = subparsers.add_parser("portfolio-show", help="Show open positions with rules-based hold/sell signals")
+    portfolio_show.add_argument("--symbol")
+    portfolio_show.add_argument("--closed", action="store_true", help="Also show closed lots and realized P&L")
+    _add_as_of_argument(portfolio_show)
 
     analysis_list=subparsers.add_parser("analysis-list", help="List saved analysis runs")
     analysis_list.add_argument("--scope",choices=("candidate_universe","all_data_symbols","custom")); analysis_list.add_argument("--date"); analysis_list.add_argument("--canonical-only",action="store_true"); analysis_list.add_argument("--limit",type=int,default=20)
@@ -580,6 +605,59 @@ def _load_saved_results(
     return saved, results
 
 
+def _finite(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None
+
+
+def _held_portfolio_symbols(config: dict[str, Any]) -> list[str]:
+    """Return every symbol with an open portfolio lot, so real holdings always get fresh price data."""
+    initialize_database(config["database_path"])
+    conn = create_connection(config["database_path"])
+    try:
+        return list_open_portfolio_symbols(conn)
+    finally:
+        conn.close()
+
+
+def _assess_open_holdings(
+    conn: sqlite3.Connection,
+    base_dir: Path,
+    as_of_date: date,
+    results_by_symbol: Mapping[str, Any],
+) -> list[HoldingAssessment]:
+    """Evaluate every open lot against the same rules score_v1 uses to exit a backtest position."""
+    positions = aggregate_open_lots(list_portfolio_lots(conn, status="open"))
+    if not positions:
+        return []
+    backtest_config = load_backtesting_config(base_dir / "config" / "backtesting_rules.yaml")
+    assessments: list[HoldingAssessment] = []
+    for position in positions:
+        history = fetch_price_history(
+            conn, position.symbol, start_date=position.earliest_opened_date, end_date=as_of_date
+        )
+        closes = [_finite(row.get("adjusted_close")) for row in history]
+        closes = [value for value in closes if value is not None]
+        latest_price = closes[-1] if closes else None
+        peak_price = max(closes) if closes else None
+        assessments.append(
+            evaluate_holding(
+                position,
+                result=results_by_symbol.get(position.symbol),
+                backtest_config=backtest_config,
+                latest_price=latest_price,
+                peak_price_since_entry=peak_price,
+                holding_period_sessions=len(history),
+            )
+        )
+    return assessments
+
+
 def _backtest_config(
     base_dir: Path,
     args: argparse.Namespace,
@@ -782,8 +860,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         partial_update = False
 
         if args.command == "update":
+            update_symbols_list = list(dict.fromkeys([*symbols, *_held_portfolio_symbols(config)]))
             successful, failed, inserted, updated = update_symbols(
-                config, logger, symbols, full_refresh=args.full_refresh
+                config, logger, update_symbols_list, full_refresh=args.full_refresh
             )
             print(f"inserted={inserted} updated={updated} successful={len(successful)} failed={len(failed)}")
             if failed and successful:
@@ -936,6 +1015,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             conn = create_connection(config["database_path"])
             try:
                 previous = _previous_analysis(conn, as_of_text)
+                results_by_symbol = {result.symbol: result for result in results}
+                holdings = _assess_open_holdings(
+                    conn, base_dir, _parse_date(as_of_text, field="as-of date"), results_by_symbol
+                )
             finally:
                 conn.close()
             payload = build_digest(
@@ -945,6 +1028,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 market_regime_confidence=regime_confidence,
                 results=results,
                 previous_results=previous,
+                holdings=holdings,
             )
             text = render_digest_text(payload)
             print(text)
@@ -953,6 +1037,94 @@ def main(argv: Sequence[str] | None = None) -> int:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(text, encoding="utf-8")
                 print(f"Digest: {target}")
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "portfolio-buy":
+            if args.shares <= 0:
+                parser.error("--shares must be positive")
+            if args.price < 0:
+                parser.error("--price must be nonnegative")
+            purchase_date = _parse_date(args.date, field="purchase date")
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                lot_id = insert_portfolio_lot(
+                    conn,
+                    {
+                        "symbol": args.symbol,
+                        "shares": args.shares,
+                        "cost_basis_per_share": args.price,
+                        "opened_date": purchase_date.isoformat(),
+                        "notes": args.notes,
+                    },
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            print(
+                f"Recorded {lot_id}: {args.shares:g} sh {args.symbol.strip().upper()} "
+                f"@ {args.price:.2f} on {purchase_date.isoformat()}"
+            )
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "portfolio-sell":
+            if args.shares <= 0:
+                parser.error("--shares must be positive")
+            if args.price < 0:
+                parser.error("--price must be nonnegative")
+            sale_date = _parse_date(args.date, field="sale date")
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                sales = close_portfolio_lots_fifo(
+                    conn,
+                    symbol=args.symbol,
+                    shares=args.shares,
+                    sale_price=args.price,
+                    sale_date=sale_date.isoformat(),
+                    notes=args.notes,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            realized = sum(sale["realized_pnl"] for sale in sales)
+            print(
+                f"Closed {len(sales)} lot(s) for {args.symbol.strip().upper()}: {args.shares:g} sh "
+                f"@ {args.price:.2f} on {sale_date.isoformat()}, realized P&L={realized:+.2f}"
+            )
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "portfolio-show":
+            effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                saved = get_latest_canonical_analysis_run(conn)
+                results_by_symbol = (
+                    {result.symbol: result for result in results_from_saved_run(saved)} if saved else {}
+                )
+                holdings = _assess_open_holdings(conn, base_dir, effective, results_by_symbol)
+                if args.symbol:
+                    requested_symbol = args.symbol.strip().upper()
+                    holdings = [holding for holding in holdings if holding.symbol == requested_symbol]
+                closed_lots = list_portfolio_lots(conn, args.symbol, status="closed") if args.closed else []
+                sales = list_portfolio_sales(conn, args.symbol) if args.closed else []
+            finally:
+                conn.close()
+            print(f"OPEN POSITIONS — {len(holdings)} symbol(s) as of {effective.isoformat()}")
+            if holdings:
+                for holding in holdings:
+                    print(format_holding_line(holding))
+            else:
+                print("  None recorded. Use `python main.py portfolio-buy` to add one.")
+            if args.closed:
+                realized_total = sum(float(sale["realized_pnl"]) for sale in sales)
+                print(f"\nCLOSED LOTS — {len(closed_lots)} lot(s), realized P&L={realized_total:+.2f}")
+                for sale in sales:
+                    print(
+                        f"  {sale['symbol']:<6} {sale['shares']:g} sh @ {float(sale['sale_price']):.2f} "
+                        f"on {sale['sale_date']} | realized {float(sale['realized_pnl']):+.2f}"
+                    )
             return int(ExitCode.SUCCESS)
 
         if args.command == "analysis-list":
@@ -1169,6 +1341,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.command == "run":
             update_symbols_requested = list(universe.data_symbols) if not explicit_symbols else list(dict.fromkeys([*symbols, universe.benchmark, *universe.market_context, *universe.defensive_context]))
+            update_symbols_requested = list(dict.fromkeys([*update_symbols_requested, *_held_portfolio_symbols(config)]))
             successful, failed, _, _ = update_symbols(
                 config, logger, update_symbols_requested, full_refresh=args.full_refresh
             )

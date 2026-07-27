@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-LATEST_SCHEMA_VERSION = 6
+LATEST_SCHEMA_VERSION = 7
 
 
 def _utc_now() -> str:
@@ -106,6 +106,10 @@ def apply_migrations(db_path: str | Path) -> None:
             _apply_v6(conn)
         else:
             _ensure_phase33_tables(conn)
+        if current_version < 7:
+            _apply_v7(conn)
+        else:
+            _ensure_phase4_portfolio_tables(conn)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -969,3 +973,29 @@ def _apply_v6(conn: sqlite3.Connection) -> None:
     _ensure_phase33_tables(conn)
     conn.execute("INSERT INTO schema_metadata(schema_version,applied_at,description) VALUES(?,?,?)",
                  (6,_utc_now(),"Add Phase 3.3 universe scope, canonical selection, report persistence, and review classification"))
+
+
+def _ensure_phase4_portfolio_tables(conn: sqlite3.Connection) -> None:
+    """Add tables recording the user's actual owned lots and closing sales."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS portfolio_lots (
+      lot_id TEXT PRIMARY KEY, symbol TEXT NOT NULL,
+      shares REAL NOT NULL CHECK(shares > 0),
+      remaining_shares REAL NOT NULL CHECK(remaining_shares >= 0),
+      cost_basis_per_share REAL NOT NULL CHECK(cost_basis_per_share >= 0),
+      opened_date TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','closed')),
+      notes TEXT, created_at TEXT NOT NULL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS portfolio_sales (
+      sale_id TEXT PRIMARY KEY, lot_id TEXT NOT NULL, symbol TEXT NOT NULL,
+      shares REAL NOT NULL CHECK(shares > 0), sale_price REAL NOT NULL CHECK(sale_price >= 0),
+      sale_date TEXT NOT NULL, realized_pnl REAL NOT NULL, notes TEXT, created_at TEXT NOT NULL,
+      FOREIGN KEY(lot_id) REFERENCES portfolio_lots(lot_id) ON DELETE CASCADE)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_lots_symbol_status ON portfolio_lots(symbol, status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_lots_symbol_opened ON portfolio_lots(symbol, opened_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_sales_lot ON portfolio_sales(lot_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_sales_symbol_date ON portfolio_sales(symbol, sale_date)")
+
+
+def _apply_v7(conn: sqlite3.Connection) -> None:
+    _ensure_phase4_portfolio_tables(conn)
+    conn.execute("INSERT INTO schema_metadata(schema_version,applied_at,description) VALUES(?,?,?)",
+                 (7,_utc_now(),"Add Phase 4 portfolio lots and sales for real-holdings tracking"))

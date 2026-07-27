@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from stock_scrapper.models.analysis_models import AnalysisResult
-from stock_scrapper.reporting.digest import build_digest, render_digest_text
+from stock_scrapper.portfolio import HoldingAssessment
+from stock_scrapper.reporting.digest import build_digest, format_holding_line, render_digest_text
 
 
 def _result(symbol: str, classification: str, opportunity: float | None = 50.0) -> AnalysisResult:
@@ -83,3 +84,66 @@ def test_render_digest_text_reports_empty_buckets() -> None:
     text = render_digest_text(digest)
     assert "None today." in text
     assert "No classification changes since the previous saved run." in text
+    assert "YOUR HOLDINGS — 0 open position(s)" in text
+    assert "portfolio-buy" in text
+
+
+def _holding(**overrides: object) -> HoldingAssessment:
+    base = dict(
+        symbol="AAPL",
+        shares=10.0,
+        average_cost_basis=100.0,
+        latest_price=110.0,
+        classification="Candidate",
+        primary_reason="Solid trend",
+        rule_based_exit_reason=None,
+        price_stop_reason=None,
+        recommendation="HOLD",
+    )
+    base.update(overrides)
+    return HoldingAssessment(**base)
+
+
+def test_build_digest_sorts_holdings_by_symbol() -> None:
+    digest = build_digest(
+        as_of_date="2024-12-31",
+        data_through_date="2024-12-31",
+        market_regime="Neutral",
+        market_regime_confidence=80.0,
+        results=[_result("AAA", "Watch")],
+        holdings=[_holding(symbol="MSFT"), _holding(symbol="AAPL")],
+    )
+    assert [holding.symbol for holding in digest["holdings"]] == ["AAPL", "MSFT"]
+
+
+def test_render_digest_text_includes_holdings_and_sell_signal() -> None:
+    digest = build_digest(
+        as_of_date="2024-12-31",
+        data_through_date="2024-12-31",
+        market_regime="Neutral",
+        market_regime_confidence=80.0,
+        results=[_result("AAA", "Watch")],
+        holdings=[
+            _holding(symbol="AAPL"),
+            _holding(
+                symbol="TSLA",
+                classification="High Risk",
+                recommendation="SELL",
+                rule_based_exit_reason="Classification became High Risk",
+                price_stop_reason="Stop loss",
+            ),
+        ],
+    )
+    text = render_digest_text(digest)
+    assert "YOUR HOLDINGS — 2 open position(s)" in text
+    assert "AAPL   10 sh @ avg cost $100.00" in text
+    assert "Recommendation: HOLD" in text
+    assert "TSLA" in text and "Recommendation: SELL" in text
+    assert "Sell signal: Classification became High Risk; Stop loss" in text
+
+
+def test_format_holding_line_reports_unavailable_price() -> None:
+    holding = _holding(latest_price=None, recommendation="UNKNOWN (no current price data)")
+    line = format_holding_line(holding)
+    assert "latest n/a" in line
+    assert "unrealized n/a" in line

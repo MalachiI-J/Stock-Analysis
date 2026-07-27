@@ -1,6 +1,30 @@
 # Stock Scrapper
 
-Stock Scrapper 0.6.0 is a free, local, explainable stock-market research and historical-backtesting application. It collects daily market data, preserves it in SQLite, calculates transparent technical evidence, saves reproducible analysis runs, and simulates a long-only strategy in one shared portfolio.
+Stock Scrapper 0.6.0 is a free, local, explainable stock-market research and historical-backtesting application. It collects daily market data, preserves it in SQLite, calculates transparent technical evidence, saves reproducible analysis runs, simulates a long-only strategy in one shared portfolio, and tracks a user's real holdings against the same rules.
+
+## Phase 4 real-portfolio tracking
+
+`portfolio-buy` and `portfolio-sell` record real owned lots and closing sales
+in SQLite; `portfolio-sell` closes the oldest open lots first (FIFO) and
+rejects selling more shares than are currently held rather than partially
+filling. `portfolio-show` lists open positions with current value, unrealized
+P&L, and a rules-based hold/sell recommendation; add `--closed` for realized
+lots and P&L.
+
+A held position's recommendation reuses `evaluate_rule_based_exit` from
+`stock_scrapper/backtesting/exit_rules.py` — the exact classification/regime/
+score/SMA200/holding-period exit logic `score_v1` uses to close a backtested
+position — plus a close-price stop-loss/trailing-stop check against the
+position's average cost basis and highest close since it was opened. A held
+symbol outside the analyzed candidate universe still gets the price-based
+check; it just has no classification-based signal since nothing scores it.
+`update` and `run` always additionally collect price data for every symbol
+with an open lot, even if it is outside the configured watchlist, so a real
+holding's evaluation has current data.
+
+`digest` includes a "YOUR HOLDINGS" section built from the same assessment.
+Recommendations are rule-based research output, not investment advice, and a
+missing current price is reported as unavailable rather than assumed.
 
 ## Phase 3.2 calibration and diagnostics
 
@@ -196,6 +220,12 @@ python main.py report --symbols AAPL MSFT --date 2024-12-31
 python main.py digest
 python main.py digest --recalculate
 python main.py digest --run-id <analysis-run-id> --no-save
+
+# Record real buys/sells and inspect your actual holdings
+python main.py portfolio-buy --symbol AAPL --shares 10 --price 150.25 --date 2026-01-05
+python main.py portfolio-sell --symbol AAPL --shares 4 --price 165.00 --date 2026-03-01
+python main.py portfolio-show
+python main.py portfolio-show --symbol AAPL --closed
 ```
 
 `digest` reads the same saved classifications as `scores`/`explain` and groups
@@ -404,7 +434,9 @@ stock_scrapper/backtesting/     Configuration, simulation, persistence, metrics,
 stock_scrapper/collectors/      Daily market-data collection
 stock_scrapper/migrations/      Safe SQLite schema migrations
 stock_scrapper/processing/      Validation, indicators, relative strength
-stock_scrapper/reporting/       Phase 2 offline reporting
+stock_scrapper/reporting/       Phase 2 offline reporting and the daily digest
+stock_scrapper/portfolio.py     Real-holdings aggregation and hold/sell assessment
+scripts/                        Daily automation wrapper (Task Scheduler entry point)
 tools/                          Clean source-archive tooling
 data/                           Local SQLite and caches; not source-controlled
 reports/                        Generated offline reports; not source-controlled

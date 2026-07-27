@@ -9,7 +9,9 @@ import sqlite3
 from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+from uuid import uuid4
 
+from stock_scrapper.exceptions import InsufficientHoldingsError
 from stock_scrapper.migrations.migration_manager import apply_migrations
 from stock_scrapper.market_calendar import SessionResolver
 from stock_scrapper.revision_policy import compare_price_rows
@@ -433,3 +435,132 @@ def get_latest_analysis_run(
 def get_latest_canonical_analysis_run(conn: sqlite3.Connection, scope: str = "candidate_universe") -> dict[str, Any] | None:
     row=conn.execute("SELECT analysis_run_id FROM analysis_runs WHERE status='completed' AND is_canonical=1 AND analysis_scope=? ORDER BY as_of_date DESC,COALESCE(completed_at,started_at) DESC LIMIT 1",(scope,)).fetchone()
     return get_analysis_run(conn,str(row[0])) if row else None
+
+
+def insert_portfolio_lot(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> str:
+    """Record one real buy as a new open lot and return its lot ID."""
+    lot_id = str(payload.get("lot_id") or f"lot-{uuid4().hex}")
+    conn.execute(
+        "INSERT INTO portfolio_lots "
+        "(lot_id, symbol, shares, remaining_shares, cost_basis_per_share, opened_date, status, notes, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?)",
+        (
+            lot_id,
+            str(payload["symbol"]).strip().upper(),
+            float(payload["shares"]),
+            float(payload["shares"]),
+            float(payload["cost_basis_per_share"]),
+            str(payload["opened_date"]),
+            payload.get("notes"),
+            str(payload.get("created_at") or utc_now_iso()),
+        ),
+    )
+    return lot_id
+
+
+def list_portfolio_lots(
+    conn: sqlite3.Connection,
+    symbol: str | None = None,
+    *,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    """List recorded lots, optionally filtered by symbol and/or open/closed status."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if symbol:
+        clauses.append("symbol = ?")
+        params.append(symbol.strip().upper())
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    sql = "SELECT * FROM portfolio_lots" + (
+        " WHERE " + " AND ".join(clauses) if clauses else ""
+    ) + " ORDER BY symbol ASC, opened_date ASC, lot_id ASC"
+    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def list_open_portfolio_symbols(conn: sqlite3.Connection) -> list[str]:
+    """Return every symbol with at least one open lot, for data-collection coverage."""
+    rows = conn.execute(
+        "SELECT DISTINCT symbol FROM portfolio_lots WHERE status = 'open' AND remaining_shares > 0"
+    ).fetchall()
+    return sorted({str(row["symbol"]).upper() for row in rows})
+
+
+def close_portfolio_lots_fifo(
+    conn: sqlite3.Connection,
+    *,
+    symbol: str,
+    shares: float,
+    sale_price: float,
+    sale_date: str,
+    notes: str | None = None,
+) -> list[dict[str, Any]]:
+    """Close the oldest open lots first for a real sell and record realized P&L.
+
+    Raises :class:`InsufficientHoldingsError` rather than partially selling when
+    the requested shares exceed what is currently held.
+    """
+    normalized_symbol = symbol.strip().upper()
+    open_lots = conn.execute(
+        "SELECT * FROM portfolio_lots WHERE symbol = ? AND status = 'open' AND remaining_shares > 0 "
+        "ORDER BY opened_date ASC, lot_id ASC",
+        (normalized_symbol,),
+    ).fetchall()
+    available = sum(float(row["remaining_shares"]) for row in open_lots)
+    if shares <= 0:
+        raise InsufficientHoldingsError("Shares to sell must be positive")
+    if shares > available + 1e-9:
+        raise InsufficientHoldingsError(
+            f"Cannot sell {shares} shares of {normalized_symbol}: only {available} shares are currently held"
+        )
+    now = utc_now_iso()
+    remaining_to_close = shares
+    sales: list[dict[str, Any]] = []
+    for lot in open_lots:
+        if remaining_to_close <= 1e-9:
+            break
+        lot_remaining = float(lot["remaining_shares"])
+        take = min(lot_remaining, remaining_to_close)
+        new_remaining = max(lot_remaining - take, 0.0)
+        new_status = "closed" if new_remaining <= 1e-9 else "open"
+        conn.execute(
+            "UPDATE portfolio_lots SET remaining_shares = ?, status = ? WHERE lot_id = ?",
+            (new_remaining, new_status, lot["lot_id"]),
+        )
+        realized_pnl = take * (float(sale_price) - float(lot["cost_basis_per_share"]))
+        sale_id = f"sale-{uuid4().hex}"
+        sale = {
+            "sale_id": sale_id,
+            "lot_id": lot["lot_id"],
+            "symbol": normalized_symbol,
+            "shares": take,
+            "sale_price": float(sale_price),
+            "sale_date": str(sale_date),
+            "realized_pnl": realized_pnl,
+            "notes": notes,
+            "created_at": now,
+        }
+        conn.execute(
+            "INSERT INTO portfolio_sales "
+            "(sale_id, lot_id, symbol, shares, sale_price, sale_date, realized_pnl, notes, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (sale_id, lot["lot_id"], normalized_symbol, take, float(sale_price), str(sale_date), realized_pnl, notes, now),
+        )
+        sales.append(sale)
+        remaining_to_close -= take
+    return sales
+
+
+def list_portfolio_sales(conn: sqlite3.Connection, symbol: str | None = None) -> list[dict[str, Any]]:
+    """List recorded realized sales, most recent first."""
+    if symbol:
+        rows = conn.execute(
+            "SELECT * FROM portfolio_sales WHERE symbol = ? ORDER BY sale_date DESC, sale_id DESC",
+            (symbol.strip().upper(),),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM portfolio_sales ORDER BY sale_date DESC, sale_id DESC"
+        ).fetchall()
+    return [dict(row) for row in rows]

@@ -362,7 +362,7 @@ def test_migrations_are_idempotent_and_preserve_legacy_price_values(
             for value in conn.execute(
                 "SELECT schema_version FROM schema_metadata ORDER BY schema_version"
             )
-        ] == [1, 2, 3, 4, 5, 6]
+        ] == [1, 2, 3, 4, 5, 6, 7]
         quality_columns = {
             value[1] for value in conn.execute("PRAGMA table_info(data_quality_issues)")
         }
@@ -422,6 +422,6 @@ def test_migration_failure_rolls_back_schema_and_data_changes(
         ).fetchone()[0] == 0
         assert conn.execute(
             "SELECT MAX(schema_version) FROM schema_metadata"
-        ).fetchone()[0] == 6
+        ).fetchone()[0] == 7
     finally:
         conn.close()

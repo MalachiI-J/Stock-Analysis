@@ -381,6 +381,7 @@ def test_run_uses_one_report_connection_and_closes_it(
         lambda *_args, **_kwargs: (["AAA"], [], 0, 0),
     )
     monkeypatch.setattr(cli, "validate_database", lambda *_args: [])
+    monkeypatch.setattr(cli, "_held_portfolio_symbols", lambda _config: [])
     monkeypatch.setattr(cli, "_analysis_batch", lambda *_args, **_kwargs: batch)
     monkeypatch.setattr(
         cli,
@@ -467,8 +468,6 @@ def _install_digest_saved_run(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]
             confidence_score=60.0,
         ),
     ]
-    monkeypatch.setattr(cli, "initialize_database", lambda _path: None)
-    monkeypatch.setattr(cli, "create_connection", lambda _path: _Connection())
     monkeypatch.setattr(
         cli, "_load_saved_results", lambda *_args, **_kwargs: (saved, results)
     )
@@ -507,3 +506,88 @@ def test_digest_command_no_save_skips_file(
     )
 
     assert not (tmp_path / "reports" / "digest_2024-12-31.txt").exists()
+
+
+def test_digest_command_includes_holdings_section(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    _install_digest_saved_run(monkeypatch)
+    assert cli.main(
+        ["portfolio-buy", "--symbol", "AAA", "--shares", "10", "--price", "50", "--date", "2024-11-01"]
+    ) == int(ExitCode.SUCCESS)
+
+    assert cli.main(["digest", "--run-id", "saved-run"]) == int(ExitCode.SUCCESS)
+
+    text = (tmp_path / "reports" / "digest_2024-12-31.txt").read_text(encoding="utf-8")
+    assert "YOUR HOLDINGS — 1 open position(s)" in text
+    assert "AAA" in text
+    assert "Classification: Strong Candidate" in text
+
+
+def test_portfolio_buy_command_records_lot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+
+    assert cli.main(
+        ["portfolio-buy", "--symbol", "aapl", "--shares", "10", "--price", "150.25", "--date", "2026-01-05"]
+    ) == int(ExitCode.SUCCESS)
+
+    captured = capsys.readouterr()
+    assert "10 sh AAPL" in captured.out
+
+    assert cli.main(["portfolio-show"]) == int(ExitCode.SUCCESS)
+    captured = capsys.readouterr()
+    assert "OPEN POSITIONS — 1 symbol(s)" in captured.out
+    assert "AAPL" in captured.out
+
+
+def test_portfolio_buy_rejects_nonpositive_shares(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["portfolio-buy", "--symbol", "AAPL", "--shares", "0", "--price", "10", "--date", "2026-01-05"])
+    assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)
+
+
+def test_portfolio_sell_command_closes_lot_and_reports_realized_pnl(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    assert cli.main(
+        ["portfolio-buy", "--symbol", "AAPL", "--shares", "10", "--price", "100", "--date", "2026-01-05"]
+    ) == int(ExitCode.SUCCESS)
+
+    assert cli.main(
+        ["portfolio-sell", "--symbol", "AAPL", "--shares", "4", "--price", "120", "--date", "2026-02-05"]
+    ) == int(ExitCode.SUCCESS)
+    captured = capsys.readouterr()
+    assert "realized P&L=+80.00" in captured.out
+
+    assert cli.main(["portfolio-show", "--closed"]) == int(ExitCode.SUCCESS)
+    captured = capsys.readouterr()
+    assert "AAPL" in captured.out
+    assert "CLOSED LOTS" in captured.out
+
+
+def test_portfolio_sell_command_reports_insufficient_holdings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    assert cli.main(
+        ["portfolio-buy", "--symbol", "AAPL", "--shares", "5", "--price", "100", "--date", "2026-01-05"]
+    ) == int(ExitCode.SUCCESS)
+
+    assert cli.main(
+        ["portfolio-sell", "--symbol", "AAPL", "--shares", "6", "--price", "120", "--date", "2026-02-05"]
+    ) == int(ExitCode.OPERATION_FAILED)

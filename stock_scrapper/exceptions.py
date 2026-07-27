@@ -40,3 +40,7 @@ class PartialFailureError(StockScrapperError):
 
 class OperationFailedError(StockScrapperError):
     """The complete requested operation failed."""
+
+
+class InsufficientHoldingsError(OperationFailedError):
+    """A requested portfolio sell exceeds the shares currently held."""
