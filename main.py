@@ -65,7 +65,12 @@ from stock_scrapper.exceptions import (
     MissingDataError,
     OperationFailedError,
 )
-from stock_scrapper.portfolio import HoldingAssessment, aggregate_open_lots, evaluate_holding
+from stock_scrapper.portfolio import (
+    HoldingAssessment,
+    aggregate_open_lots,
+    evaluate_holding,
+    evaluate_portfolio_performance,
+)
 from stock_scrapper.processing.validation import validate_price_records
 from stock_scrapper.reporting.report_builder import write_phase2_reports
 from stock_scrapper.reporting.persistence import persist_report, report_identity
@@ -173,6 +178,13 @@ def build_parser() -> argparse.ArgumentParser:
     portfolio_show.add_argument("--symbol")
     portfolio_show.add_argument("--closed", action="store_true", help="Also show closed lots and realized P&L")
     _add_as_of_argument(portfolio_show)
+
+    portfolio_compare = subparsers.add_parser("portfolio-compare", help="Compare real realized+unrealized P&L with a SPY shadow portfolio")
+    portfolio_compare.add_argument("--symbol")
+    _add_as_of_argument(portfolio_compare)
+
+    cleanup_logs = subparsers.add_parser("cleanup-logs", help="Delete log files older than the retention window")
+    cleanup_logs.add_argument("--days", type=int, help="Override config logs_retention_days")
 
     analysis_list=subparsers.add_parser("analysis-list", help="List saved analysis runs")
     analysis_list.add_argument("--scope",choices=("candidate_universe","all_data_symbols","custom")); analysis_list.add_argument("--date"); analysis_list.add_argument("--canonical-only",action="store_true"); analysis_list.add_argument("--limit",type=int,default=20)
@@ -1127,6 +1139,73 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
             return int(ExitCode.SUCCESS)
 
+        if args.command == "portfolio-compare":
+            effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                lots = list_portfolio_lots(conn, args.symbol)
+                sales = list_portfolio_sales(conn, args.symbol)
+                saved = get_latest_canonical_analysis_run(conn)
+                results_by_symbol = (
+                    {result.symbol: result for result in results_from_saved_run(saved)} if saved else {}
+                )
+                holdings = _assess_open_holdings(conn, base_dir, effective, results_by_symbol)
+                if args.symbol:
+                    requested_symbol = args.symbol.strip().upper()
+                    holdings = [holding for holding in holdings if holding.symbol == requested_symbol]
+                backtest_config = load_backtesting_config(base_dir / "config" / "backtesting_rules.yaml")
+                benchmark_symbol = backtest_config.benchmark.upper()
+                price_cache: dict[str, float | None] = {}
+
+                def benchmark_price_at(day: str) -> float | None:
+                    if day not in price_cache:
+                        history = fetch_price_history(conn, benchmark_symbol, end_date=day)
+                        price_cache[day] = _finite(history[-1].get("adjusted_close")) if history else None
+                    return price_cache[day]
+
+                benchmark_as_of = benchmark_price_at(effective.isoformat())
+                summary = evaluate_portfolio_performance(
+                    lots,
+                    sales,
+                    holdings,
+                    benchmark_price_at=benchmark_price_at,
+                    benchmark_price_as_of=benchmark_as_of,
+                )
+            finally:
+                conn.close()
+            if not lots:
+                print("No portfolio lots recorded. Use `python main.py portfolio-buy` to start tracking real holdings.")
+                return int(ExitCode.SUCCESS)
+            print(f"Portfolio performance as of {effective.isoformat()} (benchmark {benchmark_symbol})")
+            print(f"Total invested:        ${summary.total_invested:,.2f}")
+            print(f"Realized P&L:          ${summary.realized_pnl:+,.2f}")
+            print(f"Unrealized P&L:        ${summary.unrealized_pnl:+,.2f}")
+            return_text = "n/a" if summary.total_return_pct is None else f"{summary.total_return_pct:+.1%}"
+            print(f"Total P&L:             ${summary.total_pnl:+,.2f} ({return_text})")
+            if summary.benchmark_shadow_pnl is None:
+                print(f"{benchmark_symbol} shadow P&L:      unavailable (no priced lots)")
+            else:
+                shadow_return_text = (
+                    "n/a" if summary.benchmark_shadow_return_pct is None else f"{summary.benchmark_shadow_return_pct:+.1%}"
+                )
+                print(
+                    f"{benchmark_symbol} shadow P&L:      ${summary.benchmark_shadow_pnl:+,.2f} ({shadow_return_text}) "
+                    f"on ${summary.benchmark_shadow_invested:,.2f} of comparably-priced capital"
+                )
+                excess_text = "n/a" if summary.excess_return_pct is None else f"{summary.excess_return_pct:+.1%}"
+                print(f"Excess vs {benchmark_symbol}:         {excess_text}")
+            if summary.unpriced_lot_ids:
+                print(f"Lots excluded from {benchmark_symbol} comparison (missing benchmark price): " + ", ".join(summary.unpriced_lot_ids))
+            if summary.unpriced_symbols:
+                print("Symbols missing a current price (excluded from unrealized P&L): " + ", ".join(summary.unpriced_symbols))
+            print(
+                "Educational research output, not investment advice. The benchmark comparison assumes the same "
+                "dollars were invested in the benchmark on the same days; it does not model taxes, fees, or "
+                "dividends."
+            )
+            return int(ExitCode.SUCCESS)
+
         if args.command == "analysis-list":
             initialize_database(config["database_path"])
             conn = create_connection(config["database_path"])
@@ -1385,6 +1464,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.command == "status":
             show_status(config, logger)
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "cleanup-logs":
+            retention_days = args.days if args.days is not None else int(config.get("logs_retention_days", 30))
+            if retention_days <= 0:
+                parser.error("--days must be positive")
+            cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+            logs_dir = Path(config["logs_dir"])
+            deleted = 0
+            for path in sorted(logs_dir.glob("*.log")):
+                try:
+                    modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                except OSError:
+                    continue
+                if modified_at < cutoff:
+                    path.unlink(missing_ok=True)
+                    deleted += 1
+            print(f"Deleted {deleted} log file(s) older than {retention_days} day(s) from {logs_dir}")
             return int(ExitCode.SUCCESS)
         parser.error("Unsupported command")
         return int(ExitCode.INVALID_ARGUMENTS)

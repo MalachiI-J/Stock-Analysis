@@ -24,6 +24,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "logging_level": "INFO",
     "archive_raw_downloads": False,
     "open_reports_automatically": False,
+    "logs_retention_days": 30,
     "market_data": {
         "exchange": "XNYS", "timezone": "America/New_York",
         "provider_delay_minutes": 30, "incomplete_bar_policy": "exclude",
@@ -72,6 +73,7 @@ def _ensure_default_files(base_dir: Path) -> tuple[Path, Path]:
             "logging_level": "INFO",
             "archive_raw_downloads": False,
             "open_reports_automatically": False,
+            "logs_retention_days": 30,
         }
         settings_path.write_text(yaml.safe_dump(settings_payload, sort_keys=False), encoding="utf-8")
 

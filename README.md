@@ -26,6 +26,24 @@ holding's evaluation has current data.
 Recommendations are rule-based research output, not investment advice, and a
 missing current price is reported as unavailable rather than assumed.
 
+`portfolio-compare` reports real realized/unrealized P&L against a SPY
+"shadow portfolio": the same dollars, invested in the benchmark on the same
+days each lot was opened or sold, using each sale's own recorded `lot_id` to
+match it to its true entry date rather than an average. A lot only counts
+toward the shadow total if every benchmark price point it needs is available,
+so the reported shadow total and its invested-capital denominator always
+match; excluded lots and symbols with no current price are listed separately
+rather than silently folded into the totals. This is a fairer comparison for
+irregular real-world trade timing than a naive total-cost-vs-current-value
+ratio, but it still ignores taxes, fees, and dividends.
+
+`cleanup-logs` deletes files under `logs/` older than `logs_retention_days`
+(default 30; override with `--days`). It never touches `reports/`, since
+Phase 2/3 report files can be referenced by persisted `analysis_reports`/
+`backtest_runs` rows and deleting them without removing those rows would
+orphan a database reference. `scripts/run_daily.ps1` runs it automatically
+after each daily digest.
+
 ## Phase 3.2 calibration and diagnostics
 
 Revision policy `revision-v2` uses configurable absolute and relative tolerances.
@@ -226,6 +244,14 @@ python main.py portfolio-buy --symbol AAPL --shares 10 --price 150.25 --date 202
 python main.py portfolio-sell --symbol AAPL --shares 4 --price 165.00 --date 2026-03-01
 python main.py portfolio-show
 python main.py portfolio-show --symbol AAPL --closed
+
+# Compare your real P&L with a same-dollars-same-days SPY shadow portfolio
+python main.py portfolio-compare
+python main.py portfolio-compare --symbol AAPL --as-of-date 2026-06-30
+
+# Delete old log files (reports/ is never touched)
+python main.py cleanup-logs
+python main.py cleanup-logs --days 7
 ```
 
 `digest` reads the same saved classifications as `scores`/`explain` and groups
@@ -299,7 +325,7 @@ The archive is written under `dist/`. It includes source, configuration, documen
 
 ## Configuration
 
-- `config/settings.yaml` controls local paths, data source, retry behavior, and historical lookback.
+- `config/settings.yaml` controls local paths, data source, retry behavior, historical lookback, and log retention (`logs_retention_days`).
 - `config/watchlist.csv` defines the static research universe.
 - `config/scoring_rules.yaml` defines score weights, thresholds, regime settings, and scoring version.
 - `config/backtesting_rules.yaml` defines strategy, portfolio, execution, cost, stop, benchmark, and walk-forward assumptions.

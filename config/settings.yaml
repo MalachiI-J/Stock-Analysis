@@ -12,6 +12,7 @@ retry_delay_seconds: 2
 logging_level: INFO
 archive_raw_downloads: false
 open_reports_automatically: false
+logs_retention_days: 30
 market_data:
   exchange: XNYS
   timezone: America/New_York

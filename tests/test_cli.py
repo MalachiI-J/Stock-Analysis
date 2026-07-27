@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator
@@ -591,3 +593,128 @@ def test_portfolio_sell_command_reports_insufficient_holdings(
     assert cli.main(
         ["portfolio-sell", "--symbol", "AAPL", "--shares", "6", "--price", "120", "--date", "2026-02-05"]
     ) == int(ExitCode.OPERATION_FAILED)
+
+
+def test_cleanup_logs_deletes_only_files_older_than_retention(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True)
+    old_log = logs_dir / "stock_scrapper_old.log"
+    new_log = logs_dir / "stock_scrapper_new.log"
+    old_log.write_text("old", encoding="utf-8")
+    new_log.write_text("new", encoding="utf-8")
+    old_timestamp = (datetime.now(timezone.utc) - timedelta(days=45)).timestamp()
+    os.utime(old_log, (old_timestamp, old_timestamp))
+
+    assert cli.main(["cleanup-logs", "--days", "30"]) == int(ExitCode.SUCCESS)
+
+    assert not old_log.exists()
+    assert new_log.exists()
+    captured = capsys.readouterr()
+    assert "Deleted 1 log file(s)" in captured.out
+
+
+def test_cleanup_logs_uses_configured_retention_when_no_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    config["logs_retention_days"] = 7
+    monkeypatch.setattr(cli, "load_config", lambda _base_dir: config)
+    monkeypatch.setattr(cli, "ensure_directories", lambda _config: None)
+    monkeypatch.setattr(cli, "load_watchlist", lambda _path: ["AAA"])
+    monkeypatch.setattr(cli, "setup_logging", lambda _config, run_id: _Logger())
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True)
+    old_log = logs_dir / "daily_run_old.log"
+    old_log.write_text("old", encoding="utf-8")
+    old_timestamp = (datetime.now(timezone.utc) - timedelta(days=10)).timestamp()
+    os.utime(old_log, (old_timestamp, old_timestamp))
+
+    assert cli.main(["cleanup-logs"]) == int(ExitCode.SUCCESS)
+
+    assert not old_log.exists()
+
+
+def test_cleanup_logs_rejects_nonpositive_days(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["cleanup-logs", "--days", "0"])
+    assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)
+
+
+def _seed_price_row(symbol: str, trade_date: str, price: float) -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "trade_date": trade_date,
+        "open": price,
+        "high": price,
+        "low": price,
+        "close": price,
+        "adjusted_close": price,
+        "volume": 1_000_000,
+        "dividends": 0.0,
+        "stock_splits": 0.0,
+        "data_source": "test",
+        "collected_at": f"{trade_date}T22:00:00+00:00",
+    }
+
+
+def test_portfolio_compare_reports_shadow_benchmark_comparison(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from stock_scrapper.database import create_connection, initialize_database, upsert_price_history
+
+    _install_startup(monkeypatch, tmp_path)
+    config = _config(tmp_path)
+    initialize_database(config["database_path"])
+    conn = create_connection(config["database_path"])
+    try:
+        for trade_date, aapl_price, spy_price in [
+            ("2020-01-02", 100.0, 50.0),
+            ("2020-06-30", 120.0, 60.0),
+        ]:
+            upsert_price_history(conn, _seed_price_row("AAPL", trade_date, aapl_price))
+            upsert_price_history(conn, _seed_price_row("SPY", trade_date, spy_price))
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert cli.main(
+        ["portfolio-buy", "--symbol", "AAPL", "--shares", "10", "--price", "100", "--date", "2020-01-02"]
+    ) == int(ExitCode.SUCCESS)
+    capsys.readouterr()
+
+    assert cli.main(["portfolio-compare", "--as-of-date", "2020-06-30"]) == int(ExitCode.SUCCESS)
+    captured = capsys.readouterr()
+    assert "Total invested:        $1,000.00" in captured.out
+    assert "Unrealized P&L:        $+200.00" in captured.out
+    assert "Total P&L:             $+200.00 (+20.0%)" in captured.out
+    assert "SPY shadow P&L:      $+200.00 (+20.0%)" in captured.out
+    assert "Excess vs SPY:         +0.0%" in captured.out
+    assert not summary_has_unpriced(captured.out)
+
+
+def summary_has_unpriced(output: str) -> bool:
+    return "excluded from" in output
+
+
+def test_portfolio_compare_reports_none_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+
+    assert cli.main(["portfolio-compare"]) == int(ExitCode.SUCCESS)
+    captured = capsys.readouterr()
+    assert "No portfolio lots recorded" in captured.out

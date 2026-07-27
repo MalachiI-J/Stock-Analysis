@@ -6,12 +6,18 @@ the same rule-based exit logic the backtester uses
 (:mod:`stock_scrapper.backtesting.exit_rules`) so a live "consider selling"
 signal is judged by exactly the rules that would have closed the position in
 a backtest, plus a close-price stop-loss/trailing-stop check.
+
+It also compares real trades with a "SPY shadow portfolio": what the same
+dollars, invested in the benchmark on the same days, would be worth now. This
+is a fair like-for-like comparison for irregular real-world buy/sell timing,
+unlike a naive total-cost-vs-current-value ratio that ignores when the
+benchmark itself moved.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from stock_scrapper.backtesting.config import BacktestConfig
 from stock_scrapper.backtesting.exit_rules import evaluate_price_stop, evaluate_rule_based_exit
@@ -136,4 +142,127 @@ def evaluate_holding(
         rule_based_exit_reason=rule_based_exit_reason,
         price_stop_reason=price_stop_reason,
         recommendation=recommendation,
+    )
+
+
+@dataclass(slots=True)
+class PortfolioPerformanceSummary:
+    """Real trading performance plus a fair, like-for-like benchmark comparison."""
+
+    total_invested: float
+    realized_pnl: float
+    unrealized_pnl: float
+    total_pnl: float
+    total_return_pct: float | None
+    benchmark_shadow_pnl: float | None
+    benchmark_shadow_invested: float | None
+    benchmark_shadow_return_pct: float | None
+    excess_return_pct: float | None
+    unpriced_lot_ids: list[str]
+    unpriced_symbols: list[str]
+
+
+def evaluate_portfolio_performance(
+    lots: Sequence[Mapping[str, Any]],
+    sales: Sequence[Mapping[str, Any]],
+    holdings: Sequence[HoldingAssessment],
+    *,
+    benchmark_price_at: Callable[[str], float | None],
+    benchmark_price_as_of: float | None,
+) -> PortfolioPerformanceSummary:
+    """Compare real realized+unrealized P&L with a same-dollars, same-days SPY shadow portfolio.
+
+    For each lot, ``benchmark_price_at(lot's opened_date)`` gives the shadow
+    number of benchmark shares that lot's cash would have bought; each sale
+    (matched to its originating lot via ``lot_id``) and any still-open
+    remainder is priced the same way at its own date. A lot only contributes
+    to the shadow comparison if every benchmark price point it needs is
+    available — partial lots are not mixed into the totals, so the returned
+    ``benchmark_shadow_invested`` always matches the dollars actually behind
+    ``benchmark_shadow_pnl``. Lots missing any required price are listed in
+    ``unpriced_lot_ids`` and simply excluded rather than guessed at.
+
+    ``holdings`` supplies today's actual unrealized P&L (already computed
+    against real market prices in :func:`evaluate_holding`); symbols with no
+    current price are listed in ``unpriced_symbols`` and excluded from
+    ``unrealized_pnl``/``total_pnl`` rather than treated as zero.
+    """
+    sales_by_lot: dict[str, list[Mapping[str, Any]]] = {}
+    for sale in sales:
+        sales_by_lot.setdefault(str(sale["lot_id"]), []).append(sale)
+
+    total_invested = sum(float(lot["shares"]) * float(lot["cost_basis_per_share"]) for lot in lots)
+    realized_pnl = sum(float(sale["realized_pnl"]) for sale in sales)
+    unrealized_by_symbol = {holding.symbol: holding.unrealized_pnl for holding in holdings}
+    unrealized_pnl = sum(value for value in unrealized_by_symbol.values() if value is not None)
+    unpriced_symbols = sorted(
+        symbol for symbol, value in unrealized_by_symbol.items() if value is None
+    )
+
+    benchmark_shadow_pnl = 0.0
+    benchmark_shadow_invested = 0.0
+    unpriced_lot_ids: list[str] = []
+    for lot in lots:
+        lot_id = str(lot["lot_id"])
+        lot_shares = float(lot["shares"])
+        cost_per_share = float(lot["cost_basis_per_share"])
+        entry_price = benchmark_price_at(str(lot["opened_date"]))
+        if entry_price is None or entry_price <= 0 or lot_shares <= 0:
+            unpriced_lot_ids.append(lot_id)
+            continue
+        shadow_shares_total = (lot_shares * cost_per_share) / entry_price
+
+        lot_ok = True
+        lot_shadow_pnl = 0.0
+        lot_invested = 0.0
+        for sale in sales_by_lot.get(lot_id, []):
+            exit_price = benchmark_price_at(str(sale["sale_date"]))
+            if exit_price is None:
+                lot_ok = False
+                break
+            sale_shares = float(sale["shares"])
+            fraction = sale_shares / lot_shares
+            dollars_invested = sale_shares * cost_per_share
+            lot_shadow_pnl += shadow_shares_total * fraction * exit_price - dollars_invested
+            lot_invested += dollars_invested
+
+        remaining = float(lot.get("remaining_shares") or 0.0)
+        if lot_ok and remaining > 0:
+            if benchmark_price_as_of is None:
+                lot_ok = False
+            else:
+                fraction = remaining / lot_shares
+                dollars_invested = remaining * cost_per_share
+                lot_shadow_pnl += shadow_shares_total * fraction * benchmark_price_as_of - dollars_invested
+                lot_invested += dollars_invested
+
+        if lot_ok:
+            benchmark_shadow_pnl += lot_shadow_pnl
+            benchmark_shadow_invested += lot_invested
+        else:
+            unpriced_lot_ids.append(lot_id)
+
+    total_pnl = realized_pnl + unrealized_pnl
+    total_return_pct = total_pnl / total_invested if total_invested > 0 else None
+    has_shadow_data = benchmark_shadow_invested > 0
+    benchmark_shadow_return_pct = (
+        benchmark_shadow_pnl / benchmark_shadow_invested if has_shadow_data else None
+    )
+    excess_return_pct = (
+        total_return_pct - benchmark_shadow_return_pct
+        if total_return_pct is not None and benchmark_shadow_return_pct is not None
+        else None
+    )
+    return PortfolioPerformanceSummary(
+        total_invested=total_invested,
+        realized_pnl=realized_pnl,
+        unrealized_pnl=unrealized_pnl,
+        total_pnl=total_pnl,
+        total_return_pct=total_return_pct,
+        benchmark_shadow_pnl=benchmark_shadow_pnl if has_shadow_data else None,
+        benchmark_shadow_invested=benchmark_shadow_invested if has_shadow_data else None,
+        benchmark_shadow_return_pct=benchmark_shadow_return_pct,
+        excess_return_pct=excess_return_pct,
+        unpriced_lot_ids=sorted(set(unpriced_lot_ids)),
+        unpriced_symbols=unpriced_symbols,
     )

@@ -1,6 +1,7 @@
 <#
 Runs the daily Stock Scrapper pipeline unattended: collects/validates/analyzes/reports
-(`main.py run`), then writes a plain-language buy/watch/sell digest (`main.py digest`).
+(`main.py run`), writes a plain-language buy/watch/sell digest (`main.py digest`), then
+deletes log files older than the configured retention window (`main.py cleanup-logs`).
 Intended to be invoked by Windows Task Scheduler once per day, after the market
 close plus the configured provider delay (see market_data.provider_delay_minutes
 in config/settings.yaml).
@@ -34,6 +35,9 @@ $runExit = $LASTEXITCODE
 cmd.exe /c "`"$pythonExe`" main.py digest >> `"$logFile`" 2>&1"
 $digestExit = $LASTEXITCODE
 
-Add-Content -Path $logFile -Value "=== Stock Scrapper daily run finished $(Get-Date -Format o): run=$runExit digest=$digestExit ==="
+cmd.exe /c "`"$pythonExe`" main.py cleanup-logs >> `"$logFile`" 2>&1"
+$cleanupExit = $LASTEXITCODE
 
-exit ([Math]::Max($runExit, $digestExit))
+Add-Content -Path $logFile -Value "=== Stock Scrapper daily run finished $(Get-Date -Format o): run=$runExit digest=$digestExit cleanup=$cleanupExit ==="
+
+exit ([Math]::Max($runExit, $digestExit, $cleanupExit))

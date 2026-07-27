@@ -15,6 +15,7 @@ from stock_scrapper.portfolio import (
     PortfolioPosition,
     aggregate_open_lots,
     evaluate_holding,
+    evaluate_portfolio_performance,
 )
 
 
@@ -171,6 +172,153 @@ def test_evaluate_holding_recommends_sell_on_trailing_stop() -> None:
     # 150 * (1 - 0.15) = 127.5 trailing-stop trigger; 127.0 <= 127.5 -> triggered.
     assert assessment.recommendation == "SELL"
     assert assessment.price_stop_reason == "Trailing stop"
+
+
+def _holding(**overrides: object) -> HoldingAssessment:
+    base = dict(
+        symbol="AAPL",
+        shares=10.0,
+        average_cost_basis=100.0,
+        latest_price=120.0,
+        classification="Candidate",
+        primary_reason="Solid trend",
+        rule_based_exit_reason=None,
+        price_stop_reason=None,
+        recommendation="HOLD",
+    )
+    base.update(overrides)
+    return HoldingAssessment(**base)
+
+
+def test_evaluate_portfolio_performance_matches_benchmark_when_returns_equal() -> None:
+    lots = [
+        {
+            "lot_id": "lot-1", "symbol": "AAPL", "shares": 10.0, "remaining_shares": 10.0,
+            "cost_basis_per_share": 100.0, "opened_date": "2026-01-01",
+        }
+    ]
+    holdings = [_holding(latest_price=120.0)]  # +20% -> unrealized_pnl = 200
+    prices = {"2026-01-01": 50.0}
+
+    summary = evaluate_portfolio_performance(
+        lots, [], holdings,
+        benchmark_price_at=lambda day: prices.get(day),
+        benchmark_price_as_of=60.0,  # +20% vs the 2026-01-01 entry price
+    )
+
+    assert summary.total_invested == 1000.0
+    assert summary.realized_pnl == 0.0
+    assert summary.unrealized_pnl == pytest.approx(200.0)
+    assert summary.total_return_pct == pytest.approx(0.20)
+    assert summary.benchmark_shadow_pnl == pytest.approx(200.0)
+    assert summary.benchmark_shadow_return_pct == pytest.approx(0.20)
+    assert summary.excess_return_pct == pytest.approx(0.0)
+    assert summary.unpriced_lot_ids == []
+    assert summary.unpriced_symbols == []
+
+
+def test_evaluate_portfolio_performance_reports_excess_return() -> None:
+    lots = [
+        {
+            "lot_id": "lot-1", "symbol": "AAPL", "shares": 10.0, "remaining_shares": 10.0,
+            "cost_basis_per_share": 100.0, "opened_date": "2026-01-01",
+        }
+    ]
+    holdings = [_holding(latest_price=130.0)]  # +30% -> unrealized_pnl = 300
+    prices = {"2026-01-01": 50.0}
+
+    summary = evaluate_portfolio_performance(
+        lots, [], holdings,
+        benchmark_price_at=lambda day: prices.get(day),
+        benchmark_price_as_of=50.0,  # benchmark flat
+    )
+
+    assert summary.total_return_pct == pytest.approx(0.30)
+    assert summary.benchmark_shadow_return_pct == pytest.approx(0.0)
+    assert summary.excess_return_pct == pytest.approx(0.30)
+
+
+def test_evaluate_portfolio_performance_handles_partial_sale() -> None:
+    lots = [
+        {
+            "lot_id": "lot-1", "symbol": "AAPL", "shares": 10.0, "remaining_shares": 6.0,
+            "cost_basis_per_share": 100.0, "opened_date": "2026-01-01",
+        }
+    ]
+    sales = [
+        {
+            "lot_id": "lot-1", "symbol": "AAPL", "shares": 4.0, "sale_price": 130.0,
+            "sale_date": "2026-02-01", "realized_pnl": 120.0,
+        }
+    ]
+    holdings = [_holding(shares=6.0, latest_price=140.0)]  # unrealized = 6*(140-100) = 240
+    prices = {"2026-01-01": 50.0, "2026-02-01": 55.0}
+
+    summary = evaluate_portfolio_performance(
+        lots, sales, holdings,
+        benchmark_price_at=lambda day: prices.get(day),
+        benchmark_price_as_of=60.0,
+    )
+
+    assert summary.total_invested == 1000.0
+    assert summary.realized_pnl == pytest.approx(120.0)
+    assert summary.unrealized_pnl == pytest.approx(240.0)
+    assert summary.total_pnl == pytest.approx(360.0)
+    assert summary.total_return_pct == pytest.approx(0.36)
+    # Shadow: sold portion (0.4 * 20 shadow shares * 55) - 400 = 40; remaining (0.6*20*60) - 600 = 120
+    assert summary.benchmark_shadow_pnl == pytest.approx(160.0)
+    assert summary.benchmark_shadow_invested == pytest.approx(1000.0)
+    assert summary.benchmark_shadow_return_pct == pytest.approx(0.16)
+    assert summary.excess_return_pct == pytest.approx(0.20)
+
+
+def test_evaluate_portfolio_performance_excludes_lot_missing_benchmark_price() -> None:
+    lots = [
+        {
+            "lot_id": "lot-1", "symbol": "AAPL", "shares": 10.0, "remaining_shares": 10.0,
+            "cost_basis_per_share": 100.0, "opened_date": "2026-01-01",
+        },
+        {
+            "lot_id": "lot-2", "symbol": "MSFT", "shares": 5.0, "remaining_shares": 5.0,
+            "cost_basis_per_share": 200.0, "opened_date": "1999-01-01",  # no benchmark data this far back
+        },
+    ]
+    holdings = [_holding(symbol="AAPL", latest_price=120.0), _holding(symbol="MSFT", shares=5.0, average_cost_basis=200.0, latest_price=220.0)]
+    prices = {"2026-01-01": 50.0}
+
+    summary = evaluate_portfolio_performance(
+        lots, [], holdings,
+        benchmark_price_at=lambda day: prices.get(day),
+        benchmark_price_as_of=60.0,
+    )
+
+    assert summary.unpriced_lot_ids == ["lot-2"]
+    # total_invested and actual P&L still include the unpriced lot.
+    assert summary.total_invested == pytest.approx(1000.0 + 1000.0)
+    assert summary.unrealized_pnl == pytest.approx(200.0 + 100.0)
+    # Shadow totals only reflect the priced lot.
+    assert summary.benchmark_shadow_invested == pytest.approx(1000.0)
+    assert summary.benchmark_shadow_pnl == pytest.approx(200.0)
+
+
+def test_evaluate_portfolio_performance_excludes_symbol_missing_current_price() -> None:
+    lots = [
+        {
+            "lot_id": "lot-1", "symbol": "ZZZZ", "shares": 10.0, "remaining_shares": 10.0,
+            "cost_basis_per_share": 100.0, "opened_date": "2026-01-01",
+        }
+    ]
+    holdings = [_holding(symbol="ZZZZ", latest_price=None, recommendation="UNKNOWN (no current price data)")]
+
+    summary = evaluate_portfolio_performance(
+        lots, [], holdings,
+        benchmark_price_at=lambda _day: 50.0,
+        benchmark_price_as_of=60.0,
+    )
+
+    assert summary.unpriced_symbols == ["ZZZZ"]
+    assert summary.unrealized_pnl == 0.0
+    assert summary.total_pnl == 0.0
 
 
 def test_evaluate_holding_reports_unknown_recommendation_without_price() -> None:
