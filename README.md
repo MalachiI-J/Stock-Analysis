@@ -1,6 +1,6 @@
 # Stock Scrapper
 
-Stock Scrapper 0.6.0 is a free, local, explainable stock-market research and historical-backtesting application. It collects daily market data, preserves it in SQLite, calculates transparent technical evidence, saves reproducible analysis runs, simulates a long-only strategy in one shared portfolio, tracks a user's real holdings against the same rules, screens a broader universe for new ideas, and offers a separate, clearly-labeled experimental statistical forecast alongside the deterministic score.
+Stock Scrapper 0.7.0 is a free, local, explainable stock-market research and historical-backtesting application. It collects daily market data, preserves it in SQLite, calculates transparent technical evidence, saves reproducible analysis runs, simulates a long-only strategy in one shared portfolio, tracks a user's real holdings against the same rules, screens a broader universe for new ideas, and offers a separate, clearly-labeled experimental statistical forecast alongside the deterministic score.
 
 ## Phase 5 screening, notifications, and experimental prediction
 
@@ -80,11 +80,15 @@ irregular real-world trade timing than a naive total-cost-vs-current-value
 ratio, but it still ignores taxes, fees, and dividends.
 
 `cleanup-logs` deletes files under `logs/` older than `logs_retention_days`
-(default 30; override with `--days`). It never touches `reports/`, since
-Phase 2/3 report files can be referenced by persisted `analysis_reports`/
-`backtest_runs` rows and deleting them without removing those rows would
-orphan a database reference. `scripts/run_daily.ps1` runs it automatically
-after each daily digest.
+(default 30; override with `--days`). By default it never touches `reports/`,
+since Phase 2/3 report files can be referenced by persisted
+`analysis_reports`/`backtest_runs` rows and deleting them without removing
+those rows would orphan a database reference. `--include-reports` additionally
+deletes old digest (`.txt`/`.summary.json`), data-health, and screener
+(`stock_summary_*_screen-*`) files specifically — the only report outputs
+never referenced by any saved-run row, identified by filename pattern, never
+the canonical/custom/backtest ones. `scripts/run_daily.ps1` runs
+`cleanup-logs --include-reports` automatically after each daily digest.
 
 ## Phase 3.2 calibration and diagnostics
 
@@ -291,9 +295,10 @@ python main.py portfolio-show --symbol AAPL --closed
 python main.py portfolio-compare
 python main.py portfolio-compare --symbol AAPL --as-of-date 2026-06-30
 
-# Delete old log files (reports/ is never touched)
+# Delete old log files; --include-reports also removes old digest/data-health/screener files
 python main.py cleanup-logs
 python main.py cleanup-logs --days 7
+python main.py cleanup-logs --include-reports
 
 # Scan a broader static universe for new Candidate/Strong Candidate ideas
 python main.py screen

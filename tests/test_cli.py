@@ -659,6 +659,69 @@ def test_cleanup_logs_rejects_nonpositive_days(
     assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)
 
 
+def test_cleanup_logs_include_reports_deletes_only_unreferenced_patterns(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True)
+
+    old_timestamp = (datetime.now(timezone.utc) - timedelta(days=45)).timestamp()
+    unreferenced_old = [
+        reports_dir / "digest_2024-01-01.txt",
+        reports_dir / "digest_2024-01-01.summary.json",
+        reports_dir / "data_health_2024-01-01.json",
+        reports_dir / "data_health_2024-01-01.html",
+        reports_dir / "stock_summary_2024-01-01_screen-abc12345.csv",
+        reports_dir / "stock_summary_2024-01-01_screen-abc12345.html",
+    ]
+    for path in unreferenced_old:
+        path.write_text("x", encoding="utf-8")
+        os.utime(path, (old_timestamp, old_timestamp))
+
+    # Persisted-report-style filenames must never be deleted, even when old.
+    protected_old = [
+        reports_dir / "stock_summary_2024-01-01_candidates_abc12345.csv",
+        reports_dir / "stock_summary_2024-01-01_candidates_abc12345.manifest.json",
+        reports_dir / "stock_summary_2024-01-01_custom-AAPL_abc12345.html",
+    ]
+    for path in protected_old:
+        path.write_text("x", encoding="utf-8")
+        os.utime(path, (old_timestamp, old_timestamp))
+
+    recent_digest = reports_dir / "digest_2026-01-01.txt"
+    recent_digest.write_text("x", encoding="utf-8")
+
+    assert cli.main(["cleanup-logs", "--days", "30", "--include-reports"]) == int(ExitCode.SUCCESS)
+
+    for path in unreferenced_old:
+        assert not path.exists(), f"{path} should have been deleted"
+    for path in protected_old:
+        assert path.exists(), f"{path} must never be deleted"
+    assert recent_digest.exists()
+    captured = capsys.readouterr()
+    assert "Deleted 6 unreferenced report file(s)" in captured.out
+
+
+def test_cleanup_logs_without_include_reports_leaves_reports_alone(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True)
+    old_digest = reports_dir / "digest_2024-01-01.txt"
+    old_digest.write_text("x", encoding="utf-8")
+    old_timestamp = (datetime.now(timezone.utc) - timedelta(days=45)).timestamp()
+    os.utime(old_digest, (old_timestamp, old_timestamp))
+
+    assert cli.main(["cleanup-logs", "--days", "30"]) == int(ExitCode.SUCCESS)
+
+    assert old_digest.exists()
+
+
 def _seed_price_row(symbol: str, trade_date: str, price: float) -> dict[str, Any]:
     return {
         "symbol": symbol,

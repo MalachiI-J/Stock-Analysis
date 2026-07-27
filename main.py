@@ -205,8 +205,12 @@ def build_parser() -> argparse.ArgumentParser:
     portfolio_compare.add_argument("--symbol")
     _add_as_of_argument(portfolio_compare)
 
-    cleanup_logs = subparsers.add_parser("cleanup-logs", help="Delete log files older than the retention window")
+    cleanup_logs = subparsers.add_parser("cleanup-logs", help="Delete log files (and optionally unreferenced report artifacts) older than the retention window")
     cleanup_logs.add_argument("--days", type=int, help="Override config logs_retention_days")
+    cleanup_logs.add_argument(
+        "--include-reports", action="store_true",
+        help="Also delete digest/data-health/screener report files not tied to any saved analysis or backtest run",
+    )
 
     analysis_list=subparsers.add_parser("analysis-list", help="List saved analysis runs")
     analysis_list.add_argument("--scope",choices=("candidate_universe","all_data_symbols","custom")); analysis_list.add_argument("--date"); analysis_list.add_argument("--canonical-only",action="store_true"); analysis_list.add_argument("--limit",type=int,default=20)
@@ -656,6 +660,32 @@ def _finite(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if number == number and abs(number) != float("inf") else None
+
+
+_UNREFERENCED_REPORT_PATTERNS: tuple[str, ...] = (
+    "digest_*.txt",
+    "digest_*.summary.json",
+    "data_health_*.json",
+    "data_health_*.html",
+    "stock_summary_*_screen-*.csv",
+    "stock_summary_*_screen-*.html",
+)
+
+
+def _delete_old_files(directory: Path, pattern: str, cutoff: datetime) -> int:
+    """Delete files matching ``pattern`` under ``directory`` last modified before ``cutoff``."""
+    if not directory.exists():
+        return 0
+    deleted = 0
+    for path in sorted(directory.glob(pattern)):
+        try:
+            modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            continue
+        if modified_at < cutoff:
+            path.unlink(missing_ok=True)
+            deleted += 1
+    return deleted
 
 
 def _new_screening_symbols(screening_symbols: Sequence[str], already_tracked: Sequence[str]) -> list[str]:
@@ -1622,16 +1652,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 parser.error("--days must be positive")
             cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
             logs_dir = Path(config["logs_dir"])
-            deleted = 0
-            for path in sorted(logs_dir.glob("*.log")):
-                try:
-                    modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-                except OSError:
-                    continue
-                if modified_at < cutoff:
-                    path.unlink(missing_ok=True)
-                    deleted += 1
-            print(f"Deleted {deleted} log file(s) older than {retention_days} day(s) from {logs_dir}")
+            deleted_logs = _delete_old_files(logs_dir, "*.log", cutoff)
+            print(f"Deleted {deleted_logs} log file(s) older than {retention_days} day(s) from {logs_dir}")
+            if args.include_reports:
+                reports_dir = Path(config["reports_dir"])
+                deleted_reports = sum(
+                    _delete_old_files(reports_dir, pattern, cutoff) for pattern in _UNREFERENCED_REPORT_PATTERNS
+                )
+                print(
+                    f"Deleted {deleted_reports} unreferenced report file(s) older than {retention_days} day(s) "
+                    f"from {reports_dir} (digest/data-health/screener outputs only; analysis and backtest "
+                    "reports tied to saved runs are never touched)"
+                )
             return int(ExitCode.SUCCESS)
         parser.error("Unsupported command")
         return int(ExitCode.INVALID_ARGUMENTS)

@@ -1,9 +1,11 @@
 <#
 Runs the daily Stock Scrapper pipeline unattended: collects/validates/analyzes/reports
 (`main.py run`), writes a plain-language buy/watch/sell digest (`main.py digest`) and
-shows it as a Windows toast notification, then deletes log files older than the
-configured retention window (`main.py cleanup-logs`). Intended to be invoked by Windows
-Task Scheduler once per day, after the market close plus the configured provider delay
+shows it as a Windows toast notification, then deletes log files and unreferenced
+report artifacts (old digest/data-health/screener files; never analysis/backtest
+reports tied to a saved run) older than the configured retention window
+(`main.py cleanup-logs --include-reports`). Intended to be invoked by Windows Task
+Scheduler once per day, after the market close plus the configured provider delay
 (see market_data.provider_delay_minutes in config/settings.yaml).
 
 The toast notification requires an interactive logon session, which is why this
@@ -58,7 +60,7 @@ if (Test-Path $summaryPath) {
     Add-Content -Path $logFile -Value "Toast notification skipped: summary file not found at $summaryPath"
 }
 
-cmd.exe /c "`"$pythonExe`" main.py cleanup-logs >> `"$logFile`" 2>&1"
+cmd.exe /c "`"$pythonExe`" main.py cleanup-logs --include-reports >> `"$logFile`" 2>&1"
 $cleanupExit = $LASTEXITCODE
 
 Add-Content -Path $logFile -Value "=== Stock Scrapper daily run finished $(Get-Date -Format o): run=$runExit digest=$digestExit cleanup=$cleanupExit ==="
