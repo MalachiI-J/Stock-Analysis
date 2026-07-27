@@ -312,6 +312,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     predict = subparsers.add_parser("predict", help="EXPERIMENTAL statistical forward-return prediction (not score_v1)")
     predict.add_argument("--symbols", nargs="+", help="Optional symbol list")
+    predict.add_argument(
+        "--horizon-days", type=int,
+        help="Override config/prediction_rules.yaml's horizon_days, e.g. to compare horizons",
+    )
     _add_as_of_argument(predict)
     return parser
 
@@ -1071,6 +1075,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
             prediction_rules = load_prediction_rules(base_dir)
+            if args.horizon_days is not None:
+                if args.horizon_days <= 0:
+                    parser.error("--horizon-days must be positive")
+                prediction_rules = dict(prediction_rules, horizon_days=args.horizon_days)
             scoring_rules = load_scoring_rules(base_dir)
             roles = load_universes(config)
             benchmark = roles["benchmark"]

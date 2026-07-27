@@ -1094,3 +1094,36 @@ def test_predict_command_reports_coefficients_and_ranked_predictions(
     assert lines.index(aapl_line) < lines.index(msft_line) < lines.index(zzzz_line)
     assert "71.0%" in aapl_line
     assert "unavailable" in zzzz_line
+
+
+def test_predict_command_horizon_days_override_replaces_config_value(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from stock_scrapper.prediction.service import PredictionRunResult
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    captured_rules: dict[str, Any] = {}
+
+    def _fake_run_prediction(*_args: Any, **kwargs: Any) -> PredictionRunResult:
+        captured_rules.update(kwargs["rules"])
+        return PredictionRunResult(
+            status="insufficient_data", message="x", as_of_date="2026-01-01",
+            horizon_days=kwargs["rules"]["horizon_days"],
+        )
+
+    monkeypatch.setattr(cli, "run_prediction", _fake_run_prediction)
+
+    cli.main(["predict", "--symbols", "AAPL", "--horizon-days", "5"])
+
+    assert captured_rules["horizon_days"] == 5
+
+
+def test_predict_command_rejects_nonpositive_horizon_days(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_predict_startup(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["predict", "--symbols", "AAPL", "--horizon-days", "0"])
+    assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)
