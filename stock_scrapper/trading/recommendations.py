@@ -199,7 +199,7 @@ def render_recommendations_text(result: RecommendationRunResult) -> str:
     if buys:
         for rec in buys:
             probability_text = (
-                "" if rec.model_probability is None else f" | model: {rec.model_probability:.0%} positive"
+                "" if rec.model_probability is None else f" | model: {rec.model_probability:.0%} beats benchmark"
             )
             lines.append(
                 f"  {rec.symbol:<6} {rec.shares:g} sh (~${rec.estimated_dollars:,.2f}) — {rec.reason}{probability_text}"

@@ -239,7 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_logs.add_argument("--days", type=int, help="Override config logs_retention_days")
     cleanup_logs.add_argument(
         "--include-reports", action="store_true",
-        help="Also delete digest/data-health/screener report files not tied to any saved analysis or backtest run",
+        help="Also delete digest/recommendations/data-health/screener report files not tied to any saved analysis or backtest run",
     )
 
     analysis_list=subparsers.add_parser("analysis-list", help="List saved analysis runs")
@@ -695,6 +695,8 @@ def _finite(value: Any) -> float | None:
 _UNREFERENCED_REPORT_PATTERNS: tuple[str, ...] = (
     "digest_*.txt",
     "digest_*.summary.json",
+    "recommendations_*.txt",
+    "recommendations_*.summary.json",
     "data_health_*.json",
     "data_health_*.html",
     "stock_summary_*_screen-*.csv",
@@ -1062,7 +1064,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "predict":
             print(
                 "EXPERIMENTAL STATISTICAL FORECAST — not part of score_v1, not a trading signal. "
-                "Read the holdout accuracy/Brier score below before trusting any probability.",
+                "Predicts whether a symbol beats the benchmark's own return over the horizon (not "
+                "merely whether its price rises), since raw direction is mostly market drift in a "
+                "trending regime. Read the holdout accuracy/Brier score below before trusting any probability.",
                 file=sys.stderr,
             )
             effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
@@ -1079,7 +1083,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 service = AnalysisService(conn, scoring_rules, roles["candidates"])
                 result = run_prediction(
                     service, symbols, histories, trading_dates,
-                    as_of_date=effective.isoformat(), rules=prediction_rules,
+                    as_of_date=effective.isoformat(), rules=prediction_rules, benchmark_symbol=benchmark,
                 )
             finally:
                 conn.close()
@@ -1121,7 +1125,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "  Near-zero influence, consider pruning from feature_keys: "
                     + ", ".join(weak_features)
                 )
-            print("Symbol predictions (probability of a positive forward return over the horizon):")
+            print(f"Symbol predictions (probability of beating {benchmark}'s own return over the horizon):")
             ranked = sorted(
                 result.predictions,
                 key=lambda item: item.probability_positive if item.probability_positive is not None else -1.0,
@@ -1331,7 +1335,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         service = AnalysisService(conn, scoring_rules, roles["candidates"])
                         prediction = run_prediction(
                             service, symbols, histories, trading_dates,
-                            as_of_date=effective.isoformat(), rules=prediction_rules,
+                            as_of_date=effective.isoformat(), rules=prediction_rules, benchmark_symbol=benchmark,
                         )
                         if prediction.status == "ok":
                             model_probability_by_symbol = {
@@ -1816,8 +1820,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 print(
                     f"Deleted {deleted_reports} unreferenced report file(s) older than {retention_days} day(s) "
-                    f"from {reports_dir} (digest/data-health/screener outputs only; analysis and backtest "
-                    "reports tied to saved runs are never touched)"
+                    f"from {reports_dir} (digest/recommendations/data-health/screener outputs only; analysis "
+                    "and backtest reports tied to saved runs are never touched)"
                 )
             return int(ExitCode.SUCCESS)
         parser.error("Unsupported command")

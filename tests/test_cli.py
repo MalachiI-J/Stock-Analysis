@@ -672,6 +672,8 @@ def test_cleanup_logs_include_reports_deletes_only_unreferenced_patterns(
     unreferenced_old = [
         reports_dir / "digest_2024-01-01.txt",
         reports_dir / "digest_2024-01-01.summary.json",
+        reports_dir / "recommendations_2024-01-01.txt",
+        reports_dir / "recommendations_2024-01-01.summary.json",
         reports_dir / "data_health_2024-01-01.json",
         reports_dir / "data_health_2024-01-01.html",
         reports_dir / "stock_summary_2024-01-01_screen-abc12345.csv",
@@ -702,7 +704,7 @@ def test_cleanup_logs_include_reports_deletes_only_unreferenced_patterns(
         assert path.exists(), f"{path} must never be deleted"
     assert recent_digest.exists()
     captured = capsys.readouterr()
-    assert "Deleted 6 unreferenced report file(s)" in captured.out
+    assert "Deleted 8 unreferenced report file(s)" in captured.out
 
 
 def test_cleanup_logs_without_include_reports_leaves_reports_alone(

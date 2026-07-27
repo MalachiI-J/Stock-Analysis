@@ -230,7 +230,7 @@ def test_render_recommendations_text_includes_buys_sells_and_disclaimer() -> Non
     text = render_recommendations_text(result)
 
     assert "TRADE RECOMMENDATIONS" in text
-    assert "BUY — 1" in text and "NVDA" in text and "model: 60% positive" in text
+    assert "BUY — 1" in text and "NVDA" in text and "model: 60% beats benchmark" in text
     assert "SELL — 0" in text and "None" in text
     assert "not investment advice" in text.lower()
 

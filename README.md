@@ -12,8 +12,9 @@ new ones: SELL recommendations reuse `evaluate_holding()` from
 `stock_scrapper/portfolio.py` (the exact rules a backtest would have exited
 on), and BUY candidates are score_v1's own `Strong Candidate`/`Candidate`
 classifications. The experimental `predict` model's probability is attached
-to each BUY as displayed context only ("model: 57% positive") — never as a
-gate — since its accuracy doesn't yet warrant driving a real trade decision.
+to each BUY as displayed context only ("model: 45% beats benchmark") — never
+as a gate — since its accuracy doesn't yet warrant driving a real trade
+decision.
 
 Position sizing follows the same weight-based approach as the backtester's
 `BacktestConfig` (`max_position_weight`, `cash_reserve`), configured in
@@ -24,7 +25,10 @@ Position sizing follows the same weight-based approach as the backtester's
 capital minus every dollar ever committed to a lot, plus every dollar a sale
 ever returned — no new database table was needed. `recommend` writes
 `reports/recommendations_<date>.txt` plus a `.summary.json`, following the
-same pattern as `digest`.
+same pattern as `digest`, and now runs as part of the daily automation loop
+alongside it (see Daily automation below) — the toast notification includes
+a buy/sell count with an explicit "advisory, unproven model" label so it's
+never mistaken for a stronger signal than it is.
 
 `trading_rules.yaml` also carries an `auto_execute` flag for a possible
 future Part 3 (the program placing orders itself, opted into explicitly,
@@ -57,18 +61,25 @@ which conflicts with this project's documented credential-free design
 `predict` is an experimental statistical layer, fully separate from
 `score_v1`: a small hand-rolled (not scikit-learn, to stay dependency-light
 and fully transparent) logistic regression predicting the probability that a
-symbol's adjusted close will be higher after `horizon_days` trading sessions,
-using existing stored technical indicators plus two derived features
+symbol beats the benchmark's own return after `horizon_days` trading sessions
+— not merely whether its own price rises. Raw direction is dominated by broad
+market drift (in a sustained Risk-On stretch most stocks rise most of the time
+regardless of anything stock-specific), so a model trained on raw direction
+mostly just relearns "is the market going up," which it has no way to predict
+better than chance; excess return over the benchmark isolates the
+stock-picking signal the rest of this project is actually about. Features are
+existing stored technical indicators plus two derived ones
 (`market_regime_code`, that day's regime encoded as an ordinal, and
 `opportunity_score_percentile`, the symbol's cross-sectional rank against the
 rest of that day's analyzed universe). It is retrained from scratch on every
 call — nothing is persisted — from historical (symbol, as-of-date) rows
-sampled from stored price history, each paired with its own realized forward
-return. A sample date only enters training if its forward return is fully
-computable from history already bounded at or before the requested as-of date
-(see `stock_scrapper/prediction/dataset.py`), so nothing about the future is
-ever visible during training, matching the no-lookahead guarantee the rest of
-the project depends on.
+sampled from stored price history, each paired with its own realized excess
+return. A sample date only enters training if both the symbol's and the
+benchmark's forward returns are fully computable from history already bounded
+at or before the requested as-of date (see
+`stock_scrapper/prediction/dataset.py`), so nothing about the future is ever
+visible during training, matching the no-lookahead guarantee the rest of the
+project depends on.
 
 Performance is estimated via expanding-window walk-forward cross-validation
 (fit on everything before a chronological cut, test on the chunk right after
@@ -251,11 +262,15 @@ No API key or paid account is required. Runtime settings come from YAML; see [Co
 ## Daily automation
 
 `scripts/run_daily.ps1` runs `python main.py run` (collect → validate →
-analyze → report) followed by `python main.py digest`, logging combined
-output to `logs/daily_run_<timestamp>.log`. It uses `cmd.exe` for output
-redirection rather than PowerShell's native `2>&1`/`*>>`, which otherwise
-wraps every stderr line from a Python process (the app logger writes `INFO`
-to stderr) in a spurious `NativeCommandError` and can emit UTF-16 log files.
+analyze → report), `python main.py digest`, and `python main.py recommend`,
+in that order, logging combined output to `logs/daily_run_<timestamp>.log`.
+The Windows toast notification combines the digest and recommendation
+summaries into one message, with the recommendation line explicitly marked
+"advisory, unproven model" so it never reads as a stronger signal than it
+is. It uses `cmd.exe` for output redirection rather than PowerShell's native
+`2>&1`/`*>>`, which otherwise wraps every stderr line from a Python process
+(the app logger writes `INFO` to stderr) in a spurious `NativeCommandError`
+and can emit UTF-16 log files.
 
 A Windows Task Scheduler task (`\StockScrapper\DailyRun`) runs this script
 Monday–Friday. Inspect or change it with:

@@ -85,10 +85,16 @@ def test_select_sample_dates_returns_empty_when_history_too_short() -> None:
     assert sampled == []
 
 
-def test_build_training_dataset_labels_match_forward_return_sign() -> None:
+def _flat_history(symbol: str, trading_dates: list[str], price: float = 200.0) -> dict[str, list[dict[str, Any]]]:
+    """A constant-price benchmark series, so beating it is equivalent to a positive raw return."""
+    return {symbol: [{"trade_date": d, "adjusted_close": price} for d in trading_dates]}
+
+
+def test_build_training_dataset_labels_match_excess_return_over_benchmark() -> None:
     trading_dates = _dates("2024-01-01", 20)
-    prices = [100.0 + index for index in range(20)]  # steadily rising -> always positive forward return
+    prices = [100.0 + index for index in range(20)]  # steadily rising -> always beats a flat benchmark
     history = {"AAA": [{"trade_date": d, "adjusted_close": p} for d, p in zip(trading_dates, prices)]}
+    history.update(_flat_history("SPY", trading_dates))
     results_by_date = {
         d: {"AAA": _result("AAA", d, rsi=50.0 + index)} for index, d in enumerate(trading_dates)
     }
@@ -96,11 +102,12 @@ def test_build_training_dataset_labels_match_forward_return_sign() -> None:
     sample_dates = [date.fromisoformat(d) for d in trading_dates[:10]]
 
     features, labels, meta = build_training_dataset(
-        service, ["AAA"], history, sample_dates, horizon_days=5, feature_keys=["rsi_14"]
+        service, ["AAA"], history, sample_dates,
+        horizon_days=5, feature_keys=["rsi_14"], benchmark_symbol="SPY",
     )
 
     assert features.shape[0] == 10
-    assert (labels == 1.0).all()  # prices always rise -> always a positive forward return
+    assert (labels == 1.0).all()  # rising price vs a flat benchmark -> always beats it
     assert [row["symbol"] for row in meta] == ["AAA"] * 10
 
 
@@ -108,6 +115,7 @@ def test_build_training_dataset_drops_rows_missing_features_or_ineligible() -> N
     trading_dates = _dates("2024-01-01", 10)
     prices = [100.0] * 10
     history = {"AAA": [{"trade_date": d, "adjusted_close": p} for d, p in zip(trading_dates, prices)]}
+    history.update(_flat_history("SPY", trading_dates))
     results_by_date = {
         trading_dates[0]: {"AAA": _result("AAA", trading_dates[0], eligible=False)},
         trading_dates[1]: {"AAA": _result("AAA", trading_dates[1], rsi=None)},
@@ -117,7 +125,8 @@ def test_build_training_dataset_drops_rows_missing_features_or_ineligible() -> N
     sample_dates = [date.fromisoformat(trading_dates[index]) for index in range(3)]
 
     features, labels, meta = build_training_dataset(
-        service, ["AAA"], history, sample_dates, horizon_days=5, feature_keys=["rsi_14"]
+        service, ["AAA"], history, sample_dates,
+        horizon_days=5, feature_keys=["rsi_14"], benchmark_symbol="SPY",
     )
 
     assert features.shape[0] == 1
@@ -128,6 +137,7 @@ def test_build_training_dataset_excludes_dates_without_enough_forward_history() 
     trading_dates = _dates("2024-01-01", 8)
     prices = [100.0 + index for index in range(8)]
     history = {"AAA": [{"trade_date": d, "adjusted_close": p} for d, p in zip(trading_dates, prices)]}
+    history.update(_flat_history("SPY", trading_dates))
     # Request a sample date only 2 sessions from the end of the stored history, with horizon=5:
     # index 6 + horizon 5 = 11 >= len(history)=8, so this date must be excluded even though a
     # caller passed it in directly (defense in depth beyond select_sample_dates' own embargo).
@@ -135,7 +145,25 @@ def test_build_training_dataset_excludes_dates_without_enough_forward_history() 
     service = _FakeService(results_by_date)
 
     features, labels, meta = build_training_dataset(
-        service, ["AAA"], history, [date.fromisoformat(trading_dates[6])], horizon_days=5, feature_keys=["rsi_14"]
+        service, ["AAA"], history, [date.fromisoformat(trading_dates[6])],
+        horizon_days=5, feature_keys=["rsi_14"], benchmark_symbol="SPY",
+    )
+
+    assert features.shape[0] == 0
+    assert meta == []
+
+
+def test_build_training_dataset_drops_rows_missing_benchmark_price() -> None:
+    trading_dates = _dates("2024-01-01", 10)
+    prices = [100.0 + index for index in range(10)]
+    history = {"AAA": [{"trade_date": d, "adjusted_close": p} for d, p in zip(trading_dates, prices)]}
+    # No "SPY" entry at all -> every row lacks a benchmark price and must be dropped.
+    results_by_date = {trading_dates[0]: {"AAA": _result("AAA", trading_dates[0])}}
+    service = _FakeService(results_by_date)
+
+    features, labels, meta = build_training_dataset(
+        service, ["AAA"], history, [date.fromisoformat(trading_dates[0])],
+        horizon_days=5, feature_keys=["rsi_14"], benchmark_symbol="SPY",
     )
 
     assert features.shape[0] == 0
@@ -174,6 +202,7 @@ def test_build_training_dataset_drops_rows_with_unmapped_market_regime() -> None
     trading_dates = _dates("2024-01-01", 10)
     prices = [100.0] * 10
     history = {"AAA": [{"trade_date": d, "adjusted_close": p} for d, p in zip(trading_dates, prices)]}
+    history.update(_flat_history("SPY", trading_dates))
     results_by_date = {
         trading_dates[0]: {"AAA": _result("AAA", trading_dates[0], market_regime="Insufficient Market Data")},
         trading_dates[1]: {"AAA": _result("AAA", trading_dates[1], market_regime="Risk-On")},
@@ -183,7 +212,7 @@ def test_build_training_dataset_drops_rows_with_unmapped_market_regime() -> None
 
     features, labels, meta = build_training_dataset(
         service, ["AAA"], history, sample_dates,
-        horizon_days=5, feature_keys=["rsi_14", "market_regime_code"],
+        horizon_days=5, feature_keys=["rsi_14", "market_regime_code"], benchmark_symbol="SPY",
     )
 
     assert features.shape[0] == 1

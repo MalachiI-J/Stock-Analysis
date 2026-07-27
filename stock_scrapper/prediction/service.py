@@ -1,9 +1,13 @@
-"""Orchestrate the experimental forward-return prediction: train, evaluate, predict.
+"""Orchestrate the experimental excess-return-vs-benchmark prediction: train, evaluate, predict.
 
-Everything here is fit fresh from the caller-supplied, as-of-date-bounded
-histories every time it runs — nothing is persisted or reused across calls.
-Given the same stored price history and the same config, the result is
-exactly reproducible (no randomness anywhere in the pipeline).
+The model predicts whether a symbol will beat the benchmark's own return over
+the horizon, not merely whether its price rises — see
+stock_scrapper/prediction/dataset.py for why raw direction is mostly just
+market drift in disguise. Everything here is fit fresh from the
+caller-supplied, as-of-date-bounded histories every time it runs — nothing is
+persisted or reused across calls. Given the same stored price history and the
+same config, the result is exactly reproducible (no randomness anywhere in
+the pipeline).
 
 Performance is estimated via expanding-window walk-forward cross-validation
 (fit on everything before a chronological cut, test on the chunk right after
@@ -42,7 +46,7 @@ def _finite(value: Any) -> float | None:
 
 @dataclass(slots=True)
 class SymbolPrediction:
-    """One symbol's predicted probability of a positive forward return, or why it has none."""
+    """One symbol's predicted probability of beating the benchmark, or why it has none."""
 
     symbol: str
     probability_positive: float | None
@@ -143,6 +147,7 @@ def run_prediction(
     *,
     as_of_date: str,
     rules: Mapping[str, Any],
+    benchmark_symbol: str,
 ) -> PredictionRunResult:
     """Walk-forward evaluate, then fit a final model on all embargoed history, and predict today."""
     horizon_days = int(rules["horizon_days"])
@@ -164,7 +169,7 @@ def run_prediction(
     feature_keys = list(rules["feature_keys"])
     features, labels, meta = build_training_dataset(
         service, target_symbols, histories, sample_dates,
-        horizon_days=horizon_days, feature_keys=feature_keys,
+        horizon_days=horizon_days, feature_keys=feature_keys, benchmark_symbol=benchmark_symbol,
     )
     minimum_samples = int(rules["minimum_training_samples"])
     if features.shape[0] < minimum_samples:

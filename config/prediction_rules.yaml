@@ -1,4 +1,4 @@
-prediction_version: "predict-v2"
+prediction_version: "predict-v3"
 horizon_days: 21
 lookback_years: 3
 sample_stride_sessions: 5
