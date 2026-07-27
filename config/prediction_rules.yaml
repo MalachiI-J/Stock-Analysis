@@ -1,8 +1,8 @@
-prediction_version: "predict-v1"
+prediction_version: "predict-v2"
 horizon_days: 21
 lookback_years: 3
 sample_stride_sessions: 5
-train_fraction: 0.8
+walk_forward_folds: 5
 l2_lambda: 0.01
 learning_rate: 0.3
 iterations: 500
@@ -24,3 +24,5 @@ feature_keys:
   - correlation
   - atr_percentage
   - volume_relative_to_average
+  - market_regime_code
+  - opportunity_score_percentile

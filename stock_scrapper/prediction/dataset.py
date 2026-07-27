@@ -32,6 +32,51 @@ def _finite(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+# Ordinal encoding of the market regime, from most to least favorable. Mirrors the
+# direction (though not the exact scale) of the regime's own risk-score mapping in
+# stock_scrapper/analysis/risk_score.py, so higher always means "more bullish."
+_REGIME_CODES: dict[str, float] = {
+    "Risk-On": 1.0,
+    "Neutral": 0.0,
+    "Risk-Off": -1.0,
+    "Stress": -2.0,
+}
+
+# Feature keys computed here rather than read from result.indicators, because they
+# depend on either a top-level AnalysisResult field (market_regime) or on the whole
+# day's batch of results (a cross-sectional rank), not on one symbol in isolation.
+DERIVED_FEATURE_KEYS = frozenset({"market_regime_code", "opportunity_score_percentile"})
+
+
+def opportunity_percentiles(results: Sequence[Any]) -> dict[str, float]:
+    """Rank each result's opportunity_score against the rest of that same day's batch.
+
+    Returns a 0..1 percentile per symbol (1.0 = highest opportunity score that day).
+    Ties and single-symbol batches fall back to the midpoint (0.5) rather than an
+    arbitrary ordering, since ambiguous ranks aren't meaningful signal.
+    """
+    scored = [
+        (result.symbol, score)
+        for result in results
+        for score in (_finite(getattr(result, "opportunity_score", None)),)
+        if score is not None
+    ]
+    if len(scored) < 2:
+        return {symbol: 0.5 for symbol, _ in scored}
+    ordered = sorted(scored, key=lambda item: (item[1], item[0]))
+    denominator = len(ordered) - 1
+    return {symbol: index / denominator for index, (symbol, _) in enumerate(ordered)}
+
+
+def feature_value(result: Any, key: str, percentiles: Mapping[str, float]) -> float | None:
+    """Resolve one feature's value for a result, whether indicator-based or derived."""
+    if key == "market_regime_code":
+        return _REGIME_CODES.get(getattr(result, "market_regime", None))
+    if key == "opportunity_score_percentile":
+        return percentiles.get(result.symbol)
+    return _finite(result.indicators.get(key))
+
+
 def select_sample_dates(
     trading_dates: Sequence[str],
     *,
@@ -78,6 +123,7 @@ def build_training_dataset(
     meta: list[dict[str, str]] = []
     for sample_date in sample_dates:
         batch = service.analyze_loaded_many_as_of(list(symbols), histories, sample_date, persist=False)
+        percentiles = opportunity_percentiles(batch.results)
         for result in batch.results:
             if not result.eligible_for_scoring:
                 continue
@@ -90,7 +136,7 @@ def build_training_dataset(
             future_close = _finite(symbol_history[index + horizon_days].get("adjusted_close"))
             if entry_close is None or future_close is None or entry_close <= 0:
                 continue
-            values = [_finite(result.indicators.get(key)) for key in feature_keys]
+            values = [feature_value(result, key, percentiles) for key in feature_keys]
             if any(value is None for value in values):
                 continue
             feature_rows.append(values)  # type: ignore[arg-type]

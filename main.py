@@ -74,6 +74,8 @@ from stock_scrapper.portfolio import (
 from stock_scrapper.prediction.config import validate_prediction_config
 from stock_scrapper.prediction.service import run_prediction
 from stock_scrapper.processing.validation import validate_price_records
+from stock_scrapper.trading.config import validate_trading_rules
+from stock_scrapper.trading.recommendations import build_recommendations, render_recommendations_text
 from stock_scrapper.reporting.report_builder import write_phase2_reports
 from stock_scrapper.reporting.persistence import persist_report, report_identity
 from stock_scrapper.reporting.digest import (
@@ -114,6 +116,21 @@ def load_prediction_rules(base_dir: Path) -> dict[str, Any]:
         if not isinstance(rules, dict):
             raise ValueError("prediction_rules.yaml must contain a mapping")
         return validate_prediction_config(rules)
+    except (OSError, yaml.YAMLError, ValueError) as exc:
+        raise InvalidConfigurationError(str(exc)) from exc
+
+
+def load_trading_rules(base_dir: Path) -> dict[str, Any]:
+    """Load and strictly validate the Phase 6 trade-recommendation sizing/restriction rules."""
+    rules_path = base_dir / "config" / "trading_rules.yaml"
+    if not rules_path.exists():
+        raise InvalidConfigurationError(f"Trading rules configuration is missing: {rules_path}")
+    try:
+        with rules_path.open("r", encoding="utf-8") as handle:
+            rules = yaml.safe_load(handle)
+        if not isinstance(rules, dict):
+            raise ValueError("trading_rules.yaml must contain a mapping")
+        return validate_trading_rules(rules)
     except (OSError, yaml.YAMLError, ValueError) as exc:
         raise InvalidConfigurationError(str(exc)) from exc
 
@@ -181,6 +198,19 @@ def build_parser() -> argparse.ArgumentParser:
     digest_parser.add_argument("--scope", choices=("candidate_universe", "all_data_symbols", "custom"))
     digest_parser.add_argument("--no-save", action="store_true", help="Print only; do not write a digest file to reports_dir")
     _add_as_of_argument(digest_parser)
+
+    recommend_parser = subparsers.add_parser(
+        "recommend", help="Sized buy/sell trade recommendations from today's scores and real holdings (advisory only)"
+    )
+    recommend_parser.add_argument("--symbols", nargs="+", help="Optional saved symbols")
+    recommend_source = recommend_parser.add_mutually_exclusive_group()
+    recommend_source.add_argument("--run-id", help="Read one exact saved run")
+    recommend_source.add_argument("--recalculate", action="store_true")
+    recommend_source.add_argument("--latest-any", action="store_true")
+    recommend_parser.add_argument("--scope", choices=("candidate_universe", "all_data_symbols", "custom"))
+    recommend_parser.add_argument("--no-save", action="store_true", help="Print only; do not write a report file to reports_dir")
+    recommend_parser.add_argument("--no-model", action="store_true", help="Skip the experimental prediction model's confidence context")
+    _add_as_of_argument(recommend_parser)
 
     portfolio_buy = subparsers.add_parser("portfolio-buy", help="Record a real buy as a new open lot")
     portfolio_buy.add_argument("--symbol", required=True)
@@ -1059,14 +1089,38 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Prediction as of {result.as_of_date} | horizon={result.horizon_days} session(s) | model={prediction_rules['prediction_version']}")
             print(
                 f"Trained on {result.training_samples} sample(s) ({result.training_start_date} to "
-                f"{result.training_end_date}), evaluated on {result.holdout_samples} held-out sample(s)"
+                f"{result.training_end_date})"
             )
+            if result.message:
+                print(f"Note: {result.message}", file=sys.stderr)
+            base_rate_text = "n/a" if result.positive_label_rate is None else f"{result.positive_label_rate:.1%}"
             accuracy_text = "n/a" if result.holdout_accuracy is None else f"{result.holdout_accuracy:.1%}"
             brier_text = "n/a" if result.holdout_brier_score is None else f"{result.holdout_brier_score:.4f}"
-            print(f"Holdout accuracy: {accuracy_text}  |  Holdout Brier score (lower is better, 0.25 = coin flip): {brier_text}")
+            print(
+                f"Walk-forward holdout accuracy: {accuracy_text} (base rate {base_rate_text} — "
+                f"compare the two, since a lopsided base rate alone can inflate accuracy) over "
+                f"{result.holdout_samples} held-out sample(s) across {len(result.walk_forward_folds)} fold(s)"
+            )
+            print(f"Holdout Brier score (lower is better, 0.25 = coin flip): {brier_text}")
+            for fold in result.walk_forward_folds:
+                fold_accuracy = "n/a" if fold.accuracy is None else f"{fold.accuracy:.1%}"
+                fold_brier = "n/a" if fold.brier_score is None else f"{fold.brier_score:.4f}"
+                print(
+                    f"  fold {fold.fold}: trained on {fold.training_samples}, tested on "
+                    f"{fold.test_samples} -> accuracy {fold_accuracy}, brier {fold_brier}"
+                )
             print("Model coefficients (standardized; positive pushes probability up):")
+            weak_features: list[str] = []
             for name, weight in result.coefficients[:10]:
                 print(f"  {name:<32} {weight:+.4f}")
+            for name, weight in result.coefficients:
+                if abs(weight) < 0.01:
+                    weak_features.append(name)
+            if weak_features:
+                print(
+                    "  Near-zero influence, consider pruning from feature_keys: "
+                    + ", ".join(weak_features)
+                )
             print("Symbol predictions (probability of a positive forward return over the horizon):")
             ranked = sorted(
                 result.predictions,
@@ -1228,6 +1282,107 @@ def main(argv: Sequence[str] | None = None) -> int:
                 summary_target.write_text(
                     json.dumps(build_notification_summary(payload), indent=2, sort_keys=True), encoding="utf-8"
                 )
+                print(f"Summary: {summary_target}")
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "recommend":
+            explicit = bool(getattr(args, "symbols", None))
+            if args.recalculate:
+                effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
+                batch = _analysis_batch(config, base_dir, symbols, effective, persist=True, universe=universe)
+                results = batch.results
+                as_of_text = str(batch.as_of_date)[:10]
+            else:
+                saved, results = _load_saved_results(
+                    config, args.run_id, symbols if explicit else None,
+                    latest_any=args.latest_any, scope=args.scope,
+                )
+                as_of_text = str(saved.get("as_of_date"))[:10]
+            effective = _parse_date(as_of_text, field="as-of date")
+            trading_rules = load_trading_rules(base_dir)
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                results_by_symbol = {result.symbol: result for result in results}
+                lots = list_portfolio_lots(conn)
+                sales = list_portfolio_sales(conn)
+                positions = aggregate_open_lots(list_portfolio_lots(conn, status="open"))
+                holdings = _assess_open_holdings(conn, base_dir, effective, results_by_symbol)
+
+                latest_price_by_symbol: dict[str, float] = {}
+                for candidate_symbol in set(results_by_symbol) | {position.symbol for position in positions}:
+                    history = fetch_price_history(conn, candidate_symbol, end_date=effective)
+                    price = _finite(history[-1].get("adjusted_close")) if history else None
+                    if price is not None:
+                        latest_price_by_symbol[candidate_symbol] = price
+
+                model_probability_by_symbol: dict[str, float] = {}
+                if not args.no_model:
+                    try:
+                        prediction_rules = load_prediction_rules(base_dir)
+                        roles = load_universes(config)
+                        benchmark = roles["benchmark"]
+                        load_symbols = sorted(
+                            set(symbols) | {benchmark} | set(roles["market_context"]) | set(roles["defensive_context"])
+                        )
+                        histories = {sym: fetch_price_history(conn, sym, end_date=effective) for sym in load_symbols}
+                        trading_dates = [str(row["trade_date"])[:10] for row in histories.get(benchmark, [])]
+                        scoring_rules = load_scoring_rules(base_dir)
+                        service = AnalysisService(conn, scoring_rules, roles["candidates"])
+                        prediction = run_prediction(
+                            service, symbols, histories, trading_dates,
+                            as_of_date=effective.isoformat(), rules=prediction_rules,
+                        )
+                        if prediction.status == "ok":
+                            model_probability_by_symbol = {
+                                item.symbol: item.probability_positive
+                                for item in prediction.predictions
+                                if item.probability_positive is not None
+                            }
+                    except Exception:
+                        # The experimental model is context only; never let it block a recommendation run.
+                        model_probability_by_symbol = {}
+            finally:
+                conn.close()
+
+            outcome = build_recommendations(
+                as_of_date=as_of_text,
+                results_by_symbol=results_by_symbol,
+                holdings=holdings,
+                positions=positions,
+                lots=lots,
+                sales=sales,
+                latest_price_by_symbol=latest_price_by_symbol,
+                rules=trading_rules,
+                model_probability_by_symbol=model_probability_by_symbol,
+            )
+            text = render_recommendations_text(outcome)
+            print(text)
+            if not args.no_save:
+                target = Path(config["reports_dir"]) / f"recommendations_{as_of_text}.txt"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+                print(f"Recommendations: {target}")
+                summary_target = Path(config["reports_dir"]) / f"recommendations_{as_of_text}.summary.json"
+                summary_payload = {
+                    "as_of_date": outcome.as_of_date,
+                    "account_value": outcome.account_value,
+                    "available_cash": outcome.available_cash,
+                    "open_position_count": outcome.open_position_count,
+                    "recommendations": [
+                        {
+                            "symbol": rec.symbol,
+                            "action": rec.action,
+                            "shares": rec.shares,
+                            "estimated_dollars": rec.estimated_dollars,
+                            "reason": rec.reason,
+                            "model_probability": rec.model_probability,
+                        }
+                        for rec in outcome.recommendations
+                    ],
+                    "skipped": outcome.skipped,
+                }
+                summary_target.write_text(json.dumps(summary_payload, indent=2, sort_keys=True), encoding="utf-8")
                 print(f"Summary: {summary_target}")
             return int(ExitCode.SUCCESS)
 

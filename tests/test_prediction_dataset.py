@@ -5,7 +5,12 @@ from datetime import date, timedelta
 from typing import Any
 
 from stock_scrapper.models.analysis_models import AnalysisResult
-from stock_scrapper.prediction.dataset import build_training_dataset, select_sample_dates
+from stock_scrapper.prediction.dataset import (
+    build_training_dataset,
+    feature_value,
+    opportunity_percentiles,
+    select_sample_dates,
+)
 
 
 def _dates(start: str, count: int) -> list[str]:
@@ -34,11 +39,21 @@ class _FakeService:
         return type("Batch", (), {"results": results})()
 
 
-def _result(symbol: str, as_of: str, *, eligible: bool = True, rsi: float | None = 50.0) -> AnalysisResult:
+def _result(
+    symbol: str,
+    as_of: str,
+    *,
+    eligible: bool = True,
+    rsi: float | None = 50.0,
+    market_regime: str = "Insufficient Market Data",
+    opportunity_score: float | None = None,
+) -> AnalysisResult:
     return AnalysisResult(
         symbol=symbol,
         as_of_date=as_of,
         eligible_for_scoring=eligible,
+        market_regime=market_regime,
+        opportunity_score=opportunity_score,
         indicators={"rsi_14": rsi} if rsi is not None else {},
     )
 
@@ -125,3 +140,51 @@ def test_build_training_dataset_excludes_dates_without_enough_forward_history() 
 
     assert features.shape[0] == 0
     assert meta == []
+
+
+def test_opportunity_percentiles_ranks_by_score_with_symbol_tiebreak() -> None:
+    results = [
+        _result("AAA", "2024-01-01", opportunity_score=70.0),
+        _result("BBB", "2024-01-01", opportunity_score=90.0),
+        _result("CCC", "2024-01-01", opportunity_score=50.0),
+    ]
+    percentiles = opportunity_percentiles(results)
+    assert percentiles == {"CCC": 0.0, "AAA": 0.5, "BBB": 1.0}
+
+
+def test_opportunity_percentiles_falls_back_to_midpoint_for_ambiguous_ranks() -> None:
+    assert opportunity_percentiles([_result("AAA", "2024-01-01", opportunity_score=70.0)]) == {"AAA": 0.5}
+    assert opportunity_percentiles([_result("AAA", "2024-01-01", opportunity_score=None)]) == {}
+
+
+def test_feature_value_resolves_derived_and_indicator_features() -> None:
+    result = _result("AAA", "2024-01-01", rsi=42.0, market_regime="Risk-On", opportunity_score=80.0)
+    percentiles = {"AAA": 0.75}
+    assert feature_value(result, "rsi_14", percentiles) == 42.0
+    assert feature_value(result, "market_regime_code", percentiles) == 1.0
+    assert feature_value(result, "opportunity_score_percentile", percentiles) == 0.75
+
+
+def test_feature_value_returns_none_for_unmapped_regime() -> None:
+    result = _result("AAA", "2024-01-01", market_regime="Insufficient Market Data")
+    assert feature_value(result, "market_regime_code", {}) is None
+
+
+def test_build_training_dataset_drops_rows_with_unmapped_market_regime() -> None:
+    trading_dates = _dates("2024-01-01", 10)
+    prices = [100.0] * 10
+    history = {"AAA": [{"trade_date": d, "adjusted_close": p} for d, p in zip(trading_dates, prices)]}
+    results_by_date = {
+        trading_dates[0]: {"AAA": _result("AAA", trading_dates[0], market_regime="Insufficient Market Data")},
+        trading_dates[1]: {"AAA": _result("AAA", trading_dates[1], market_regime="Risk-On")},
+    }
+    service = _FakeService(results_by_date)
+    sample_dates = [date.fromisoformat(trading_dates[index]) for index in range(2)]
+
+    features, labels, meta = build_training_dataset(
+        service, ["AAA"], history, sample_dates,
+        horizon_days=5, feature_keys=["rsi_14", "market_regime_code"],
+    )
+
+    assert features.shape[0] == 1
+    assert meta == [{"symbol": "AAA", "date": trading_dates[1]}]

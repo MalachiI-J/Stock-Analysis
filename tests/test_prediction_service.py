@@ -39,7 +39,7 @@ _RULES = {
     "horizon_days": 3,
     "lookback_years": 10.0,
     "sample_stride_sessions": 1,
-    "train_fraction": 0.6,
+    "walk_forward_folds": 2,
     "l2_lambda": 0.01,
     "learning_rate": 0.3,
     "iterations": 50,
@@ -99,7 +99,12 @@ def test_run_prediction_succeeds_and_reports_today_predictions() -> None:
     )
 
     assert result.status == "ok"
-    assert result.training_samples + result.holdout_samples >= _RULES["minimum_training_samples"]
+    # 17 embargoed sample dates (20 minus horizon_days=3), all usable -> the final
+    # model is fit on all 17, and 2 walk-forward folds cover 11 of them as holdout.
+    assert result.training_samples == 17
+    assert len(result.walk_forward_folds) == 2
+    assert result.holdout_samples == sum(fold.test_samples for fold in result.walk_forward_folds)
+    assert result.positive_label_rate == 1.0  # prices always rise -> every label is positive
     assert result.coefficients and result.coefficients[0][0] == "rsi_14"
     by_symbol = {p.symbol: p for p in result.predictions}
     assert by_symbol["AAA"].probability_positive is not None
@@ -107,6 +112,25 @@ def test_run_prediction_succeeds_and_reports_today_predictions() -> None:
     assert "indicators are unavailable" in by_symbol["BBB"].reason
     assert by_symbol["CCC"].probability_positive is None
     assert "Not eligible" in by_symbol["CCC"].reason
+
+
+def test_run_prediction_handles_too_few_samples_for_any_walk_forward_fold() -> None:
+    trading_dates = _dates("2024-01-01", 4)  # horizon_days=3 embargo -> exactly 1 sample date
+    prices = [100.0, 101.0, 102.0, 103.0]
+    history = {"AAA": [{"trade_date": d, "adjusted_close": p} for d, p in zip(trading_dates, prices)]}
+    results_by_date = {d: {"AAA": _result("AAA", d)} for d in trading_dates}
+    service = _FakeService(results_by_date)
+    rules = dict(_RULES, minimum_training_samples=1)
+
+    result = run_prediction(
+        service, ["AAA"], history, trading_dates, as_of_date=trading_dates[-1], rules=rules
+    )
+
+    assert result.status == "ok"
+    assert result.training_samples == 1
+    assert result.walk_forward_folds == []
+    assert result.holdout_accuracy is None
+    assert "walk-forward" in result.message
 
 
 def test_run_prediction_is_deterministic_given_same_inputs() -> None:

@@ -1,6 +1,36 @@
 # Stock Scrapper
 
-Stock Scrapper 0.7.0 is a free, local, explainable stock-market research and historical-backtesting application. It collects daily market data, preserves it in SQLite, calculates transparent technical evidence, saves reproducible analysis runs, simulates a long-only strategy in one shared portfolio, tracks a user's real holdings against the same rules, screens a broader universe for new ideas, and offers a separate, clearly-labeled experimental statistical forecast alongside the deterministic score.
+Stock Scrapper 0.8.0 is a free, local, explainable stock-market research and historical-backtesting application. It collects daily market data, preserves it in SQLite, calculates transparent technical evidence, saves reproducible analysis runs, simulates a long-only strategy in one shared portfolio, tracks a user's real holdings against the same rules, screens a broader universe for new ideas, sizes advisory buy/sell recommendations within configurable risk limits, and offers a separate, clearly-labeled experimental statistical forecast alongside the deterministic score.
+
+## Phase 6a trade recommendations and sizing (advisory only)
+
+`recommend` is the first step toward the project's longer-term goal of an
+automated trader with guardrails — deliberately built as a two-part process.
+This part only recommends and sizes trades; it never places an order. It
+combines two existing, independently-validated signals rather than inventing
+new ones: SELL recommendations reuse `evaluate_holding()` from
+`stock_scrapper/portfolio.py` (the exact rules a backtest would have exited
+on), and BUY candidates are score_v1's own `Strong Candidate`/`Candidate`
+classifications. The experimental `predict` model's probability is attached
+to each BUY as displayed context only ("model: 57% positive") — never as a
+gate — since its accuracy doesn't yet warrant driving a real trade decision.
+
+Position sizing follows the same weight-based approach as the backtester's
+`BacktestConfig` (`max_position_weight`, `cash_reserve`), configured in
+`config/trading_rules.yaml` alongside hard dollar caps
+(`max_trade_dollar_amount`, `min_trade_dollar_amount`), a position-count cap
+(`max_open_positions`), and a per-run cap on new buys
+(`max_new_buys_per_run`). Available cash is derived, not stored: starting
+capital minus every dollar ever committed to a lot, plus every dollar a sale
+ever returned — no new database table was needed. `recommend` writes
+`reports/recommendations_<date>.txt` plus a `.summary.json`, following the
+same pattern as `digest`.
+
+`trading_rules.yaml` also carries an `auto_execute` flag for a possible
+future Part 3 (the program placing orders itself, opted into explicitly,
+against a paper-trading broker first) — it is rejected as unsupported if set
+to `true`. No broker integration exists yet; building one is a deliberate
+later step, not a silent default.
 
 ## Phase 5 screening, notifications, and experimental prediction
 
@@ -28,21 +58,31 @@ which conflicts with this project's documented credential-free design
 `score_v1`: a small hand-rolled (not scikit-learn, to stay dependency-light
 and fully transparent) logistic regression predicting the probability that a
 symbol's adjusted close will be higher after `horizon_days` trading sessions,
-using existing stored technical indicators as features. It is retrained from
-scratch on every call — nothing is persisted — from historical (symbol,
-as-of-date) rows sampled from stored price history, each paired with its own
-realized forward return. A sample date only enters training if its forward
-return is fully computable from history already bounded at or before the
-requested as-of date (see `stock_scrapper/prediction/dataset.py`), so nothing
-about the future is ever visible during training, matching the no-lookahead
-guarantee the rest of the project depends on. Output always reports holdout
-accuracy and Brier score first — a coin flip scores ~50%/0.25, and a small
-model over freely available technical indicators may well be no better than
-that; this is reported honestly, not hidden. Fitting is deterministic (zero
-initialization, full-batch gradient descent, no randomness), so the same
-stored data always produces the same coefficients and predictions. Configure
-via `config/prediction_rules.yaml` (horizon, lookback, feature list,
-regularization, minimum sample count).
+using existing stored technical indicators plus two derived features
+(`market_regime_code`, that day's regime encoded as an ordinal, and
+`opportunity_score_percentile`, the symbol's cross-sectional rank against the
+rest of that day's analyzed universe). It is retrained from scratch on every
+call — nothing is persisted — from historical (symbol, as-of-date) rows
+sampled from stored price history, each paired with its own realized forward
+return. A sample date only enters training if its forward return is fully
+computable from history already bounded at or before the requested as-of date
+(see `stock_scrapper/prediction/dataset.py`), so nothing about the future is
+ever visible during training, matching the no-lookahead guarantee the rest of
+the project depends on.
+
+Performance is estimated via expanding-window walk-forward cross-validation
+(fit on everything before a chronological cut, test on the chunk right after
+it, repeated over `walk_forward_folds` cuts) rather than one lucky/unlucky
+train/holdout split, and the report always shows accuracy next to the
+positive-label base rate side by side — a model that's "60% accurate" during
+a period where 60% of samples were positive anyway has learned nothing, and
+this is reported honestly rather than hidden. The model actually used for
+today's predictions is then re-fit on the entire embargoed dataset, since a
+deployed model should use all the history available to it. Fitting is
+deterministic (zero initialization, full-batch gradient descent, no
+randomness), so the same stored data always produces the same coefficients
+and predictions. Configure via `config/prediction_rules.yaml` (horizon,
+lookback, feature list, fold count, regularization, minimum sample count).
 
 ## Phase 4 real-portfolio tracking
 
@@ -295,6 +335,11 @@ python main.py portfolio-show --symbol AAPL --closed
 python main.py portfolio-compare
 python main.py portfolio-compare --symbol AAPL --as-of-date 2026-06-30
 
+# Sized buy/sell recommendations from the latest saved run and your real holdings (advisory only)
+python main.py recommend
+python main.py recommend --recalculate
+python main.py recommend --run-id <analysis-run-id> --no-save
+
 # Delete old log files; --include-reports also removes old digest/data-health/screener files
 python main.py cleanup-logs
 python main.py cleanup-logs --days 7
@@ -386,7 +431,8 @@ The archive is written under `dist/`. It includes source, configuration, documen
 - `config/scoring_rules.yaml` defines score weights, thresholds, regime settings, and scoring version.
 - `config/backtesting_rules.yaml` defines strategy, portfolio, execution, cost, stop, benchmark, and walk-forward assumptions.
 - `config/screening_universe.csv` is the static, additional large-cap list `screen` scans.
-- `config/prediction_rules.yaml` configures the experimental `predict` command (horizon, lookback, features, regularization).
+- `config/prediction_rules.yaml` configures the experimental `predict` command (horizon, lookback, features, walk-forward folds, regularization).
+- `config/trading_rules.yaml` configures `recommend`'s sizing and restrictions (starting capital, position/dollar/trade-count caps); `auto_execute` must stay `false` — no order-placement layer exists yet.
 
 Configuration is validated before use. Unknown or missing scoring components are rejected, weights must be numeric and nonnegative, and each score's weights must total exactly 100. Configuration snapshots are canonicalized as sorted JSON and identified with stable SHA-256 hashes.
 
@@ -521,6 +567,7 @@ stock_scrapper/processing/      Validation, indicators, relative strength
 stock_scrapper/reporting/       Phase 2 offline reporting and the daily digest
 stock_scrapper/portfolio.py     Real-holdings aggregation and hold/sell assessment
 stock_scrapper/prediction/      Experimental forward-return prediction (config, dataset, model, service)
+stock_scrapper/trading/         Advisory trade recommendations and sizing (config, recommendations)
 scripts/                        Daily automation wrapper, toast notification (Task Scheduler entry point)
 tools/                          Clean source-archive tooling
 data/                           Local SQLite and caches; not source-controlled
@@ -546,7 +593,8 @@ python -m pytest -q
 - **Historical simulation:** fills are modeled from stored bars and configured assumptions, not an exchange order book.
 - **Research scope:** technical evidence omits fundamentals, macroeconomic releases, news, taxes, borrowing constraints, and individual circumstances.
 - **Screening universe:** `config/screening_universe.csv` is a hand-maintained illustrative list, not a live feed of any official index's constituents, and is not automatically kept current.
-- **Experimental prediction:** `predict` fits a small linear model on freely available technical indicators; its holdout accuracy/Brier score may show no real edge over chance, and past accuracy does not indicate future accuracy. It is not part of `score_v1` and is not validated with the same walk-forward rigor as the backtester.
+- **Experimental prediction:** `predict` fits a small linear model on freely available technical indicators; its walk-forward holdout accuracy/Brier score may show no real edge over the base rate (both are reported side by side precisely so this is visible), and past accuracy does not indicate future accuracy. It is not part of `score_v1`.
+- **Advisory recommendations only:** `recommend` sizes suggestions but never places an order — there is no broker integration, and `auto_execute` in `config/trading_rules.yaml` is rejected if set to `true`. Sizing assumes a single account with no existing outside positions, ignores taxes/fees, and derives available cash from `starting_capital` plus recorded lots/sales rather than a real brokerage balance.
 
 ## Financial and historical-results disclaimer
 
