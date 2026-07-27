@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "pandas>=2.2.0",
+  "numpy>=1.26",
   "yfinance>=0.2.0",
   "PyYAML>=6.0.2",
   "exchange-calendars>=4.5",

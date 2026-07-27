@@ -1,6 +1,48 @@
 # Stock Scrapper
 
-Stock Scrapper 0.6.0 is a free, local, explainable stock-market research and historical-backtesting application. It collects daily market data, preserves it in SQLite, calculates transparent technical evidence, saves reproducible analysis runs, simulates a long-only strategy in one shared portfolio, and tracks a user's real holdings against the same rules.
+Stock Scrapper 0.6.0 is a free, local, explainable stock-market research and historical-backtesting application. It collects daily market data, preserves it in SQLite, calculates transparent technical evidence, saves reproducible analysis runs, simulates a long-only strategy in one shared portfolio, tracks a user's real holdings against the same rules, screens a broader universe for new ideas, and offers a separate, clearly-labeled experimental statistical forecast alongside the deterministic score.
+
+## Phase 5 screening, notifications, and experimental prediction
+
+`screen` scans `config/screening_universe.csv` — a static, illustrative list
+of roughly 65 additional large-cap U.S. tickers, not an official index feed —
+for symbols not already in the configured candidate universe, runs the same
+Phase 2 analysis over them (as a non-persisted `custom`-scope batch, so
+routine screening never clutters `analysis-list`), and reports any that
+qualify as Candidate/Strong Candidate plus a full report for the rest. Pass
+`--update` to explicitly collect data for the screening universe first.
+
+`scripts/run_daily.ps1` shows the digest as a native Windows toast
+notification (`scripts/send_toast.ps1`, using PowerShell's own registered
+AppUserModelID rather than requiring a module install). This is why the
+`\StockScrapper\DailyRun` scheduled task uses `LogonType=Interactive` — a
+toast can only display in an active logged-in session. `digest` also writes
+`reports/digest_<date>.summary.json`, a compact structured summary (counts,
+top changes, symbols to consider selling) for exactly this kind of
+non-terminal consumer, so the notification script never has to parse prose.
+Email delivery was deliberately not built: it would need SMTP credentials,
+which conflicts with this project's documented credential-free design
+(see `.env.example`).
+
+`predict` is an experimental statistical layer, fully separate from
+`score_v1`: a small hand-rolled (not scikit-learn, to stay dependency-light
+and fully transparent) logistic regression predicting the probability that a
+symbol's adjusted close will be higher after `horizon_days` trading sessions,
+using existing stored technical indicators as features. It is retrained from
+scratch on every call — nothing is persisted — from historical (symbol,
+as-of-date) rows sampled from stored price history, each paired with its own
+realized forward return. A sample date only enters training if its forward
+return is fully computable from history already bounded at or before the
+requested as-of date (see `stock_scrapper/prediction/dataset.py`), so nothing
+about the future is ever visible during training, matching the no-lookahead
+guarantee the rest of the project depends on. Output always reports holdout
+accuracy and Brier score first — a coin flip scores ~50%/0.25, and a small
+model over freely available technical indicators may well be no better than
+that; this is reported honestly, not hidden. Fitting is deterministic (zero
+initialization, full-batch gradient descent, no randomness), so the same
+stored data always produces the same coefficients and predictions. Configure
+via `config/prediction_rules.yaml` (horizon, lookback, feature list,
+regularization, minimum sample count).
 
 ## Phase 4 real-portfolio tracking
 
@@ -252,6 +294,15 @@ python main.py portfolio-compare --symbol AAPL --as-of-date 2026-06-30
 # Delete old log files (reports/ is never touched)
 python main.py cleanup-logs
 python main.py cleanup-logs --days 7
+
+# Scan a broader static universe for new Candidate/Strong Candidate ideas
+python main.py screen
+python main.py screen --update
+python main.py screen --universe-path config/screening_universe.csv
+
+# EXPERIMENTAL: statistical forward-return prediction, separate from score_v1
+python main.py predict
+python main.py predict --symbols AAPL MSFT --as-of-date 2026-06-30
 ```
 
 `digest` reads the same saved classifications as `scores`/`explain` and groups
@@ -329,6 +380,8 @@ The archive is written under `dist/`. It includes source, configuration, documen
 - `config/watchlist.csv` defines the static research universe.
 - `config/scoring_rules.yaml` defines score weights, thresholds, regime settings, and scoring version.
 - `config/backtesting_rules.yaml` defines strategy, portfolio, execution, cost, stop, benchmark, and walk-forward assumptions.
+- `config/screening_universe.csv` is the static, additional large-cap list `screen` scans.
+- `config/prediction_rules.yaml` configures the experimental `predict` command (horizon, lookback, features, regularization).
 
 Configuration is validated before use. Unknown or missing scoring components are rejected, weights must be numeric and nonnegative, and each score's weights must total exactly 100. Configuration snapshots are canonicalized as sorted JSON and identified with stable SHA-256 hashes.
 
@@ -462,7 +515,8 @@ stock_scrapper/migrations/      Safe SQLite schema migrations
 stock_scrapper/processing/      Validation, indicators, relative strength
 stock_scrapper/reporting/       Phase 2 offline reporting and the daily digest
 stock_scrapper/portfolio.py     Real-holdings aggregation and hold/sell assessment
-scripts/                        Daily automation wrapper (Task Scheduler entry point)
+stock_scrapper/prediction/      Experimental forward-return prediction (config, dataset, model, service)
+scripts/                        Daily automation wrapper, toast notification (Task Scheduler entry point)
 tools/                          Clean source-archive tooling
 data/                           Local SQLite and caches; not source-controlled
 reports/                        Generated offline reports; not source-controlled
@@ -486,6 +540,8 @@ python -m pytest -q
 - **Daily bars:** OHLC data cannot reveal the exact intraday order of events.
 - **Historical simulation:** fills are modeled from stored bars and configured assumptions, not an exchange order book.
 - **Research scope:** technical evidence omits fundamentals, macroeconomic releases, news, taxes, borrowing constraints, and individual circumstances.
+- **Screening universe:** `config/screening_universe.csv` is a hand-maintained illustrative list, not a live feed of any official index's constituents, and is not automatically kept current.
+- **Experimental prediction:** `predict` fits a small linear model on freely available technical indicators; its holdout accuracy/Brier score may show no real edge over chance, and past accuracy does not indicate future accuracy. It is not part of `score_v1` and is not validated with the same walk-forward rigor as the backtester.
 
 ## Financial and historical-results disclaimer
 

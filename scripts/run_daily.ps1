@@ -1,10 +1,13 @@
 <#
 Runs the daily Stock Scrapper pipeline unattended: collects/validates/analyzes/reports
-(`main.py run`), writes a plain-language buy/watch/sell digest (`main.py digest`), then
-deletes log files older than the configured retention window (`main.py cleanup-logs`).
-Intended to be invoked by Windows Task Scheduler once per day, after the market
-close plus the configured provider delay (see market_data.provider_delay_minutes
-in config/settings.yaml).
+(`main.py run`), writes a plain-language buy/watch/sell digest (`main.py digest`) and
+shows it as a Windows toast notification, then deletes log files older than the
+configured retention window (`main.py cleanup-logs`). Intended to be invoked by Windows
+Task Scheduler once per day, after the market close plus the configured provider delay
+(see market_data.provider_delay_minutes in config/settings.yaml).
+
+The toast notification requires an interactive logon session, which is why this
+task is registered with LogonType=Interactive rather than running detached.
 
 Uses cmd.exe for output redirection rather than PowerShell's native `*>>`/`2>&1`,
 which wraps every stderr line from a native exe (Python's logger writes INFO to
@@ -35,9 +38,29 @@ $runExit = $LASTEXITCODE
 cmd.exe /c "`"$pythonExe`" main.py digest >> `"$logFile`" 2>&1"
 $digestExit = $LASTEXITCODE
 
+$today = Get-Date -Format "yyyy-MM-dd"
+$summaryPath = Join-Path $RepoRoot "reports\digest_$today.summary.json"
+if (Test-Path $summaryPath) {
+    try {
+        $summary = Get-Content $summaryPath -Raw | ConvertFrom-Json
+        $sellSymbols = @($summary.holdings_sell_symbols)
+        $changes = @($summary.changes)
+        $title = "Stock Scrapper digest - $($summary.as_of_date)"
+        $lines = @("Buy: $($summary.buy_count)  Sell: $($summary.sell_count)  Watch: $($summary.watch_count)")
+        if ($sellSymbols.Count -gt 0) { $lines += "Consider selling: " + ($sellSymbols -join ", ") }
+        if ($changes.Count -gt 0) { $lines += ($changes | Select-Object -First 3) -join "; " }
+        $message = $lines -join "`n"
+        & (Join-Path $PSScriptRoot "send_toast.ps1") -Title $title -Message $message *>> $logFile
+    } catch {
+        Add-Content -Path $logFile -Value "Toast notification skipped: $_"
+    }
+} else {
+    Add-Content -Path $logFile -Value "Toast notification skipped: summary file not found at $summaryPath"
+}
+
 cmd.exe /c "`"$pythonExe`" main.py cleanup-logs >> `"$logFile`" 2>&1"
 $cleanupExit = $LASTEXITCODE
 
 Add-Content -Path $logFile -Value "=== Stock Scrapper daily run finished $(Get-Date -Format o): run=$runExit digest=$digestExit cleanup=$cleanupExit ==="
 
-exit ([Math]::Max($runExit, $digestExit, $cleanupExit))
+exit ([Math]::Max($runExit, [Math]::Max($digestExit, $cleanupExit)))

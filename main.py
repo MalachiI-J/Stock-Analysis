@@ -71,10 +71,17 @@ from stock_scrapper.portfolio import (
     evaluate_holding,
     evaluate_portfolio_performance,
 )
+from stock_scrapper.prediction.config import validate_prediction_config
+from stock_scrapper.prediction.service import run_prediction
 from stock_scrapper.processing.validation import validate_price_records
 from stock_scrapper.reporting.report_builder import write_phase2_reports
 from stock_scrapper.reporting.persistence import persist_report, report_identity
-from stock_scrapper.reporting.digest import build_digest, format_holding_line, render_digest_text
+from stock_scrapper.reporting.digest import (
+    build_digest,
+    build_notification_summary,
+    format_holding_line,
+    render_digest_text,
+)
 from stock_scrapper.utilities.hashing import canonical_json
 from stock_scrapper.utilities.logging_setup import setup_logging
 from stock_scrapper.utilities.provenance import collect_provenance
@@ -92,6 +99,21 @@ def load_scoring_rules(base_dir: Path) -> dict[str, Any]:
         if not isinstance(rules, dict):
             raise ValueError("scoring_rules.yaml must contain a mapping")
         return validate_scoring_config(rules)
+    except (OSError, yaml.YAMLError, ValueError) as exc:
+        raise InvalidConfigurationError(str(exc)) from exc
+
+
+def load_prediction_rules(base_dir: Path) -> dict[str, Any]:
+    """Load and strictly validate the experimental Phase 5 prediction configuration."""
+    rules_path = base_dir / "config" / "prediction_rules.yaml"
+    if not rules_path.exists():
+        raise InvalidConfigurationError(f"Prediction configuration is missing: {rules_path}")
+    try:
+        with rules_path.open("r", encoding="utf-8") as handle:
+            rules = yaml.safe_load(handle)
+        if not isinstance(rules, dict):
+            raise ValueError("prediction_rules.yaml must contain a mapping")
+        return validate_prediction_config(rules)
     except (OSError, yaml.YAMLError, ValueError) as exc:
         raise InvalidConfigurationError(str(exc)) from exc
 
@@ -248,6 +270,15 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("universe-show", help="Show role-aware symbol universes")
     subparsers.add_parser("universe-validate", help="Validate symbol universe roles")
     subparsers.add_parser("provenance", help="Show current software provenance")
+
+    screen = subparsers.add_parser("screen", help="Scan a broader static universe for new Candidate/Strong Candidate symbols")
+    screen.add_argument("--universe-path", help="Override path to the screening universe CSV")
+    screen.add_argument("--update", action="store_true", help="Explicitly collect data for the screening universe first")
+    _add_as_of_argument(screen)
+
+    predict = subparsers.add_parser("predict", help="EXPERIMENTAL statistical forward-return prediction (not score_v1)")
+    predict.add_argument("--symbols", nargs="+", help="Optional symbol list")
+    _add_as_of_argument(predict)
     return parser
 
 
@@ -627,6 +658,19 @@ def _finite(value: Any) -> float | None:
     return number if number == number and abs(number) != float("inf") else None
 
 
+def _new_screening_symbols(screening_symbols: Sequence[str], already_tracked: Sequence[str]) -> list[str]:
+    """Screening-universe symbols not already in the configured candidate universe."""
+    tracked = {str(symbol).upper() for symbol in already_tracked}
+    seen: set[str] = set()
+    result: list[str] = []
+    for symbol in screening_symbols:
+        normalized = str(symbol).strip().upper()
+        if normalized and normalized not in tracked and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
+
+
 def _held_portfolio_symbols(config: dict[str, Any]) -> list[str]:
     """Return every symbol with an open portfolio lot, so real holdings always get fresh price data."""
     initialize_database(config["database_path"])
@@ -905,6 +949,107 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "provenance":
             print(json.dumps(collect_provenance(base_dir,scoring_version=str(load_scoring_rules(base_dir).get("scoring_version"))), indent=2, default=str)); return int(ExitCode.SUCCESS)
 
+        if args.command == "screen":
+            universe_path = Path(args.universe_path) if args.universe_path else base_dir / "config" / "screening_universe.csv"
+            if not universe_path.exists():
+                raise InvalidConfigurationError(f"Screening universe file does not exist: {universe_path}")
+            screening_symbols = load_watchlist(universe_path)
+            new_symbols = _new_screening_symbols(screening_symbols, load_universes(config)["candidates"])
+            if not new_symbols:
+                print("No new symbols to screen: every screening-universe symbol is already in your candidate universe.")
+                return int(ExitCode.SUCCESS)
+            effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
+            partial_update = False
+            if args.update:
+                successful, failed, _, _ = update_symbols(config, logger, new_symbols)
+                if failed and not successful:
+                    raise OperationFailedError("Explicit pre-screen update failed for: " + ", ".join(failed))
+                partial_update = bool(failed)
+            batch = _analysis_batch(config, base_dir, new_symbols, effective, persist=False)
+            found = sorted(
+                (result for result in batch.results if result.classification in ("Candidate", "Strong Candidate")),
+                key=lambda result: -(result.opportunity_score if result.opportunity_score is not None else -1.0),
+            )
+            print(f"Screened {len(new_symbols)} symbol(s) outside your candidate universe as of {batch.as_of_date}")
+            print(f"New Candidate/Strong Candidate symbol(s): {len(found)}")
+            for result in found:
+                print(f"  {result.symbol:<6} {result.classification} opp={result.opportunity_score} risk={result.risk_score} conf={result.confidence_score}")
+                print(f"          {result.primary_reason}")
+            scoring_rules = load_scoring_rules(base_dir)
+            conn = create_connection(config["database_path"])
+            try:
+                histories = {symbol: fetch_price_history(conn, symbol, end_date=effective) for symbol in new_symbols}
+                issues = fetch_quality_issues(conn, unresolved_only=True, as_of_date=effective)
+            finally:
+                conn.close()
+            metadata = {
+                "as_of_date": batch.as_of_date,
+                "data_through_date": batch.data_through_date,
+                "scoring_version": scoring_rules.get("scoring_version"),
+                "configuration_hash": batch.configuration_hash,
+                "benchmark_symbol": scoring_rules.get("benchmark_symbol", "SPY"),
+                "market_regime": batch.market_context.regime,
+                "market_regime_confidence": batch.market_context.confidence,
+                "market_regime_reasons": batch.market_context.reasons,
+            }
+            paths = write_phase2_reports(
+                config["reports_dir"], effective, metadata, batch.results, histories, issues, [],
+                f"screen-{uuid4().hex[:8]}",
+            )
+            print(f"Screener report: {paths['html']}")
+            return int(ExitCode.PARTIAL_FAILURE if partial_update else ExitCode.SUCCESS)
+
+        if args.command == "predict":
+            print(
+                "EXPERIMENTAL STATISTICAL FORECAST — not part of score_v1, not a trading signal. "
+                "Read the holdout accuracy/Brier score below before trusting any probability.",
+                file=sys.stderr,
+            )
+            effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
+            prediction_rules = load_prediction_rules(base_dir)
+            scoring_rules = load_scoring_rules(base_dir)
+            roles = load_universes(config)
+            benchmark = roles["benchmark"]
+            load_symbols = sorted(set(symbols) | {benchmark} | set(roles["market_context"]) | set(roles["defensive_context"]))
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                histories = {symbol: fetch_price_history(conn, symbol, end_date=effective) for symbol in load_symbols}
+                trading_dates = [str(row["trade_date"])[:10] for row in histories.get(benchmark, [])]
+                service = AnalysisService(conn, scoring_rules, roles["candidates"])
+                result = run_prediction(
+                    service, symbols, histories, trading_dates,
+                    as_of_date=effective.isoformat(), rules=prediction_rules,
+                )
+            finally:
+                conn.close()
+            if result.status == "insufficient_data":
+                print(f"Missing data: {result.message}", file=sys.stderr)
+                return int(ExitCode.MISSING_DATA)
+            print(f"Prediction as of {result.as_of_date} | horizon={result.horizon_days} session(s) | model={prediction_rules['prediction_version']}")
+            print(
+                f"Trained on {result.training_samples} sample(s) ({result.training_start_date} to "
+                f"{result.training_end_date}), evaluated on {result.holdout_samples} held-out sample(s)"
+            )
+            accuracy_text = "n/a" if result.holdout_accuracy is None else f"{result.holdout_accuracy:.1%}"
+            brier_text = "n/a" if result.holdout_brier_score is None else f"{result.holdout_brier_score:.4f}"
+            print(f"Holdout accuracy: {accuracy_text}  |  Holdout Brier score (lower is better, 0.25 = coin flip): {brier_text}")
+            print("Model coefficients (standardized; positive pushes probability up):")
+            for name, weight in result.coefficients[:10]:
+                print(f"  {name:<32} {weight:+.4f}")
+            print("Symbol predictions (probability of a positive forward return over the horizon):")
+            ranked = sorted(
+                result.predictions,
+                key=lambda item: item.probability_positive if item.probability_positive is not None else -1.0,
+                reverse=True,
+            )
+            for prediction in ranked:
+                if prediction.probability_positive is None:
+                    print(f"  {prediction.symbol:<6} unavailable — {prediction.reason}")
+                else:
+                    print(f"  {prediction.symbol:<6} {prediction.probability_positive:.1%}")
+            return int(ExitCode.SUCCESS)
+
         if args.command in {"data-health", "data-health-report"}:
             initialize_database(config["database_path"]); conn = create_connection(config["database_path"])
             try: health = assess_data_health(conn, symbols, int(config.get("market_data", {}).get("provider_delay_minutes", 30)))
@@ -1049,6 +1194,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(text, encoding="utf-8")
                 print(f"Digest: {target}")
+                summary_target = Path(config["reports_dir"]) / f"digest_{as_of_text}.summary.json"
+                summary_target.write_text(
+                    json.dumps(build_notification_summary(payload), indent=2, sort_keys=True), encoding="utf-8"
+                )
+                print(f"Summary: {summary_target}")
             return int(ExitCode.SUCCESS)
 
         if args.command == "portfolio-buy":

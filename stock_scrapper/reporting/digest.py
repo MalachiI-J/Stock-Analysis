@@ -188,3 +188,29 @@ def render_digest_text(digest: Mapping[str, Any]) -> str:
         "guarantee future performance."
     )
     return "\n".join(lines) + "\n"
+
+
+def build_notification_summary(digest: Mapping[str, Any]) -> dict[str, Any]:
+    """Compact JSON-safe summary for non-terminal consumers (e.g. a desktop toast).
+
+    Kept separate from ``render_digest_text`` so a notification script can read
+    structured counts/symbols without scraping prose output.
+    """
+    holdings = digest.get("holdings", [])
+    return {
+        "as_of_date": digest["as_of_date"],
+        "market_regime": digest["market_regime"],
+        "buy_count": len(digest["buy"]),
+        "sell_count": len(digest["sell"]),
+        "watch_count": len(digest["watch"]),
+        "blocked_count": len(digest["blocked"]),
+        "top_buy_symbols": [entry.symbol for entry in digest["buy"][:3]],
+        "changes": [
+            f"{entry.symbol}: {entry.previous_classification} -> {entry.classification}"
+            for entry in digest["changes"]
+        ],
+        "holdings_open_count": len(holdings),
+        "holdings_sell_symbols": [
+            holding.symbol for holding in holdings if holding.recommendation == "SELL"
+        ],
+    }

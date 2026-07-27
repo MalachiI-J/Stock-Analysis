@@ -1,0 +1,26 @@
+prediction_version: "predict-v1"
+horizon_days: 21
+lookback_years: 3
+sample_stride_sessions: 5
+train_fraction: 0.8
+l2_lambda: 0.01
+learning_rate: 0.3
+iterations: 500
+minimum_training_samples: 200
+feature_keys:
+  - rsi_14
+  - distance_from_sma200
+  - distance_from_sma50
+  - trend_slope_50
+  - trend_slope_200
+  - one_month_return
+  - three_month_return
+  - six_month_return
+  - twenty_day_volatility
+  - sixty_day_volatility
+  - benchmark_relative_return_63
+  - benchmark_relative_return_252
+  - beta
+  - correlation
+  - atr_percentage
+  - volume_relative_to_average

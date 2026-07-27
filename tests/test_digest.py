@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import json
+
 from stock_scrapper.models.analysis_models import AnalysisResult
 from stock_scrapper.portfolio import HoldingAssessment
-from stock_scrapper.reporting.digest import build_digest, format_holding_line, render_digest_text
+from stock_scrapper.reporting.digest import (
+    build_digest,
+    build_notification_summary,
+    format_holding_line,
+    render_digest_text,
+)
 
 
 def _result(symbol: str, classification: str, opportunity: float | None = 50.0) -> AnalysisResult:
@@ -147,3 +154,30 @@ def test_format_holding_line_reports_unavailable_price() -> None:
     line = format_holding_line(holding)
     assert "latest n/a" in line
     assert "unrealized n/a" in line
+
+
+def test_build_notification_summary_is_json_safe_and_compact() -> None:
+    digest = build_digest(
+        as_of_date="2024-12-31",
+        data_through_date="2024-12-31",
+        market_regime="Neutral",
+        market_regime_confidence=80.0,
+        results=[
+            _result("AAA", "Strong Candidate", 90.0),
+            _result("BBB", "Candidate", 70.0),
+            _result("CCC", "Avoid"),
+        ],
+        previous_results=[_result("CCC", "Watch")],
+        holdings=[
+            _holding(symbol="TSLA", recommendation="SELL"),
+            _holding(symbol="AAPL", recommendation="HOLD"),
+        ],
+    )
+    summary = build_notification_summary(digest)
+    json.dumps(summary)  # must be directly JSON-serializable
+    assert summary["buy_count"] == 2
+    assert summary["sell_count"] == 1
+    assert summary["top_buy_symbols"] == ["AAA", "BBB"]
+    assert summary["changes"] == ["CCC: Watch -> Avoid"]
+    assert summary["holdings_open_count"] == 2
+    assert summary["holdings_sell_symbols"] == ["TSLA"]

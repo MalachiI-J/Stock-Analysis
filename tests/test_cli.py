@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -495,6 +496,13 @@ def test_digest_command_writes_digest_file(
     captured = capsys.readouterr()
     assert "BUY / STRONG" in captured.out
 
+    summary_path = tmp_path / "reports" / "digest_2024-12-31.summary.json"
+    assert summary_path.exists()
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["buy_count"] == 1
+    assert summary["sell_count"] == 1
+    assert summary["top_buy_symbols"] == ["AAA"]
+
 
 def test_digest_command_no_save_skips_file(
     monkeypatch: pytest.MonkeyPatch,
@@ -508,6 +516,7 @@ def test_digest_command_no_save_skips_file(
     )
 
     assert not (tmp_path / "reports" / "digest_2024-12-31.txt").exists()
+    assert not (tmp_path / "reports" / "digest_2024-12-31.summary.json").exists()
 
 
 def test_digest_command_includes_holdings_section(
@@ -718,3 +727,180 @@ def test_portfolio_compare_reports_none_recorded(
     assert cli.main(["portfolio-compare"]) == int(ExitCode.SUCCESS)
     captured = capsys.readouterr()
     assert "No portfolio lots recorded" in captured.out
+
+
+def test_new_screening_symbols_excludes_tracked_and_dedupes() -> None:
+    result = cli._new_screening_symbols(["aapl", "MSFT", "ZZZZ", "zzzz", "jpm"], ["AAPL", "JPM"])
+    assert result == ["MSFT", "ZZZZ"]
+
+
+def _install_startup_with_real_watchlist(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    watchlist: list[str],
+) -> None:
+    # Unlike _install_startup, this leaves load_watchlist unstubbed so a
+    # separately loaded screening-universe CSV is read for real too (the
+    # blanket stub would otherwise intercept both calls identically).
+    config = _config(tmp_path)
+    Path(config["watchlist_path"]).write_text(
+        "symbol\n" + "\n".join(watchlist) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(cli, "load_config", lambda _base_dir: config)
+    monkeypatch.setattr(cli, "ensure_directories", lambda _config: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda _config, run_id: _Logger())
+
+
+def test_screen_command_reports_no_new_symbols(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_startup_with_real_watchlist(monkeypatch, tmp_path, ["AAPL", "MSFT"])
+    universe_path = tmp_path / "screening_universe.csv"
+    universe_path.write_text("symbol\nAAPL\nMSFT\n", encoding="utf-8")
+
+    assert cli.main(["screen", "--universe-path", str(universe_path)]) == int(ExitCode.SUCCESS)
+    captured = capsys.readouterr()
+    assert "No new symbols to screen" in captured.out
+
+
+def test_screen_command_reports_new_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_startup_with_real_watchlist(monkeypatch, tmp_path, ["AAPL"])
+    universe_path = tmp_path / "screening_universe.csv"
+    universe_path.write_text("symbol\nUNH\nJNJ\n", encoding="utf-8")
+
+    batch = SimpleNamespace(
+        results=[
+            AnalysisResult(
+                symbol="UNH", as_of_date="2024-12-31", data_through_date="2024-12-31",
+                classification="Strong Candidate", primary_reason="Strong trend",
+                opportunity_score=88.0, risk_score=20.0, confidence_score=90.0,
+            ),
+            AnalysisResult(
+                symbol="JNJ", as_of_date="2024-12-31", data_through_date="2024-12-31",
+                classification="Watch", primary_reason="Mixed signals",
+                opportunity_score=55.0, risk_score=40.0, confidence_score=70.0,
+            ),
+        ],
+        as_of_date="2024-12-31",
+        data_through_date="2024-12-31",
+        configuration_hash="config-hash",
+        market_context=SimpleNamespace(regime="Neutral", confidence=80.0, reasons=[]),
+    )
+    monkeypatch.setattr(cli, "_analysis_batch", lambda *_args, **_kwargs: batch)
+    monkeypatch.setattr(cli, "load_scoring_rules", lambda _base_dir: {"scoring_version": "test", "benchmark_symbol": "SPY"})
+    monkeypatch.setattr(cli, "initialize_database", lambda _path: None)
+    monkeypatch.setattr(cli, "create_connection", lambda _path: _Connection())
+    monkeypatch.setattr(cli, "fetch_price_history", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cli, "fetch_quality_issues", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cli, "write_phase2_reports", lambda *_args, **_kwargs: {"csv": "s.csv", "html": "s.html"})
+
+    assert cli.main(["screen", "--universe-path", str(universe_path)]) == int(ExitCode.SUCCESS)
+    captured = capsys.readouterr()
+    assert "Screened 2 symbol(s)" in captured.out
+    assert "New Candidate/Strong Candidate symbol(s): 1" in captured.out
+    assert "UNH" in captured.out and "Strong Candidate" in captured.out
+    assert "Screener report: s.html" in captured.out
+
+
+def test_screen_command_update_failure_raises_operation_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "load_universes", lambda _config: {"candidates": []})
+    universe_path = tmp_path / "screening_universe.csv"
+    universe_path.write_text("symbol\nUNH\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "update_symbols", lambda *_args, **_kwargs: ([], ["UNH"], 0, 0))
+
+    assert cli.main(["screen", "--universe-path", str(universe_path), "--update"]) == int(
+        ExitCode.OPERATION_FAILED
+    )
+
+
+def test_screen_command_rejects_missing_universe_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    missing = tmp_path / "does-not-exist.csv"
+
+    assert cli.main(["screen", "--universe-path", str(missing)]) == int(
+        ExitCode.INVALID_CONFIGURATION
+    )
+
+
+def _install_predict_startup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "load_universes", lambda _config: {
+        "candidates": ["AAPL"], "benchmark": "SPY", "market_context": ["SPY"], "defensive_context": [],
+    })
+    monkeypatch.setattr(cli, "load_scoring_rules", lambda _base_dir: {"scoring_version": "test"})
+    monkeypatch.setattr(cli, "initialize_database", lambda _path: None)
+    monkeypatch.setattr(cli, "create_connection", lambda _path: _Connection())
+    monkeypatch.setattr(cli, "fetch_price_history", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cli, "AnalysisService", lambda *_args, **_kwargs: object())
+
+
+def test_predict_command_reports_insufficient_data(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from stock_scrapper.prediction.service import PredictionRunResult
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cli, "run_prediction",
+        lambda *_args, **_kwargs: PredictionRunResult(
+            status="insufficient_data", message="Not enough history.", as_of_date="2026-01-01", horizon_days=21,
+        ),
+    )
+
+    assert cli.main(["predict", "--symbols", "AAPL"]) == int(ExitCode.MISSING_DATA)
+
+
+def test_predict_command_reports_coefficients_and_ranked_predictions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from stock_scrapper.prediction.service import PredictionRunResult, SymbolPrediction
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    result = PredictionRunResult(
+        status="ok",
+        message=None,
+        as_of_date="2026-01-01",
+        horizon_days=21,
+        training_samples=400,
+        holdout_samples=100,
+        training_start_date="2023-01-01",
+        training_end_date="2025-11-01",
+        holdout_accuracy=0.55,
+        holdout_brier_score=0.24,
+        coefficients=[("rsi_14", 0.42), ("beta", -0.13)],
+        predictions=[
+            SymbolPrediction("AAPL", 0.71, None),
+            SymbolPrediction("MSFT", 0.30, None),
+            SymbolPrediction("ZZZZ", None, "One or more required indicators are unavailable"),
+        ],
+    )
+    monkeypatch.setattr(cli, "run_prediction", lambda *_args, **_kwargs: result)
+
+    assert cli.main(["predict", "--symbols", "AAPL", "MSFT", "ZZZZ"]) == int(ExitCode.SUCCESS)
+    captured = capsys.readouterr()
+    assert "EXPERIMENTAL STATISTICAL FORECAST" in captured.err
+    assert "Holdout accuracy: 55.0%" in captured.out
+    assert "rsi_14" in captured.out and "+0.4200" in captured.out
+    lines = captured.out.splitlines()
+    aapl_line = next(line for line in lines if line.strip().startswith("AAPL"))
+    msft_line = next(line for line in lines if line.strip().startswith("MSFT"))
+    zzzz_line = next(line for line in lines if line.strip().startswith("ZZZZ"))
+    assert lines.index(aapl_line) < lines.index(msft_line) < lines.index(zzzz_line)
+    assert "71.0%" in aapl_line
+    assert "unavailable" in zzzz_line
