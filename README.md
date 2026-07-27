@@ -120,6 +120,34 @@ In VSCode, select `.venv\Scripts\python.exe` with **Python: Select Interpreter**
 
 No API key or paid account is required. Runtime settings come from YAML; see [Configuration](#configuration).
 
+## Daily automation
+
+`scripts/run_daily.ps1` runs `python main.py run` (collect → validate →
+analyze → report) followed by `python main.py digest`, logging combined
+output to `logs/daily_run_<timestamp>.log`. It uses `cmd.exe` for output
+redirection rather than PowerShell's native `2>&1`/`*>>`, which otherwise
+wraps every stderr line from a Python process (the app logger writes `INFO`
+to stderr) in a spurious `NativeCommandError` and can emit UTF-16 log files.
+
+A Windows Task Scheduler task (`\StockScrapper\DailyRun`) runs this script
+Monday–Friday. Inspect or change it with:
+
+```powershell
+Get-ScheduledTask -TaskPath "\StockScrapper\" -TaskName "DailyRun"
+Start-ScheduledTask -TaskPath "\StockScrapper\" -TaskName "DailyRun"   # run once now
+Disable-ScheduledTask -TaskPath "\StockScrapper\" -TaskName "DailyRun"
+Unregister-ScheduledTask -TaskPath "\StockScrapper\" -TaskName "DailyRun"
+```
+
+The scheduled time is a plain local-clock trigger, not timezone-aware; it
+assumes the machine's clock matches `market_data.timezone` in
+`config/settings.yaml` (`America/New_York`). The pipeline itself is
+correct regardless of exactly when it runs, since collection and analysis
+are bounded by the official XNYS calendar and the configured provider
+delay — running earlier just means more recently completed sessions may
+not yet be available, and `data-health`/`market-session` remain the way to
+check what is currently available.
+
 ## Command-line reference
 
 ### Collection, validation, and status
@@ -163,7 +191,19 @@ python main.py analysis-show --run-id <analysis-run-id>
 
 # Build an offline Phase 2 report bounded by the requested date
 python main.py report --symbols AAPL MSFT --date 2024-12-31
+
+# Plain-language daily buy/watch/sell digest from the latest saved run
+python main.py digest
+python main.py digest --recalculate
+python main.py digest --run-id <analysis-run-id> --no-save
 ```
+
+`digest` reads the same saved classifications as `scores`/`explain` and groups
+them into BUY (Candidate/Strong Candidate), SELL/AVOID-if-held (Avoid/High
+Risk), WATCH, and DATA ISSUES, plus a change log against the previous saved
+run. It writes `reports/digest_<as-of-date>.txt` unless `--no-save` is given.
+It is a rendering of existing scores, not a new calculation, and carries the
+same research-only disclaimer as every other report.
 
 `scores` and `explain` are read-only by default. Recalculation occurs only when requested. Invalid dates, invalid configuration, missing data, partial failure, database failure, and complete failure return nonzero exit status rather than silently reporting success.
 

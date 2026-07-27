@@ -63,6 +63,7 @@ from stock_scrapper.exceptions import (
 from stock_scrapper.processing.validation import validate_price_records
 from stock_scrapper.reporting.report_builder import write_phase2_reports
 from stock_scrapper.reporting.persistence import persist_report, report_identity
+from stock_scrapper.reporting.digest import build_digest, render_digest_text
 from stock_scrapper.utilities.hashing import canonical_json
 from stock_scrapper.utilities.logging_setup import setup_logging
 from stock_scrapper.utilities.provenance import collect_provenance
@@ -137,6 +138,16 @@ def build_parser() -> argparse.ArgumentParser:
     explain_source.add_argument("--latest-any",action="store_true")
     explain_parser.add_argument("--scope",choices=("candidate_universe","all_data_symbols","custom"))
     _add_as_of_argument(explain_parser)
+
+    digest_parser = subparsers.add_parser("digest", help="Print a plain-language daily buy/watch/sell digest")
+    digest_parser.add_argument("--symbols", nargs="+", help="Optional saved symbols")
+    digest_source = digest_parser.add_mutually_exclusive_group()
+    digest_source.add_argument("--run-id", help="Read one exact saved run")
+    digest_source.add_argument("--recalculate", action="store_true")
+    digest_source.add_argument("--latest-any", action="store_true")
+    digest_parser.add_argument("--scope", choices=("candidate_universe", "all_data_symbols", "custom"))
+    digest_parser.add_argument("--no-save", action="store_true", help="Print only; do not write a digest file to reports_dir")
+    _add_as_of_argument(digest_parser)
 
     analysis_list=subparsers.add_parser("analysis-list", help="List saved analysis runs")
     analysis_list.add_argument("--scope",choices=("candidate_universe","all_data_symbols","custom")); analysis_list.add_argument("--date"); analysis_list.add_argument("--canonical-only",action="store_true"); analysis_list.add_argument("--limit",type=int,default=20)
@@ -743,7 +754,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if (
-        args.command in {"scores", "explain"}
+        args.command in {"scores", "explain", "digest"}
         and getattr(args, "as_of_date", None)
         and not args.recalculate
     ):
@@ -902,6 +913,46 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _print_scores(results)
             else:
                 _print_explanations(results)
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "digest":
+            explicit = bool(getattr(args, "symbols", None))
+            if args.recalculate:
+                effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
+                batch = _analysis_batch(config, base_dir, symbols, effective, persist=True, universe=universe)
+                results = batch.results
+                as_of_date, data_through_date = batch.as_of_date, batch.data_through_date
+                regime, regime_confidence = batch.market_context.regime, batch.market_context.confidence
+            else:
+                saved, results = _load_saved_results(
+                    config, args.run_id, symbols if explicit else None,
+                    latest_any=args.latest_any, scope=args.scope,
+                )
+                as_of_date, data_through_date = saved.get("as_of_date"), saved.get("data_through_date")
+                regime = saved.get("market_regime") or (results[0].market_regime if results else "Insufficient Market Data")
+                regime_confidence = saved.get("market_regime_confidence")
+            as_of_text = str(as_of_date)[:10]
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                previous = _previous_analysis(conn, as_of_text)
+            finally:
+                conn.close()
+            payload = build_digest(
+                as_of_date=as_of_text,
+                data_through_date=str(data_through_date)[:10] if data_through_date else None,
+                market_regime=str(regime),
+                market_regime_confidence=regime_confidence,
+                results=results,
+                previous_results=previous,
+            )
+            text = render_digest_text(payload)
+            print(text)
+            if not args.no_save:
+                target = Path(config["reports_dir"]) / f"digest_{as_of_text}.txt"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+                print(f"Digest: {target}")
             return int(ExitCode.SUCCESS)
 
         if args.command == "analysis-list":

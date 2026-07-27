@@ -435,3 +435,75 @@ def test_build_reports_closes_connection_when_history_loading_fails(
         )
 
     assert connection.closed is True
+
+
+def _install_digest_saved_run(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    saved = {
+        "analysis_run_id": "saved-run",
+        "as_of_date": "2024-12-31",
+        "data_through_date": "2024-12-31",
+        "market_regime": "Neutral",
+        "market_regime_confidence": 80.0,
+    }
+    results = [
+        AnalysisResult(
+            symbol="AAA",
+            as_of_date="2024-12-31",
+            data_through_date="2024-12-31",
+            classification="Strong Candidate",
+            primary_reason="Strong trend",
+            opportunity_score=90.0,
+            risk_score=20.0,
+            confidence_score=85.0,
+        ),
+        AnalysisResult(
+            symbol="BBB",
+            as_of_date="2024-12-31",
+            data_through_date="2024-12-31",
+            classification="Avoid",
+            primary_reason="Deteriorating trend",
+            opportunity_score=10.0,
+            risk_score=80.0,
+            confidence_score=60.0,
+        ),
+    ]
+    monkeypatch.setattr(cli, "initialize_database", lambda _path: None)
+    monkeypatch.setattr(cli, "create_connection", lambda _path: _Connection())
+    monkeypatch.setattr(
+        cli, "_load_saved_results", lambda *_args, **_kwargs: (saved, results)
+    )
+    monkeypatch.setattr(cli, "_previous_analysis", lambda *_args: [])
+    return saved
+
+
+def test_digest_command_writes_digest_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    _install_digest_saved_run(monkeypatch)
+
+    assert cli.main(["digest", "--run-id", "saved-run"]) == int(ExitCode.SUCCESS)
+
+    target = tmp_path / "reports" / "digest_2024-12-31.txt"
+    assert target.exists()
+    text = target.read_text(encoding="utf-8")
+    assert "AAA" in text and "Strong Candidate" in text
+    assert "BBB" in text and "Avoid" in text
+    captured = capsys.readouterr()
+    assert "BUY / STRONG" in captured.out
+
+
+def test_digest_command_no_save_skips_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    _install_digest_saved_run(monkeypatch)
+
+    assert cli.main(["digest", "--run-id", "saved-run", "--no-save"]) == int(
+        ExitCode.SUCCESS
+    )
+
+    assert not (tmp_path / "reports" / "digest_2024-12-31.txt").exists()
