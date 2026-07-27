@@ -76,6 +76,7 @@ from stock_scrapper.prediction.service import run_prediction
 from stock_scrapper.processing.validation import validate_price_records
 from stock_scrapper.trading.config import validate_trading_rules
 from stock_scrapper.trading.recommendations import build_recommendations, render_recommendations_text
+from stock_scrapper.trading.review import evaluate_recommendation_outcomes, render_review_text
 from stock_scrapper.reporting.report_builder import write_phase2_reports
 from stock_scrapper.reporting.persistence import persist_report, report_identity
 from stock_scrapper.reporting.digest import (
@@ -211,6 +212,15 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_parser.add_argument("--no-save", action="store_true", help="Print only; do not write a report file to reports_dir")
     recommend_parser.add_argument("--no-model", action="store_true", help="Skip the experimental prediction model's confidence context")
     _add_as_of_argument(recommend_parser)
+
+    recommend_review = subparsers.add_parser(
+        "recommend-review", help="Check how a past `recommend` run's suggestions actually performed"
+    )
+    recommend_review.add_argument(
+        "--recommendation-date", required=True,
+        help="Date of the recommendations_<date>.summary.json file to review (YYYY-MM-DD)",
+    )
+    _add_as_of_argument(recommend_review)  # the review/evaluation date; defaults to today
 
     portfolio_buy = subparsers.add_parser("portfolio-buy", help="Record a real buy as a new open lot")
     portfolio_buy.add_argument("--symbol", required=True)
@@ -1396,6 +1406,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
                 summary_target.write_text(json.dumps(summary_payload, indent=2, sort_keys=True), encoding="utf-8")
                 print(f"Summary: {summary_target}")
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "recommend-review":
+            recommendation_date = _parse_date(args.recommendation_date, field="recommendation date").isoformat()
+            review_date = _parse_date(args.as_of_date, field="as-of date", default=date.today())
+            summary_path = Path(config["reports_dir"]) / f"recommendations_{recommendation_date}.summary.json"
+            if not summary_path.exists():
+                print(f"Missing data: no recommendations file found at {summary_path}", file=sys.stderr)
+                return int(ExitCode.MISSING_DATA)
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+            backtest_config = load_backtesting_config(base_dir / "config" / "backtesting_rules.yaml")
+            benchmark_symbol = backtest_config.benchmark.upper()
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                price_cache: dict[tuple[str, str], float | None] = {}
+
+                def price_at(price_symbol: str, day: str) -> float | None:
+                    key = (price_symbol, day)
+                    if key not in price_cache:
+                        price_history = fetch_price_history(conn, price_symbol, end_date=day)
+                        price_cache[key] = _finite(price_history[-1].get("adjusted_close")) if price_history else None
+                    return price_cache[key]
+
+                review = evaluate_recommendation_outcomes(
+                    payload.get("recommendations", []),
+                    recommendation_date=recommendation_date,
+                    review_date=review_date.isoformat(),
+                    benchmark_symbol=benchmark_symbol,
+                    price_at=price_at,
+                )
+            finally:
+                conn.close()
+            print(render_review_text(review))
             return int(ExitCode.SUCCESS)
 
         if args.command == "portfolio-buy":

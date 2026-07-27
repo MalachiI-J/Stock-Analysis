@@ -36,6 +36,18 @@ against a paper-trading broker first) — it is rejected as unsupported if set
 to `true`. No broker integration exists yet; building one is a deliberate
 later step, not a silent default.
 
+`recommend-review` closes the accountability loop: the backtester and the
+predictor's walk-forward folds both validate the underlying rules against
+history, but neither tells you whether one specific past `recommend` run —
+its specific candidates, its specific sizing, that specific day — actually
+worked out. Given a saved `recommendations_<date>.summary.json`, it looks up
+what each recommended symbol's price actually did between the recommendation
+date and a later review date, grading BUYs exactly the way `predict` defines
+success (beat the benchmark's own return) and SELLs in reverse (did the price
+actually fall after being sold). One run is one data point, not a track
+record — it's meant to be checked repeatedly over time as more dated
+recommendation files accumulate, not read as a verdict from a single result.
+
 ## Phase 5 screening, notifications, and experimental prediction
 
 `screen` scans `config/screening_universe.csv` — a static, illustrative list
@@ -355,6 +367,10 @@ python main.py recommend
 python main.py recommend --recalculate
 python main.py recommend --run-id <analysis-run-id> --no-save
 
+# Check how a past recommend run's suggestions actually performed
+python main.py recommend-review --recommendation-date 2026-07-27
+python main.py recommend-review --recommendation-date 2026-07-27 --as-of-date 2026-08-17
+
 # Delete old log files; --include-reports also removes old digest/data-health/screener files
 python main.py cleanup-logs
 python main.py cleanup-logs --days 7
@@ -582,7 +598,7 @@ stock_scrapper/processing/      Validation, indicators, relative strength
 stock_scrapper/reporting/       Phase 2 offline reporting and the daily digest
 stock_scrapper/portfolio.py     Real-holdings aggregation and hold/sell assessment
 stock_scrapper/prediction/      Experimental forward-return prediction (config, dataset, model, service)
-stock_scrapper/trading/         Advisory trade recommendations and sizing (config, recommendations)
+stock_scrapper/trading/         Advisory trade recommendations, sizing, and hindsight review (config, recommendations, review)
 scripts/                        Daily automation wrapper, toast notification (Task Scheduler entry point)
 tools/                          Clean source-archive tooling
 data/                           Local SQLite and caches; not source-controlled

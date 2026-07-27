@@ -914,6 +914,61 @@ def test_recommend_command_respects_max_trade_dollar_cap(
     assert summary["recommendations"][0]["estimated_dollars"] == 100.0
 
 
+def test_recommend_review_reports_hit_rate_against_actual_prices(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from stock_scrapper.database import create_connection, initialize_database, upsert_price_history
+
+    _install_startup(monkeypatch, tmp_path)
+    config = _config(tmp_path)
+    reports_dir = Path(config["reports_dir"])
+    reports_dir.mkdir(parents=True)
+    summary_path = reports_dir / "recommendations_2024-12-31.summary.json"
+    summary_path.write_text(
+        json.dumps({
+            "as_of_date": "2024-12-31",
+            "recommendations": [
+                {
+                    "symbol": "AAPL", "action": "BUY", "shares": 10.0, "estimated_dollars": 1000.0,
+                    "reason": "test", "model_probability": None,
+                },
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    initialize_database(config["database_path"])
+    conn = create_connection(config["database_path"])
+    try:
+        upsert_price_history(conn, _seed_price_row("SPY", "2024-12-31", 400.0))
+        upsert_price_history(conn, _seed_price_row("SPY", "2025-01-31", 408.0))  # SPY +2%
+        upsert_price_history(conn, _seed_price_row("AAPL", "2025-01-31", 110.0))  # entry 100 -> +10%
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert cli.main(
+        ["recommend-review", "--recommendation-date", "2024-12-31", "--as-of-date", "2025-01-31"]
+    ) == int(ExitCode.SUCCESS)
+
+    captured = capsys.readouterr()
+    assert "AAPL" in captured.out and "beat the benchmark" in captured.out
+    assert "BUY hit rate" in captured.out and "100%" in captured.out
+
+
+def test_recommend_review_reports_missing_data_when_no_file_exists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+
+    assert cli.main(
+        ["recommend-review", "--recommendation-date", "2024-12-31"]
+    ) == int(ExitCode.MISSING_DATA)
+
+
 def test_new_screening_symbols_excludes_tracked_and_dedupes() -> None:
     result = cli._new_screening_symbols(["aapl", "MSFT", "ZZZZ", "zzzz", "jpm"], ["AAPL", "JPM"])
     assert result == ["MSFT", "ZZZZ"]
