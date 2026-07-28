@@ -648,6 +648,24 @@ _MARKET_HERO_TEMPLATE = """\
         var startIdx = 0;
         while (startIdx < xs.length - 2 && xs[startIdx + 1] < -20 * dpr) startIdx++;
 
+        var lastI = xs.length - 1;
+        var tipY = ys[lastI];
+        // The arrowhead's angle comes from a point just under half a second
+        // back — far enough that one noisy sample can't flip it (the earlier
+        // flicker bug), but close enough that it can never meaningfully diverge
+        // from the curve actually drawn into the tip. (A longer 1.4s lookback,
+        // plus forcing the line's own geometry to bend onto that angle, is what
+        // produced the disconnected-looking "two separate pieces" artifact —
+        // the forced bend and the real data could point different directions.)
+        var lookbackTime = elapsedMs - 420;
+        var refIdx = 0;
+        for (var li = trail.length - 1; li >= 0; li--) {
+          if (trail[li].t <= lookbackTime) { refIdx = li; break; }
+        }
+        var refX = xs[refIdx], refY = ys[refIdx];
+        var targetAngle = Math.atan2(tipY - refY, tipX - refX);
+        displayAngle = ease(displayAngle, targetAngle, 320, dtMs);
+
         function tracePath() {
           ctx.beginPath();
           ctx.moveTo(xs[startIdx], ys[startIdx]);
@@ -682,21 +700,6 @@ _MARKET_HERO_TEMPLATE = """\
         tracePath();
         ctx.stroke();
 
-        var lastI = xs.length - 1;
-        var tipY = ys[lastI];
-        // The arrowhead's angle used to come from just the last two samples —
-        // one tick of noise was enough to flip it, so it flickered. Instead,
-        // look back ~1.4s for the reference point (long enough to reflect the
-        // leg's actual trend, not a single jittery step) and ease the angle
-        // itself, so the head only turns once the trend genuinely changes.
-        var lookbackTime = elapsedMs - 1400;
-        var refIdx = 0;
-        for (var li = trail.length - 1; li >= 0; li--) {
-          if (trail[li].t <= lookbackTime) { refIdx = li; break; }
-        }
-        var refX = xs[refIdx], refY = ys[refIdx];
-        var targetAngle = Math.atan2(tipY - refY, tipX - refX);
-        displayAngle = ease(displayAngle, targetAngle, 700, dtMs);
         ctx.translate(tipX, tipY);
         ctx.rotate(displayAngle);
         ctx.fillStyle = color;
