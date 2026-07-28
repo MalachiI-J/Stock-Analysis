@@ -530,14 +530,25 @@ _MARKET_HERO_TEMPLATE = """\
       // Points carry their own timestamp so x-position is a continuous function
       // of "now" (recomputed every animation frame) instead of a step that only
       // moves once per append — that discretization was the visible stutter.
-      var VISIBLE_MS = 20000, APPEND_EVERY_MS = 220, EDGE_MARGIN = 34;
+      var VISIBLE_MS = 20000, APPEND_EVERY_MS = 220;
       var dpr = window.devicePixelRatio || 1;
       var points = [];
       var value = 100;
       var startedAt = Date.now();
       var lastAppend = -Infinity;
+      var lastFrameAt = 0;
       var smoothed = null;
       var displayValue = null;
+      var displayMin = null, displayMax = null;
+
+      // Frame-rate independent easing: converges toward `target` at a fixed
+      // half-life regardless of how far apart two draw() calls land in time,
+      // so motion looks the same on a 60Hz or 144Hz display.
+      function ease(current, target, halfLifeMs, dtMs) {
+        if (current === null) return target;
+        var rate = 1 - Math.pow(0.5, dtMs / halfLifeMs);
+        return current + (target - current) * rate;
+      }
 
       function resize() {
         var rect = canvas.parentElement.getBoundingClientRect();
@@ -564,7 +575,7 @@ _MARKET_HERO_TEMPLATE = """\
         while (points.length > 2 && points[0].t < cutoff) points.shift();
       }
 
-      function draw(elapsedMs) {
+      function draw(elapsedMs, dtMs) {
         var w = canvas.width, h = canvas.height;
         ctx.clearRect(0, 0, w, h);
         if (points.length < 2) return;
@@ -572,20 +583,30 @@ _MARKET_HERO_TEMPLATE = """\
         // Ease toward the newest sample instead of snapping to it — this is what
         // keeps the tip's position (see tipX below) fixed and steady rather than
         // popping back out to the canvas edge every append.
-        displayValue = displayValue === null ? latest : displayValue + (latest - displayValue) * 0.12;
+        displayValue = ease(displayValue, latest, 260, dtMs);
 
-        var values = points.map(function (p) { return p.v; }).concat([displayValue]);
-        var min = Math.min.apply(null, values), max = Math.max.apply(null, values);
-        var pad = (max - min) * 0.18 || 6;
-        min -= pad; max += pad;
+        var rawValues = points.map(function (p) { return p.v; }).concat([displayValue]);
+        var rawMin = Math.min.apply(null, rawValues), rawMax = Math.max.apply(null, rawValues);
+        var pad = (rawMax - rawMin) * 0.18 || 6;
+        rawMin -= pad; rawMax += pad;
+        // Ease the vertical scale itself too — recomputing min/max from the raw
+        // window every frame otherwise makes the whole chart "breathe"/rescale
+        // as points slide in and out, which reads as unsteady even once the
+        // line itself is smooth.
+        displayMin = ease(displayMin, rawMin, 600, dtMs);
+        displayMax = ease(displayMax, rawMax, 600, dtMs);
+        var min = displayMin, max = displayMax;
+
         var pxPerMs = w / VISIBLE_MS;
         var bull = phaseOf(elapsedMs).bull;
         var color = bull ? "#eafff0" : "#fff0ee";
         var glow = bull ? "rgba(92,240,138,.85)" : "rgba(255,107,107,.85)";
-        // The tip is pinned to a fixed x, clear of the canvas edge (room for the
-        // arrowhead + glow) — only its y eases, so the line never touches or
-        // snaps against the border.
-        var tipX = w - EDGE_MARGIN * dpr;
+        var fillTop = bull ? "rgba(92,240,138,.22)" : "rgba(255,107,107,.22)";
+        var fillBottom = bull ? "rgba(92,240,138,0)" : "rgba(255,107,107,0)";
+        // The tip sits well clear of the canvas edge — proportional to width so
+        // the gap reads consistently at any report/window size — and only its y
+        // eases, so the line never touches or snaps against the border.
+        var tipX = w - Math.max(70 * dpr, w * 0.09);
 
         function xAt(p) { return tipX - (elapsedMs - p.t) * pxPerMs; }
         function yAt(v) { return h - ((v - min) / (max - min)) * h; }
@@ -596,6 +617,30 @@ _MARKET_HERO_TEMPLATE = """\
         var startIdx = 0;
         while (startIdx < xs.length - 2 && xs[startIdx + 1] < -20 * dpr) startIdx++;
 
+        function tracePath() {
+          ctx.beginPath();
+          ctx.moveTo(xs[startIdx], ys[startIdx]);
+          // Quadratic-through-midpoints: draws a smooth curve through the data
+          // instead of sharp straight segments between every jittery sample.
+          for (var i = startIdx + 1; i < xs.length - 1; i++) {
+            var midX = (xs[i] + xs[i + 1]) / 2, midY = (ys[i] + ys[i + 1]) / 2;
+            ctx.quadraticCurveTo(xs[i], ys[i], midX, midY);
+          }
+          ctx.lineTo(xs[xs.length - 1], ys[xs.length - 1]);
+        }
+
+        ctx.save();
+        tracePath();
+        ctx.lineTo(xs[xs.length - 1], h);
+        ctx.lineTo(xs[startIdx], h);
+        ctx.closePath();
+        var fillGrad = ctx.createLinearGradient(0, 0, 0, h);
+        fillGrad.addColorStop(0, fillTop);
+        fillGrad.addColorStop(1, fillBottom);
+        ctx.fillStyle = fillGrad;
+        ctx.fill();
+        ctx.restore();
+
         ctx.save();
         ctx.strokeStyle = color;
         ctx.shadowColor = glow;
@@ -603,15 +648,7 @@ _MARKET_HERO_TEMPLATE = """\
         ctx.lineWidth = 4 * dpr;
         ctx.lineJoin = "round";
         ctx.lineCap = "round";
-        ctx.beginPath();
-        ctx.moveTo(xs[startIdx], ys[startIdx]);
-        // Quadratic-through-midpoints: draws a smooth curve through the data
-        // instead of sharp straight segments between every jittery sample.
-        for (var i = startIdx + 1; i < xs.length - 1; i++) {
-          var midX = (xs[i] + xs[i + 1]) / 2, midY = (ys[i] + ys[i + 1]) / 2;
-          ctx.quadraticCurveTo(xs[i], ys[i], midX, midY);
-        }
-        ctx.lineTo(xs[xs.length - 1], ys[xs.length - 1]);
+        tracePath();
         ctx.stroke();
 
         var lastI = xs.length - 1, prevI = xs.length - 2;
@@ -631,11 +668,13 @@ _MARKET_HERO_TEMPLATE = """\
 
       function frame() {
         var elapsedMs = Date.now() - startedAt;
+        var dtMs = lastFrameAt ? Math.min(elapsedMs - lastFrameAt, 100) : 16.7;
+        lastFrameAt = elapsedMs;
         if (elapsedMs - lastAppend >= APPEND_EVERY_MS) {
           lastAppend = elapsedMs;
           appendPoint(elapsedMs);
         }
-        draw(elapsedMs);
+        draw(elapsedMs, dtMs);
         if (!reduceMotion) requestAnimationFrame(frame);
       }
 
