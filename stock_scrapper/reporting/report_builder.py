@@ -83,6 +83,33 @@ _HISTORY_PAYLOAD_KEYS = frozenset(
     {"history", "price_history", "historical_prices", "chart_history", "price_series", "date_series", "dates"}
 )
 
+# Status-color mapping for badges: reuses the report's fixed status palette
+# (good/warning/serious/critical/neutral) rather than inventing new colors per
+# field, so "Strong Candidate" and "Low risk" read as the same kind of good.
+_CLASSIFICATION_STATUS: dict[str, str] = {
+    "Strong Candidate": "good",
+    "Candidate": "good",
+    "Watch": "warning",
+    "Avoid": "serious",
+    "High Risk": "critical",
+    "Insufficient Data": "neutral",
+    "Data Blocked": "neutral",
+}
+_RISK_LEVEL_STATUS: dict[str, str] = {
+    "Low": "good",
+    "Moderate": "warning",
+    "Elevated": "serious",
+    "High": "critical",
+    "Unavailable": "neutral",
+}
+_REGIME_STATUS: dict[str, str] = {
+    "Risk-On": "good",
+    "Neutral": "neutral",
+    "Risk-Off": "serious",
+    "Stress": "critical",
+    "Insufficient Market Data": "neutral",
+}
+
 
 def write_phase2_reports(
     output_dir: str | Path,
@@ -292,6 +319,387 @@ def _write_phase2_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
     return path
 
 
+_REPORT_STYLES = """\
+    /* Dark is the default look (ties the page to the hero banner below);
+       a light OS preference gets the light variant instead. */
+    :root {
+      color-scheme: dark;
+      --surface:#1a1a19; --page:#0d0d0d; --ink:#ffffff; --ink-2:#c3c2b7; --muted:#898781;
+      --line:#2c2c2a; --border:rgba(255,255,255,0.12); --th-bg:#232322;
+      --page-grid-a:rgba(150,180,200,0.05); --page-grid-b:rgba(150,180,200,0.04);
+      --good-fg:#3ddc3d; --good-bg:rgba(12,163,12,0.20); --good-border:rgba(12,163,12,0.45);
+      --warning-fg:#fab219; --warning-bg:rgba(250,178,25,0.20); --warning-border:rgba(250,178,25,0.5);
+      --serious-fg:#ec835a; --serious-bg:rgba(236,131,90,0.20); --serious-border:rgba(236,131,90,0.5);
+      --critical-fg:#e66767; --critical-bg:rgba(230,103,103,0.18); --critical-border:rgba(230,103,103,0.5);
+      --neutral-fg:#c3c2b7; --neutral-bg:rgba(137,135,129,0.20); --neutral-border:rgba(137,135,129,0.4);
+      --chart-blue:#3987e5; --chart-orange:#d95926; --chart-aqua:#199e70; --chart-yellow:#eda100;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        color-scheme: light;
+        --surface:#fcfcfb; --page:#f9f9f7; --ink:#0b0b0b; --ink-2:#52514e; --muted:#898781;
+        --line:#e1e0d9; --border:rgba(11,11,11,0.10); --th-bg:#f1f0ec;
+        --page-grid-a:rgba(90,110,130,0.035); --page-grid-b:rgba(90,110,130,0.03);
+        --good-fg:#006300; --good-bg:rgba(12,163,12,0.12); --good-border:rgba(12,163,12,0.35);
+        --warning-fg:#7a4d00; --warning-bg:rgba(250,178,25,0.18); --warning-border:rgba(250,178,25,0.45);
+        --serious-fg:#8a3216; --serious-bg:rgba(236,131,90,0.18); --serious-border:rgba(236,131,90,0.45);
+        --critical-fg:#d03b3b; --critical-bg:rgba(208,59,59,0.12); --critical-border:rgba(208,59,59,0.35);
+        --neutral-fg:#52514e; --neutral-bg:rgba(137,135,129,0.16); --neutral-border:rgba(137,135,129,0.30);
+        --chart-blue:#2a78d6; --chart-orange:#eb6834; --chart-aqua:#1baf7a; --chart-yellow:#c98500;
+      }
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink);
+      font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;
+      background-color:var(--page);
+      background-image:
+        repeating-linear-gradient(0deg, var(--page-grid-a) 0 1px, transparent 1px 44px),
+        repeating-linear-gradient(100deg, var(--page-grid-b) 0 1px, transparent 1px 76px);
+      background-attachment:fixed; }
+    .page { max-width:1200px; margin:0 auto; padding:8px 24px 48px; }
+    h1,h2,h3,h4 { line-height:1.25; font-weight:600; }
+    h1 { font-size:1.7rem; margin-bottom:2px; }
+    .subtitle { color:var(--ink-2); margin-top:0; margin-bottom:18px; font-size:14px; }
+    h2 { border-bottom:1px solid var(--line); padding-bottom:8px; margin-top:40px; }
+    h4 { margin-bottom:6px; }
+    table { width:100%; border-collapse:collapse; margin:12px 0 22px; }
+    th,td { border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; }
+    th { background:var(--th-bg); color:var(--ink-2); font-weight:600; } .metadata th { width:210px; }
+    .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px 18px; margin:14px 0 22px; }
+    .notice { padding:14px 16px; border:1px solid var(--border); border-left:3px solid var(--muted);
+      background:var(--surface); color:var(--ink-2); border-radius:8px; margin:18px 0; }
+    .regime-head { display:flex; align-items:center; gap:12px; }
+    .regime-confidence { color:var(--ink-2); font-size:13px; }
+    .badge { display:inline-flex; align-items:center; gap:5px; padding:3px 11px; border-radius:999px;
+      font-size:13px; font-weight:600; border:1px solid transparent; white-space:nowrap; }
+    .badge-good { color:var(--good-fg); background:var(--good-bg); border-color:var(--good-border); }
+    .badge-warning { color:var(--warning-fg); background:var(--warning-bg); border-color:var(--warning-border); }
+    .badge-serious { color:var(--serious-fg); background:var(--serious-bg); border-color:var(--serious-border); }
+    .badge-critical { color:var(--critical-fg); background:var(--critical-bg); border-color:var(--critical-border); }
+    .badge-neutral { color:var(--neutral-fg); background:var(--neutral-bg); border-color:var(--neutral-border); }
+    .stock { border:1px solid var(--border); background:var(--surface); border-radius:10px; padding:20px; margin:20px 0; }
+    .stock-head { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
+    .stock-head h3 { margin:0; }
+    .scores { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:14px 0; }
+    .stat { background:var(--page); border:1px solid var(--border); border-radius:8px; padding:12px 14px; }
+    .stat .stat-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+    .stat .stat-value { font-size:1.5rem; font-weight:600; margin-top:3px; }
+    .stat .stat-sub { margin-top:5px; }
+    .chart-wrap { overflow-x:auto; }
+    .price-chart { width:100%; min-width:660px; height:auto; background:var(--surface); }
+    .legend { font-size:12px; } .muted { color:var(--muted); }
+    .lists { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:14px; }
+    .lists section { background:var(--page); border:1px solid var(--border); border-radius:8px; padding:10px 14px; }
+    ul { margin-top:6px; } code { overflow-wrap:anywhere; }
+    details.raw { margin:14px 0 0; border:1px solid var(--border); border-radius:8px; background:var(--page); }
+    details.raw > summary { cursor:pointer; padding:10px 14px; font-weight:600; color:var(--ink-2);
+      list-style:none; user-select:none; }
+    details.raw > summary::-webkit-details-marker { display:none; }
+    details.raw > summary::before { content:"▸ "; }
+    details.raw[open] > summary::before { content:"▾ "; }
+    details.raw .raw-body { padding:0 14px 14px; }
+    details.raw table { margin:8px 0 14px; }
+
+    /* Animated hero banner (decorative only; aria-hidden). Everything runs off one
+       shared 60s timeline: a bull dwell (0-25s), a 5s falling transition that carries
+       the numbers through zero into negative (25-30s), a bear dwell (30-55s), and a
+       5s rising transition back through zero (55-60s) — so the mood change is a
+       story, not a hard cut. Independently, the trend line "draws" toward its own
+       arrowhead every 1.6s (motion concentrated at the tip, never the whole shape
+       moving), and the bars/grid keep a fast ambient pulse/drift underneath it all. */
+    .market-hero { position:relative; overflow:hidden; height:240px;
+      background:radial-gradient(120% 130% at 15% 10%, #0d1613 0%, #060907 55%, #020302 100%);
+      border-bottom:1px solid rgba(255,255,255,0.06); }
+    .market-hero .grid { position:absolute; inset:0;
+      background-image:
+        repeating-linear-gradient(0deg, rgba(150,180,200,0.16) 0 1px, transparent 1px 40px),
+        repeating-linear-gradient(100deg, rgba(150,180,200,0.14) 0 1px, transparent 1px 70px);
+      -webkit-mask-image:linear-gradient(to bottom, black, transparent 82%);
+      mask-image:linear-gradient(to bottom, black, transparent 82%);
+      animation:hero-grid-drift 26s linear infinite; }
+    @keyframes hero-grid-drift { 0% { background-position:0 0, 0 0; } 100% { background-position:0 160px, 140px 0; } }
+    .market-hero .bars-layer { position:absolute; inset:0; display:flex; align-items:flex-end;
+      gap:12px; padding:0 26px 26px 26px; }
+    .market-hero .bar { flex:0 0 20px; width:20px; border-radius:3px 3px 0 0; transform-origin:bottom;
+      animation-name:hero-bar-pulse; animation-duration:4.2s; animation-timing-function:ease-in-out;
+      animation-iteration-count:infinite; }
+    .market-hero .bars-layer.bull .bar { background:linear-gradient(to top, rgba(20,90,40,0) 0%, rgba(46,222,110,.65) 100%);
+      box-shadow:0 0 16px rgba(46,222,110,.35); }
+    .market-hero .bars-layer.bear .bar { background:linear-gradient(to top, rgba(90,20,20,0) 0%, rgba(230,70,70,.65) 100%);
+      box-shadow:0 0 16px rgba(230,70,70,.35); }
+    @keyframes hero-bar-pulse { 0%,100% { transform:scaleY(1); } 50% { transform:scaleY(1.12); } }
+    /* The trend line is the one genuinely procedural piece (see hero script below):
+       a real, continuously-extending random-walk series drawn to a canvas, not a
+       fixed shape looping through CSS states — that's what an actually-evolving
+       line needs, and CSS keyframes fundamentally can't express it. */
+    .market-hero .trend-canvas { position:absolute; inset:0; width:100%; height:100%; }
+    .market-hero .bars-layer.bull { animation:hero-bull-cycle 60s ease-in-out infinite; }
+    .market-hero .bars-layer.bear { animation:hero-bear-cycle 60s ease-in-out infinite; }
+    @keyframes hero-bull-cycle { 0%,41.667% { opacity:1; } 50%,91.667% { opacity:0; } 100% { opacity:1; } }
+    @keyframes hero-bear-cycle { 0%,41.667% { opacity:0; } 50%,91.667% { opacity:1; } 100% { opacity:0; } }
+
+    /* Ticker numbers: one continuous 60s story per position (no bull/bear opacity
+       crossfade needed here) — a rising dwell, a 5s plunge through zero, a falling
+       dwell, and a 5s recovery through zero, on repeat. Color follows the sign of
+       the value actually shown; the arrow follows the local direction of travel.
+       step-end timing is essential: with linear timing two stacked frames briefly
+       overlap mid-fade, and two overlapping TEXT strings read as garbled double
+       digits, not a clean blend — step-end makes every frame change an instant,
+       non-overlapping swap instead. */
+    .market-hero .ticker-pos { position:absolute; }
+    .market-hero .tick { position:absolute; left:0; top:0; font:600 15px/1 ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+      letter-spacing:.02em; white-space:nowrap; opacity:0;
+      animation-duration:60s; animation-timing-function:step-end; animation-iteration-count:infinite; }
+    .market-hero .tick.tick-pos { color:#5CF08A; text-shadow:0 0 10px rgba(92,240,138,.75); }
+    .market-hero .tick.tick-neg { color:#FF6B6B; text-shadow:0 0 10px rgba(255,107,107,.75); }
+    .market-hero .tick-1 { animation-name:hero-tick-1; } .market-hero .tick-2 { animation-name:hero-tick-2; }
+    .market-hero .tick-3 { animation-name:hero-tick-3; } .market-hero .tick-4 { animation-name:hero-tick-4; }
+    .market-hero .tick-5 { animation-name:hero-tick-5; } .market-hero .tick-6 { animation-name:hero-tick-6; }
+    .market-hero .tick-7 { animation-name:hero-tick-7; } .market-hero .tick-8 { animation-name:hero-tick-8; }
+    .market-hero .tick-9 { animation-name:hero-tick-9; } .market-hero .tick-10 { animation-name:hero-tick-10; }
+    .market-hero .tick-11 { animation-name:hero-tick-11; } .market-hero .tick-12 { animation-name:hero-tick-12; }
+    .market-hero .tick-13 { animation-name:hero-tick-13; } .market-hero .tick-14 { animation-name:hero-tick-14; }
+    .market-hero .tick-15 { animation-name:hero-tick-15; } .market-hero .tick-16 { animation-name:hero-tick-16; }
+    @keyframes hero-tick-1  { 0% { opacity:1; } 10.417% { opacity:0; } }
+    @keyframes hero-tick-2  { 0% { opacity:0; } 10.417% { opacity:1; } 20.833% { opacity:0; } }
+    @keyframes hero-tick-3  { 0% { opacity:0; } 20.833% { opacity:1; } 31.25% { opacity:0; } }
+    @keyframes hero-tick-4  { 0% { opacity:0; } 31.25% { opacity:1; } 41.667% { opacity:0; } }
+    @keyframes hero-tick-5  { 0% { opacity:0; } 41.667% { opacity:1; } 43.75% { opacity:0; } }
+    @keyframes hero-tick-6  { 0% { opacity:0; } 43.75% { opacity:1; } 45.833% { opacity:0; } }
+    @keyframes hero-tick-7  { 0% { opacity:0; } 45.833% { opacity:1; } 47.917% { opacity:0; } }
+    @keyframes hero-tick-8  { 0% { opacity:0; } 47.917% { opacity:1; } 50% { opacity:0; } }
+    @keyframes hero-tick-9  { 0% { opacity:0; } 50% { opacity:1; } 60.417% { opacity:0; } }
+    @keyframes hero-tick-10 { 0% { opacity:0; } 60.417% { opacity:1; } 70.833% { opacity:0; } }
+    @keyframes hero-tick-11 { 0% { opacity:0; } 70.833% { opacity:1; } 81.25% { opacity:0; } }
+    @keyframes hero-tick-12 { 0% { opacity:0; } 81.25% { opacity:1; } 91.667% { opacity:0; } }
+    @keyframes hero-tick-13 { 0% { opacity:0; } 91.667% { opacity:1; } 93.75% { opacity:0; } }
+    @keyframes hero-tick-14 { 0% { opacity:0; } 93.75% { opacity:1; } 95.833% { opacity:0; } }
+    @keyframes hero-tick-15 { 0% { opacity:0; } 95.833% { opacity:1; } 97.917% { opacity:0; } }
+    @keyframes hero-tick-16 { 0% { opacity:0; } 97.917% { opacity:1; } }
+    @media (prefers-reduced-motion: reduce) {
+      .market-hero .grid, .market-hero .bar, .market-hero .tick { animation:none; }
+      .market-hero .bars-layer.bull { animation:none; opacity:1; }
+      .market-hero .bars-layer.bear { animation:none; opacity:0; }
+      .market-hero .tick-4 { opacity:1; }
+    }
+    /* The hero script itself checks prefers-reduced-motion and stops redrawing
+       after one frame — this covers only the CSS-driven bars/grid/tickers. */
+    @media print { .market-hero { display:none; } }
+"""
+
+_MARKET_HERO_TEMPLATE = """\
+  <div class="market-hero" aria-hidden="true">
+    <div class="grid"></div>
+    <div class="bars-layer bull">
+      <div class="bar" style="height:34px; animation-delay:0.0s"></div><div class="bar" style="height:58px; animation-delay:.3s"></div>
+      <div class="bar" style="height:44px; animation-delay:.6s"></div><div class="bar" style="height:72px; animation-delay:.9s"></div>
+      <div class="bar" style="height:52px; animation-delay:1.2s"></div><div class="bar" style="height:90px; animation-delay:1.5s"></div>
+      <div class="bar" style="height:68px; animation-delay:1.8s"></div><div class="bar" style="height:106px; animation-delay:2.1s"></div>
+      <div class="bar" style="height:82px; animation-delay:2.4s"></div><div class="bar" style="height:122px; animation-delay:2.7s"></div>
+      <div class="bar" style="height:96px; animation-delay:3.0s"></div><div class="bar" style="height:138px; animation-delay:3.3s"></div>
+      <div class="bar" style="height:110px; animation-delay:3.6s"></div><div class="bar" style="height:152px; animation-delay:3.9s"></div>
+      <div class="bar" style="height:124px; animation-delay:4.2s"></div><div class="bar" style="height:166px; animation-delay:4.5s"></div>
+    </div>
+    <div class="bars-layer bear">
+      <div class="bar" style="height:34px; animation-delay:0.0s"></div><div class="bar" style="height:58px; animation-delay:.3s"></div>
+      <div class="bar" style="height:44px; animation-delay:.6s"></div><div class="bar" style="height:72px; animation-delay:.9s"></div>
+      <div class="bar" style="height:52px; animation-delay:1.2s"></div><div class="bar" style="height:90px; animation-delay:1.5s"></div>
+      <div class="bar" style="height:68px; animation-delay:1.8s"></div><div class="bar" style="height:106px; animation-delay:2.1s"></div>
+      <div class="bar" style="height:82px; animation-delay:2.4s"></div><div class="bar" style="height:122px; animation-delay:2.7s"></div>
+      <div class="bar" style="height:96px; animation-delay:3.0s"></div><div class="bar" style="height:138px; animation-delay:3.3s"></div>
+      <div class="bar" style="height:110px; animation-delay:3.6s"></div><div class="bar" style="height:152px; animation-delay:3.9s"></div>
+      <div class="bar" style="height:124px; animation-delay:4.2s"></div><div class="bar" style="height:166px; animation-delay:4.5s"></div>
+    </div>
+    <canvas class="trend-canvas" aria-hidden="true"></canvas>
+{ticker_html}  </div>
+  <script>
+  // Decorative only: draws a genuinely evolving random-walk line onto the hero
+  // canvas above. Nothing here reads or touches report data — this is the only
+  // scripted element anywhere in the document. Silently no-ops if canvas isn't
+  // supported, and stops redrawing (leaving one static
+  // frame) when the visitor prefers reduced motion.
+  (function () {
+    try {
+      var canvas = document.querySelector(".market-hero .trend-canvas");
+      if (!canvas || !canvas.getContext) return;
+      var ctx = canvas.getContext("2d");
+      var reduceMotion = window.matchMedia &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+      var CYCLE_MS = 60000, BULL_MS = 25000, TRANSITION_MS = 5000;
+      // Points carry their own timestamp so x-position is a continuous function
+      // of "now" (recomputed every animation frame) instead of a step that only
+      // moves once per append — that discretization was the visible stutter.
+      var VISIBLE_MS = 20000, APPEND_EVERY_MS = 220, EDGE_MARGIN = 34;
+      var dpr = window.devicePixelRatio || 1;
+      var points = [];
+      var value = 100;
+      var startedAt = Date.now();
+      var lastAppend = -Infinity;
+      var smoothed = null;
+      var displayValue = null;
+
+      function resize() {
+        var rect = canvas.parentElement.getBoundingClientRect();
+        canvas.width = Math.max(1, Math.round(rect.width * dpr));
+        canvas.height = Math.max(1, Math.round(rect.height * dpr));
+      }
+
+      function phaseOf(elapsedMs) {
+        var t = elapsedMs % CYCLE_MS;
+        if (t < BULL_MS) return { drift: 0.55, bull: true };
+        if (t < BULL_MS + TRANSITION_MS) return { drift: -3.2, bull: t < BULL_MS + TRANSITION_MS / 2 };
+        if (t < BULL_MS + TRANSITION_MS + BULL_MS) return { drift: -0.55, bull: false };
+        return { drift: 3.2, bull: t > CYCLE_MS - TRANSITION_MS / 2 };
+      }
+
+      function appendPoint(elapsedMs) {
+        var phase = phaseOf(elapsedMs);
+        value += phase.drift + (Math.random() - 0.5) * 2.2;
+        // Light exponential smoothing so consecutive points don't zigzag —
+        // the drift/phase story still comes through, just without noise spikes.
+        smoothed = smoothed === null ? value : smoothed * 0.7 + value * 0.3;
+        points.push({ t: elapsedMs, v: smoothed });
+        var cutoff = elapsedMs - VISIBLE_MS - APPEND_EVERY_MS * 2;
+        while (points.length > 2 && points[0].t < cutoff) points.shift();
+      }
+
+      function draw(elapsedMs) {
+        var w = canvas.width, h = canvas.height;
+        ctx.clearRect(0, 0, w, h);
+        if (points.length < 2) return;
+        var latest = points[points.length - 1].v;
+        // Ease toward the newest sample instead of snapping to it — this is what
+        // keeps the tip's position (see tipX below) fixed and steady rather than
+        // popping back out to the canvas edge every append.
+        displayValue = displayValue === null ? latest : displayValue + (latest - displayValue) * 0.12;
+
+        var values = points.map(function (p) { return p.v; }).concat([displayValue]);
+        var min = Math.min.apply(null, values), max = Math.max.apply(null, values);
+        var pad = (max - min) * 0.18 || 6;
+        min -= pad; max += pad;
+        var pxPerMs = w / VISIBLE_MS;
+        var bull = phaseOf(elapsedMs).bull;
+        var color = bull ? "#eafff0" : "#fff0ee";
+        var glow = bull ? "rgba(92,240,138,.85)" : "rgba(255,107,107,.85)";
+        // The tip is pinned to a fixed x, clear of the canvas edge (room for the
+        // arrowhead + glow) — only its y eases, so the line never touches or
+        // snaps against the border.
+        var tipX = w - EDGE_MARGIN * dpr;
+
+        function xAt(p) { return tipX - (elapsedMs - p.t) * pxPerMs; }
+        function yAt(v) { return h - ((v - min) / (max - min)) * h; }
+
+        var history = points.slice(0, points.length - 1);
+        var xs = history.map(xAt).concat([tipX]);
+        var ys = history.map(function (p) { return yAt(p.v); }).concat([yAt(displayValue)]);
+        var startIdx = 0;
+        while (startIdx < xs.length - 2 && xs[startIdx + 1] < -20 * dpr) startIdx++;
+
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.shadowColor = glow;
+        ctx.shadowBlur = 10 * dpr;
+        ctx.lineWidth = 4 * dpr;
+        ctx.lineJoin = "round";
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(xs[startIdx], ys[startIdx]);
+        // Quadratic-through-midpoints: draws a smooth curve through the data
+        // instead of sharp straight segments between every jittery sample.
+        for (var i = startIdx + 1; i < xs.length - 1; i++) {
+          var midX = (xs[i] + xs[i + 1]) / 2, midY = (ys[i] + ys[i + 1]) / 2;
+          ctx.quadraticCurveTo(xs[i], ys[i], midX, midY);
+        }
+        ctx.lineTo(xs[xs.length - 1], ys[xs.length - 1]);
+        ctx.stroke();
+
+        var lastI = xs.length - 1, prevI = xs.length - 2;
+        var tipY = ys[lastI];
+        var angle = Math.atan2(tipY - ys[prevI], tipX - xs[prevI]);
+        ctx.translate(tipX, tipY);
+        ctx.rotate(angle);
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(14 * dpr, 0);
+        ctx.lineTo(-8 * dpr, -7 * dpr);
+        ctx.lineTo(-8 * dpr, 7 * dpr);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
+
+      function frame() {
+        var elapsedMs = Date.now() - startedAt;
+        if (elapsedMs - lastAppend >= APPEND_EVERY_MS) {
+          lastAppend = elapsedMs;
+          appendPoint(elapsedMs);
+        }
+        draw(elapsedMs);
+        if (!reduceMotion) requestAnimationFrame(frame);
+      }
+
+      resize();
+      window.addEventListener("resize", resize);
+      for (var seed = -Math.ceil(VISIBLE_MS / APPEND_EVERY_MS); seed <= 0; seed++) {
+        appendPoint(seed * APPEND_EVERY_MS);
+      }
+      lastAppend = 0;
+      requestAnimationFrame(frame);
+    } catch (err) {
+      // Decorative animation only; never let it disrupt the report itself.
+    }
+  })();
+  </script>
+"""
+
+# Each ticker position plays the same 16-frame, 60s story (see hero-tick-1..16
+# above): a rising dwell (frames 1-4), a shared 5s plunge through zero (5-8), a
+# falling/more-negative dwell (9-12), and a shared 5s recovery through zero
+# (13-16) — only the dwell values differ per position; the plunge/recovery
+# numbers are intentionally identical everywhere; one synchronized market-wide
+# swing reads more cohesive than six unrelated ones.
+_HERO_CRASH_FRAMES: tuple[tuple[float, str, str], ...] = (
+    (75.0, "pos", "down"), (30.0, "pos", "down"), (-15.0, "neg", "down"), (-90.0, "neg", "down"),
+)
+_HERO_RECOVERY_FRAMES: tuple[tuple[float, str, str], ...] = (
+    (-75.0, "neg", "up"), (-30.0, "neg", "up"), (15.0, "pos", "up"), (90.0, "pos", "up"),
+)
+_HERO_TICKER_POSITIONS: tuple[tuple[str, str, float], ...] = (
+    ("6%", "30px", 109.25),
+    ("2%", "96px", 77.61),
+    ("38%", "18px", 104.46),
+    ("33%", "132px", 104.61),
+    ("68%", "70px", 127.83),
+    ("85%", "112px", 142.10),
+)
+
+
+def _hero_tick_span(frame_index: int, value: float, sign: str, direction: str) -> str:
+    arrow = "&#9650;" if direction == "up" else "&#9660;"
+    return f'<span class="tick tick-{frame_index} tick-{sign}">{value:.2f} {arrow}</span>'
+
+
+def _hero_ticker_pos_html(left: str, top: str, base: float) -> str:
+    dwell_bull = tuple((base - offset, "pos", "up") for offset in (6.0, 4.0, 2.0, 0.0))
+    dwell_bear = tuple((-(base - offset), "neg", "down") for offset in (6.0, 4.0, 2.0, 0.0))
+    frames = dwell_bull + _HERO_CRASH_FRAMES + dwell_bear + _HERO_RECOVERY_FRAMES
+    spans = "".join(
+        _hero_tick_span(index, value, sign, direction)
+        for index, (value, sign, direction) in enumerate(frames, start=1)
+    )
+    return f'    <span class="ticker-pos" style="left:{left}; top:{top};">{spans}</span>\n'
+
+
+def _market_hero_html() -> str:
+    ticker_html = "".join(
+        _hero_ticker_pos_html(left, top, base) for left, top, base in _HERO_TICKER_POSITIONS
+    )
+    # A plain string replace, not str.format(): the template's inline <script>
+    # is full of literal JS braces that str.format() would misparse as fields.
+    return _MARKET_HERO_TEMPLATE.replace("{ticker_html}", ticker_html)
+
+
 def _render_phase2_html(
     report_date: str,
     metadata: dict[str, Any],
@@ -323,6 +731,7 @@ def _render_phase2_html(
     detail_html = "".join(_result_section(entry) for entry in entries)
     changes_html = _changes_table(entries)
     quality_html = _quality_table(quality_issues)
+    regime_badge = _badge(metadata.get("market_regime"), _REGIME_STATUS)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -331,32 +740,19 @@ def _render_phase2_html(
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Stock Scrapper Phase 2 Report — {_escape(report_date)}</title>
   <style>
-    :root {{ color-scheme: light; --ink:#172033; --muted:#5f6b7a; --line:#d6dce5; --panel:#f7f9fc; }}
-    body {{ max-width:1200px; margin:0 auto; padding:24px; color:var(--ink); font:15px/1.5 Arial,sans-serif; }}
-    h1,h2,h3,h4 {{ line-height:1.2; }} h2 {{ border-bottom:2px solid var(--line); padding-bottom:6px; margin-top:34px; }}
-    table {{ width:100%; border-collapse:collapse; margin:12px 0 22px; }}
-    th,td {{ border:1px solid var(--line); padding:7px 9px; text-align:left; vertical-align:top; }}
-    th {{ background:#eef2f7; }} .metadata th {{ width:210px; }}
-    .notice {{ padding:12px 14px; border-left:5px solid #b45309; background:#fff7ed; margin:18px 0; }}
-    .regime {{ padding:14px; background:#eef6ff; border:1px solid #bfdbfe; }}
-    .stock {{ border:1px solid var(--line); border-radius:8px; padding:18px; margin:20px 0; }}
-    .scores {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:12px 0; }}
-    .score {{ background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px; }}
-    .score strong {{ display:block; font-size:1.3rem; }}
-    .chart-wrap {{ overflow-x:auto; }} .price-chart {{ width:100%; min-width:660px; height:auto; background:white; }}
-    .legend {{ font-size:12px; }} .muted {{ color:var(--muted); }}
-    .lists {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:14px; }}
-    .lists section {{ background:var(--panel); padding:10px 14px; }} ul {{ margin-top:6px; }}
-    code {{ overflow-wrap:anywhere; }}
+{_REPORT_STYLES}
   </style>
 </head>
 <body>
+{_market_hero_html()}
+  <div class="page">
   <h1>Stock Scrapper Phase 2 Research Report</h1>
+  <p class="subtitle">As of {_escape(report_date)} &nbsp;·&nbsp; {_display(metadata.get('data_through_date'))}</p>
   <div class="notice"><strong>Research disclaimer:</strong> Educational research only; not personalized financial advice. Scores and classifications do not guarantee investment performance.</div>
   <h2>Run Metadata</h2>
-  <table class="metadata"><tbody>{metadata_html}</tbody></table>
+  <div class="card"><table class="metadata"><tbody>{metadata_html}</tbody></table></div>
   <h2>Market Regime</h2>
-  <div class="regime"><strong>{_display(metadata.get('market_regime'))}</strong> — confidence {_score(metadata.get('market_regime_confidence'))}<h3>Market-regime reasons</h3>{regime_reasons}</div>
+  <div class="card regime"><div class="regime-head">{regime_badge}<span class="regime-confidence">confidence {_score(metadata.get('market_regime_confidence'))}</span></div><h4>Market-regime reasons</h4>{regime_reasons}</div>
   <h2>Candidate Ranking</h2>
   {candidate_html}
   <h2>Highest-Risk Ranking</h2>
@@ -372,6 +768,7 @@ def _render_phase2_html(
   <p>Charts use adjusted closing prices supplied to the report and trailing, non-centered 20-, 50-, and 200-session simple moving averages. Rows later than the report/as-of date are excluded from charts. Candidate ranking uses higher opportunity, then higher confidence, lower risk, and symbol as a deterministic tie-breaker. Highest-risk ranking is descending by measured risk.</p>
   <h2>Research Disclaimer</h2>
   <p>This software is for educational and research use only. It does not provide personalized financial advice or recommend trades. Historical analysis does not guarantee future performance. Free market data may be delayed, revised, incomplete, or affected by survivorship and static-watchlist bias.</p>
+  </div>
 </body>
 </html>
 """
@@ -390,7 +787,7 @@ def _ranking_table(
         rows.append(
             "<tr>"
             f"<td>{ranks.get(symbol, '')}</td><td>{_escape(symbol)}</td>"
-            f"<td>{_display(result.get('classification'))}</td>"
+            f"<td>{_badge(result.get('classification'), _CLASSIFICATION_STATUS)}</td>"
             f"<td>{_score(result.get('opportunity_score'))}</td>"
             f"<td>{_score(result.get('risk_score'))}</td>"
             f"<td>{_score(result.get('confidence_score'))}</td></tr>"
@@ -426,15 +823,25 @@ def _result_section(entry: dict[str, Any]) -> str:
         f"<section><h4>{_escape(title)}</h4>{_render_list(values, 'None recorded.')}</section>"
         for title, values in lists
     )
+    classification_badge = _badge(result.get("classification"), _CLASSIFICATION_STATUS)
+    risk_level_badge = _badge(result.get("risk_level"), _RISK_LEVEL_STATUS)
     return f"""<article class="stock">
-<h3>{_escape(symbol)} — {_display(result.get('classification'))}</h3>
+<div class="stock-head"><h3>{_escape(symbol)}</h3>{classification_badge}</div>
 <p><strong>Primary reason:</strong> {_display(result.get('primary_reason'))}<br />
 <strong>Data through:</strong> {_display(result.get('data_through_date'))} &nbsp; <strong>Trend state:</strong> {_display(result.get('trend_state'))}</p>
-<div class="scores"><div class="score">Opportunity<strong>{_score(result.get('opportunity_score'))}</strong></div><div class="score">Measured risk<strong>{_score(result.get('risk_score'))}</strong><span>{_display(result.get('risk_level'))}</span></div><div class="score">Confidence<strong>{_score(result.get('confidence_score'))}</strong></div><div class="score">Candidate rank<strong>{_display(entry.get('candidate_rank'))}</strong></div><div class="score">Risk rank<strong>{_display(entry.get('risk_rank'))}</strong></div></div>
+<div class="scores">
+<div class="stat"><div class="stat-label">Opportunity</div><div class="stat-value">{_score(result.get('opportunity_score'))}</div></div>
+<div class="stat"><div class="stat-label">Measured risk</div><div class="stat-value">{_score(result.get('risk_score'))}</div><div class="stat-sub">{risk_level_badge}</div></div>
+<div class="stat"><div class="stat-label">Confidence</div><div class="stat-value">{_score(result.get('confidence_score'))}</div></div>
+<div class="stat"><div class="stat-label">Candidate rank</div><div class="stat-value">{_display(entry.get('candidate_rank'))}</div></div>
+<div class="stat"><div class="stat-label">Risk rank</div><div class="stat-value">{_display(entry.get('risk_rank'))}</div></div>
+</div>
 <h4>Adjusted Price and Moving Averages</h4>{chart}
 <div class="lists">{list_html}</div>
 <h4>Changes from previous stored analysis</h4><p>{_display(entry['change'].get('summary'))}</p>
+<details class="raw"><summary>Raw scoring data (components &amp; indicators)</summary><div class="raw-body">
 {component_html}
+</div></details>
 </article>"""
 
 
@@ -510,10 +917,10 @@ def _price_chart_svg(symbol: str, history: list[dict[str, Any]], cutoff: str | N
         return top + (maximum - value) * plot_height / (maximum - minimum)
 
     colors = {
-        "adjusted-price": "#1d4ed8",
-        "sma-20": "#d97706",
-        "sma-50": "#15803d",
-        "sma-200": "#7e22ce",
+        "adjusted-price": "var(--chart-blue)",
+        "sma-20": "var(--chart-orange)",
+        "sma-50": "var(--chart-aqua)",
+        "sma-200": "var(--chart-yellow)",
     }
     labels = {"adjusted-price": "Adjusted price", "sma-20": "SMA20", "sma-50": "SMA50", "sma-200": "SMA200"}
     grid = []
@@ -521,7 +928,7 @@ def _price_chart_svg(symbol: str, history: list[dict[str, Any]], cutoff: str | N
         fraction = tick / 4
         y = top + fraction * plot_height
         value = maximum - fraction * (maximum - minimum)
-        grid.append(f'<line x1="{left:.1f}" y1="{y:.1f}" x2="{width-right:.1f}" y2="{y:.1f}" stroke="#e5e7eb"/><text x="{left-7:.1f}" y="{y+4:.1f}" text-anchor="end" font-size="11" fill="#4b5563">{value:.2f}</text>')
+        grid.append(f'<line x1="{left:.1f}" y1="{y:.1f}" x2="{width-right:.1f}" y2="{y:.1f}" stroke="var(--line)"/><text x="{left-7:.1f}" y="{y+4:.1f}" text-anchor="end" font-size="11" fill="var(--ink-2)">{value:.2f}</text>')
 
     paths = []
     for name, values in series.items():
@@ -536,11 +943,11 @@ def _price_chart_svg(symbol: str, history: list[dict[str, Any]], cutoff: str | N
     legend = []
     for index, name in enumerate(series):
         x = left + index * 150
-        legend.append(f'<line x1="{x:.1f}" y1="{height-12:.1f}" x2="{x+22:.1f}" y2="{height-12:.1f}" stroke="{colors[name]}" stroke-width="3"/><text class="legend" x="{x+28:.1f}" y="{height-8:.1f}" fill="#374151">{labels[name]}</text>')
+        legend.append(f'<line x1="{x:.1f}" y1="{height-12:.1f}" x2="{x+22:.1f}" y2="{height-12:.1f}" stroke="{colors[name]}" stroke-width="3"/><text class="legend" x="{x+28:.1f}" y="{height-8:.1f}" fill="var(--ink-2)">{labels[name]}</text>')
 
     safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "-", symbol).strip("-") or "symbol"
     first_date, last_date = points[0][0], points[-1][0]
-    return f'''<div class="chart-wrap"><svg class="price-chart" viewBox="0 0 {int(width)} {int(height)}" role="img" aria-labelledby="chart-{_escape(safe_id)}-title"><title id="chart-{_escape(safe_id)}-title">{_escape(symbol)} adjusted price with 20-, 50-, and 200-session moving averages</title><rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" fill="#fff" stroke="#d1d5db"/>{''.join(grid)}{''.join(paths)}<text x="{left:.1f}" y="{height-bottom+18:.1f}" font-size="11">{_escape(first_date)}</text><text x="{width-right:.1f}" y="{height-bottom+18:.1f}" text-anchor="end" font-size="11">{_escape(last_date)}</text>{''.join(legend)}</svg></div>'''
+    return f'''<div class="chart-wrap"><svg class="price-chart" viewBox="0 0 {int(width)} {int(height)}" role="img" aria-labelledby="chart-{_escape(safe_id)}-title"><title id="chart-{_escape(safe_id)}-title">{_escape(symbol)} adjusted price with 20-, 50-, and 200-session moving averages</title><rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" fill="var(--surface)" stroke="var(--border)"/>{''.join(grid)}{''.join(paths)}<text x="{left:.1f}" y="{height-bottom+18:.1f}" font-size="11" fill="var(--ink-2)">{_escape(first_date)}</text><text x="{width-right:.1f}" y="{height-bottom+18:.1f}" text-anchor="end" font-size="11" fill="var(--ink-2)">{_escape(last_date)}</text>{''.join(legend)}</svg></div>'''
 
 
 def _chart_points(history: list[dict[str, Any]], cutoff: str | None) -> list[tuple[str, float | None]]:
@@ -834,6 +1241,14 @@ def _display(value: Any) -> str:
 def _score(value: Any) -> str:
     number = _finite_number(value)
     return '<span class="muted">Unavailable</span>' if number is None else f"{number:.2f}"
+
+
+def _badge(value: Any, status_map: Mapping[str, str]) -> str:
+    """A status pill: text label plus a color, never color alone (icon+label rule)."""
+    text = "" if value is None else str(value)
+    status = status_map.get(text, "neutral")
+    label = text or "Unavailable"
+    return f'<span class="badge badge-{status}">{_escape(label)}</span>'
 
 
 def _score_change(value: Any) -> str:

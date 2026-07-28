@@ -211,7 +211,14 @@ def test_phase2_report_contains_complete_offline_research_content(tmp_path: Path
     for series in ("adjusted-price", "sma-20", "sma-50", "sma-200"):
         assert f'data-series="{series}"' in content
     assert "<svg" in content
-    assert "<script" not in content.lower()
+    # The only allowed <script> is the decorative, data-free hero animation;
+    # everything outside the market-hero banner must still have none at all.
+    hero_start = content.index('<div class="market-hero"')
+    hero_end = content.index('<div class="page">')
+    assert content.lower().count("<script") == 1
+    assert "<script" in content[hero_start:hero_end].lower()
+    assert "<script" not in content[:hero_start].lower()
+    assert "<script" not in content[hero_end:].lower()
     assert "http://" not in content.lower()
     assert "https://" not in content.lower()
     assert "Reviewed &lt;adjusted close&gt;" in content
