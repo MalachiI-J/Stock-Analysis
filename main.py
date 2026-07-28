@@ -6,6 +6,7 @@ import argparse
 import json
 import sqlite3
 import sys
+from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -16,6 +17,7 @@ import yaml
 
 from stock_scrapper.analysis.repository import results_from_saved_run
 from stock_scrapper.analysis.scoring_config import validate_scoring_config
+from stock_scrapper.analysis.signal_validation import render_signal_validation_text, validate_signals
 from stock_scrapper.analysis.service import AnalysisBatch, AnalysisService
 from stock_scrapper.backtesting.config import BacktestConfig, load_backtesting_config
 from stock_scrapper.backtesting.engine import PortfolioBacktestResult, run_portfolio_backtest
@@ -289,6 +291,19 @@ def build_parser() -> argparse.ArgumentParser:
     walk.add_argument("--symbols", nargs="+", help="Optional candidate universe")
     walk.add_argument("--start", help="First development date (YYYY-MM-DD)")
     walk.add_argument("--end", help="Final holdout end date (YYYY-MM-DD)")
+
+    validate_signals_parser = subparsers.add_parser(
+        "validate-signals",
+        help="Does score_v1's classification beat the benchmark forward, independent of backtest sizing/timing?",
+    )
+    validate_signals_parser.add_argument("--strategy", choices=("score_v1",), default="score_v1")
+    validate_signals_parser.add_argument("--symbols", nargs="+", help="Optional candidate universe")
+    validate_signals_parser.add_argument("--start", help="Inclusive start date (YYYY-MM-DD)")
+    validate_signals_parser.add_argument("--end", help="Inclusive end date (YYYY-MM-DD)")
+    validate_signals_parser.add_argument(
+        "--horizon-days", type=int,
+        help="Override config/prediction_rules.yaml's horizon_days, so this stays comparable to `predict`",
+    )
 
     subparsers.add_parser("validate", help="Run complete database validation")
     subparsers.add_parser("status", help="Show local database status")
@@ -1807,6 +1822,36 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return int(ExitCode.OPERATION_FAILED)
             if failed_windows:
                 return int(ExitCode.PARTIAL_FAILURE)
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "validate-signals":
+            typed = _backtest_config(base_dir, args)
+            # A fresh run, not the existing backtest_signals rows already on disk: the
+            # most recent full-history run has git_dirty=1 recorded against it, so its
+            # scoring config isn't airtight-pinned to what's on disk right now. Rerunning
+            # is cheap at this data size and removes that ambiguity entirely.
+            result = run_backtests(config, logger, symbols, base_dir=base_dir, backtest_config=typed)
+            rules = load_scoring_rules(base_dir)
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                histories, _ = _load_backtest_inputs(conn, config, rules, symbols, typed)
+            finally:
+                conn.close()
+            horizon_days = args.horizon_days or int(load_prediction_rules(base_dir).get("horizon_days", 21))
+            validation = validate_signals(
+                result.signals, histories,
+                benchmark_symbol=typed.benchmark, horizon_days=horizon_days,
+            )
+            print(f"backtest run: {result.run.run_id}")
+            print(render_signal_validation_text(validation))
+            report_path = Path(config["reports_dir"]) / f"signal_validation_{result.run.run_id}.json"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
+                json.dumps({"backtest_run_id": result.run.run_id, **asdict(validation)}, indent=2),
+                encoding="utf-8",
+            )
+            print(f"report: {report_path}")
             return int(ExitCode.SUCCESS)
 
         if args.command == "run":
