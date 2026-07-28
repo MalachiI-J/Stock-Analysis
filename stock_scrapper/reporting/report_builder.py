@@ -320,15 +320,25 @@ def _write_phase2_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
 
 
 _REPORT_STYLES = """\
-    /* Data-terminal theme: unconditionally dark, matching the hero banner above
-       it — this page never switches to a light variant, the same way the hero
-       never has (a trading terminal doesn't follow the OS light/dark toggle). */
-    :root {
+    /* Data-terminal theme: dark by default, with a light counterpart selected
+       by [data-theme] on <html> (set by the theme script in <head>, before
+       paint, so there's no flash of the wrong theme). Every color used below
+       is one of these custom properties — never a hardcoded hex scattered
+       through a component rule — so switching theme is one attribute flip,
+       not a per-component conditional. The hero banner never reads these
+       tokens at all (it uses its own literal colors), which is what keeps it
+       identical in both modes. */
+    :root, [data-theme="dark"] {
       color-scheme: dark;
       --page:#10130f; --surface:rgba(255,255,255,0.05); --border:rgba(255,255,255,0.14);
       --ink:#e7e5df; --ink-2:#8a8d87; --muted:#8a8d87;
       --line:rgba(255,255,255,0.10); --th-bg:rgba(255,255,255,0.035);
       --page-grid-a:rgba(150,180,200,0.05); --page-grid-b:rgba(150,180,200,0.04);
+      --track-bg:rgba(255,255,255,0.10); --chip-bg:rgba(255,255,255,0.06);
+      --nav-bg:rgba(16,19,15,0.92); --hover-bg:rgba(255,255,255,0.06);
+      /* Deliberately DARKER/recessed than --surface (used for the active
+         circle below) — that contrast is what reads as "raised," not flat. */
+      --toggle-track:rgba(255,255,255,0.03); --toggle-shadow:0 1px 3px rgba(0,0,0,.45);
       --mono:"JetBrains Mono","IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
       --sans:system-ui,-apple-system,"Segoe UI",sans-serif;
       /* Three semantic accents only — color appears exclusively where it means
@@ -338,7 +348,27 @@ _REPORT_STYLES = """\
       --serious-fg:#F09595; --serious-bg:rgba(240,149,149,0.12); --serious-border:rgba(240,149,149,0.35);
       --critical-fg:#F09595; --critical-bg:rgba(240,149,149,0.12); --critical-border:rgba(240,149,149,0.35);
       --neutral-fg:#8a8d87; --neutral-bg:rgba(138,141,135,0.12); --neutral-border:rgba(138,141,135,0.30);
+      --good-accent-bar:var(--good-border); --warning-accent-bar:var(--warning-border);
+      --serious-accent-bar:var(--serious-border); --critical-accent-bar:var(--serious-border);
       --chart-blue:#3987e5; --chart-orange:#d95926; --chart-aqua:#199e70; --chart-yellow:#eda100;
+    }
+    [data-theme="light"] {
+      color-scheme: light;
+      --page:#F7F6F2; --surface:#FFFFFF; --border:rgba(0,0,0,0.10);
+      --ink:#1a1c18; --ink-2:#6b6f68; --muted:#6b6f68;
+      --line:rgba(0,0,0,0.08); --th-bg:rgba(0,0,0,0.025);
+      --page-grid-a:rgba(90,110,130,0.05); --page-grid-b:rgba(90,110,130,0.04);
+      --track-bg:rgba(0,0,0,0.08); --chip-bg:rgba(0,0,0,0.045);
+      --nav-bg:rgba(247,246,242,0.92); --hover-bg:rgba(0,0,0,0.045);
+      --toggle-track:rgba(0,0,0,0.06); --toggle-shadow:0 1px 2px rgba(0,0,0,.18);
+      --good-fg:#27500A; --good-bg:#EAF3DE; --good-border:rgba(39,80,10,0.30);
+      --warning-fg:#633806; --warning-bg:#FAEEDA; --warning-border:rgba(99,56,6,0.30);
+      --serious-fg:#791F1F; --serious-bg:#FCEBEB; --serious-border:rgba(121,31,31,0.28);
+      --critical-fg:#791F1F; --critical-bg:#FCEBEB; --critical-border:rgba(121,31,31,0.28);
+      --neutral-fg:#6b6f68; --neutral-bg:rgba(0,0,0,0.06); --neutral-border:rgba(0,0,0,0.18);
+      --good-accent-bar:#639922; --warning-accent-bar:#BA7517;
+      --serious-accent-bar:#BA3B3B; --critical-accent-bar:#BA3B3B;
+      --chart-blue:#2a78d6; --chart-orange:#eb6834; --chart-aqua:#1baf7a; --chart-yellow:#c98500;
     }
     * { box-sizing:border-box; }
     body { margin:0; color:var(--ink);
@@ -386,7 +416,7 @@ _REPORT_STYLES = """\
     /* Score gauge: a thin 0-100 bar so relative strength reads at a glance
        without comparing two numbers by eye. */
     .gauge-row { display:inline-flex; align-items:center; gap:8px; }
-    .gauge { position:relative; width:56px; height:5px; border-radius:999px; background:rgba(255,255,255,0.10); overflow:hidden; flex:0 0 auto; }
+    .gauge { position:relative; width:56px; height:5px; border-radius:999px; background:var(--track-bg); overflow:hidden; flex:0 0 auto; }
     .gauge.gauge-lg { width:100%; height:7px; }
     .gauge .gauge-fill { position:absolute; top:0; left:0; bottom:0; border-radius:999px; }
     .gauge-good .gauge-fill { background:var(--good-fg); }
@@ -398,15 +428,15 @@ _REPORT_STYLES = """\
     .delta { font-weight:600; white-space:nowrap; }
     .delta-good { color:var(--good-fg); } .delta-critical { color:var(--critical-fg); } .delta-neutral { color:var(--muted); }
     .chip { display:inline-flex; align-items:center; padding:2px 9px; border-radius:999px; font-size:11.5px;
-      color:var(--ink-2); background:rgba(255,255,255,0.06); border:1px solid var(--border); white-space:nowrap; }
+      color:var(--ink-2); background:var(--chip-bg); border:1px solid var(--border); white-space:nowrap; }
     .stock { border:1px solid var(--border); background:var(--surface); border-radius:10px; padding:20px; margin:20px 0; scroll-margin-top:52px; }
     .stock-head { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
     .stock-head h3 { margin:0; font-family:var(--mono); }
     .scores { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:14px 0; }
     .stat { background:var(--page); border:1px solid var(--border); border-top:2px solid var(--border); border-radius:8px; padding:12px 14px; }
-    .stat.stat-good { border-top-color:var(--good-border); }
-    .stat.stat-warning { border-top-color:var(--warning-border); }
-    .stat.stat-serious, .stat.stat-critical { border-top-color:var(--serious-border); }
+    .stat.stat-good { border-top-color:var(--good-accent-bar); }
+    .stat.stat-warning { border-top-color:var(--warning-accent-bar); }
+    .stat.stat-serious, .stat.stat-critical { border-top-color:var(--serious-accent-bar); }
     .stat .stat-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
     .stat .stat-value { font-size:1.5rem; font-weight:600; margin-top:3px; }
     .stat .stat-sub { margin-top:5px; }
@@ -435,12 +465,25 @@ _REPORT_STYLES = """\
     /* Sticky jump nav — CSS-only "current section" cue via :target on the
        headings themselves (see h2:target above); a real scroll-spy needs JS,
        which this report intentionally limits to the decorative hero only. */
-    .term-nav { position:sticky; top:0; z-index:5; display:flex; flex-wrap:wrap; gap:2px 4px;
-      background:rgba(16,19,15,0.92); backdrop-filter:blur(6px); border-bottom:1px solid var(--border);
-      padding:10px 24px; }
+    .term-nav { position:sticky; top:0; z-index:5; display:flex; flex-wrap:wrap; align-items:center;
+      justify-content:space-between; gap:8px;
+      background:var(--nav-bg); backdrop-filter:blur(6px); border-bottom:1px solid var(--border);
+      padding:8px 24px; }
+    .term-nav .term-nav-links { display:flex; flex-wrap:wrap; gap:2px 4px; }
     .term-nav a { color:var(--ink-2); text-decoration:none; font-family:var(--mono); font-size:12px;
       text-transform:uppercase; letter-spacing:.06em; padding:5px 10px; border-radius:6px; }
-    .term-nav a:hover { color:var(--ink); background:rgba(255,255,255,0.06); }
+    .term-nav a:hover { color:var(--ink); background:var(--hover-bg); }
+    /* Theme toggle: both icons always shown (never just one implying "click to
+       switch") — the active mode sits on a raised circle, the inactive one is
+       dimmed, so current state is unambiguous without reading anything. */
+    .theme-toggle { display:inline-flex; align-items:center; gap:2px; background:var(--toggle-track);
+      border:1px solid var(--border); border-radius:999px; padding:3px; flex:0 0 auto; }
+    .theme-btn { display:inline-flex; align-items:center; justify-content:center; width:26px; height:26px;
+      border-radius:50%; border:none; background:transparent; color:var(--muted); cursor:pointer;
+      font-size:13px; line-height:1; padding:0; }
+    .theme-btn:hover { color:var(--ink); }
+    .theme-btn.is-active { background:var(--surface); color:var(--ink); box-shadow:var(--toggle-shadow); }
+    .theme-btn:focus-visible { outline:2px solid var(--good-fg); outline-offset:2px; }
     @media print { .term-nav { display:none; } }
 
     /* Animated hero banner (decorative only; aria-hidden). Everything runs off one
@@ -872,6 +915,64 @@ def _market_hero_html() -> str:
     return _MARKET_HERO_TEMPLATE.replace("{ticker_html}", ticker_html)
 
 
+# Resolves and persists the report's light/dark theme. This is the one other
+# scripted element in the document besides the hero animation — like that one,
+# it touches only a UI preference (never report data), runs synchronously in
+# <head> before <body> paints (so there's no flash of the wrong theme), and is
+# wrapped in try/catch so a failure here can never break the report itself.
+_THEME_SCRIPT = """\
+  <script>
+  (function () {
+    try {
+      var root = document.documentElement;
+      var STORAGE_KEY = "stockScrapperReportTheme";
+
+      function systemTheme() {
+        try {
+          if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) return "light";
+          if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) return "dark";
+        } catch (err) {}
+        return "dark";
+      }
+
+      function storedTheme() {
+        try { return window.localStorage.getItem(STORAGE_KEY); } catch (err) { return null; }
+      }
+
+      function applyTheme(theme) {
+        root.setAttribute("data-theme", theme);
+        var buttons = document.querySelectorAll(".theme-btn");
+        for (var i = 0; i < buttons.length; i++) {
+          var btn = buttons[i];
+          var active = btn.getAttribute("data-set-theme") === theme;
+          btn.classList.toggle("is-active", active);
+          btn.setAttribute("aria-pressed", active ? "true" : "false");
+        }
+      }
+
+      var initialTheme = storedTheme() || systemTheme();
+      applyTheme(initialTheme);
+
+      document.addEventListener("DOMContentLoaded", function () {
+        applyTheme(initialTheme);
+        var toggle = document.querySelector(".theme-toggle");
+        if (!toggle) return;
+        toggle.addEventListener("click", function (event) {
+          var btn = event.target.closest ? event.target.closest(".theme-btn") : null;
+          if (!btn) return;
+          var theme = btn.getAttribute("data-set-theme");
+          applyTheme(theme);
+          try { window.localStorage.setItem(STORAGE_KEY, theme); } catch (err) {}
+        });
+      });
+    } catch (err) {
+      // Decorative preference only; never let it disrupt the report itself.
+    }
+  })();
+  </script>
+"""
+
+
 def _render_phase2_html(
     report_date: str,
     metadata: dict[str, Any],
@@ -914,12 +1015,19 @@ def _render_phase2_html(
   <style>
 {_REPORT_STYLES}
   </style>
+{_THEME_SCRIPT}
 </head>
 <body>
 {_market_hero_html()}
   <nav class="term-nav" aria-label="Report sections">
+    <div class="term-nav-links">
     <a href="#metadata">Metadata</a><a href="#market-regime">Market regime</a><a href="#candidates">Candidates</a>
     <a href="#highest-risk">Highest risk</a><a href="#changes">Changes</a><a href="#symbols">Symbols</a>
+    </div>
+    <div class="theme-toggle" role="group" aria-label="Theme">
+      <button type="button" class="theme-btn" data-set-theme="light" aria-pressed="false" title="Light mode" aria-label="Light mode">&#9728;</button>
+      <button type="button" class="theme-btn is-active" data-set-theme="dark" aria-pressed="true" title="Dark mode" aria-label="Dark mode">&#9789;</button>
+    </div>
   </nav>
   <div class="page">
   <h1>Stock Scrapper Phase 2 Research Report</h1>
