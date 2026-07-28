@@ -421,13 +421,16 @@ _REPORT_STYLES = """\
     .market-hero .bars-layer { position:absolute; inset:0; display:flex; align-items:flex-end;
       gap:12px; padding:0 26px 26px 26px; }
     .market-hero .bar { flex:0 0 20px; width:20px; border-radius:3px 3px 0 0; transform-origin:bottom;
-      animation-name:hero-bar-pulse; animation-duration:4.2s; animation-timing-function:ease-in-out;
+      animation-name:hero-bar-pulse; animation-duration:7.5s; animation-timing-function:ease-in-out;
       animation-iteration-count:infinite; }
     .market-hero .bars-layer.bull .bar { background:linear-gradient(to top, rgba(20,90,40,0) 0%, rgba(46,222,110,.65) 100%);
       box-shadow:0 0 16px rgba(46,222,110,.35); }
     .market-hero .bars-layer.bear .bar { background:linear-gradient(to top, rgba(90,20,20,0) 0%, rgba(230,70,70,.65) 100%);
       box-shadow:0 0 16px rgba(230,70,70,.35); }
-    @keyframes hero-bar-pulse { 0%,100% { transform:scaleY(1); } 50% { transform:scaleY(1.12); } }
+    /* Subtle only — this used to swing to 1.12 on a 4.2s cycle, which read as
+       distracting bouncing; a small, slow breathing motion still says "alive"
+       without competing with the trend line for attention. */
+    @keyframes hero-bar-pulse { 0%,100% { transform:scaleY(1); } 50% { transform:scaleY(1.035); } }
     /* The trend line is the one genuinely procedural piece (see hero script below):
        a real, continuously-extending random-walk series drawn to a canvas, not a
        fixed shape looping through CSS states — that's what an actually-evolving
@@ -438,52 +441,25 @@ _REPORT_STYLES = """\
     @keyframes hero-bull-cycle { 0%,41.667% { opacity:1; } 50%,91.667% { opacity:0; } 100% { opacity:1; } }
     @keyframes hero-bear-cycle { 0%,41.667% { opacity:0; } 50%,91.667% { opacity:1; } 100% { opacity:0; } }
 
-    /* Ticker numbers: one continuous 60s story per position (no bull/bear opacity
-       crossfade needed here) — a rising dwell, a 5s plunge through zero, a falling
-       dwell, and a 5s recovery through zero, on repeat. Color follows the sign of
-       the value actually shown; the arrow follows the local direction of travel.
-       step-end timing is essential: with linear timing two stacked frames briefly
-       overlap mid-fade, and two overlapping TEXT strings read as garbled double
-       digits, not a clean blend — step-end makes every frame change an instant,
-       non-overlapping swap instead. */
-    .market-hero .ticker-pos { position:absolute; }
+    /* Ticker numbers: each position is a single element whose text/color the hero
+       script (below) rewrites every ~380ms — driven by the same shared value and
+       phase timeline as the trend line, so the numbers change constantly and
+       roughly track the arrow instead of jumping between a handful of baked
+       keyframes every several seconds. Positive/green during the bull dwell,
+       negative/red during the bear dwell, sweeping through zero during the two
+       transitions — see tickerUpdate() in the script for the actual shape. */
     .market-hero .tick { position:absolute; left:0; top:0; font:600 15px/1 ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
-      letter-spacing:.02em; white-space:nowrap; opacity:0;
-      animation-duration:60s; animation-timing-function:step-end; animation-iteration-count:infinite; }
+      letter-spacing:.02em; white-space:nowrap; }
     .market-hero .tick.tick-pos { color:#5CF08A; text-shadow:0 0 10px rgba(92,240,138,.75); }
     .market-hero .tick.tick-neg { color:#FF6B6B; text-shadow:0 0 10px rgba(255,107,107,.75); }
-    .market-hero .tick-1 { animation-name:hero-tick-1; } .market-hero .tick-2 { animation-name:hero-tick-2; }
-    .market-hero .tick-3 { animation-name:hero-tick-3; } .market-hero .tick-4 { animation-name:hero-tick-4; }
-    .market-hero .tick-5 { animation-name:hero-tick-5; } .market-hero .tick-6 { animation-name:hero-tick-6; }
-    .market-hero .tick-7 { animation-name:hero-tick-7; } .market-hero .tick-8 { animation-name:hero-tick-8; }
-    .market-hero .tick-9 { animation-name:hero-tick-9; } .market-hero .tick-10 { animation-name:hero-tick-10; }
-    .market-hero .tick-11 { animation-name:hero-tick-11; } .market-hero .tick-12 { animation-name:hero-tick-12; }
-    .market-hero .tick-13 { animation-name:hero-tick-13; } .market-hero .tick-14 { animation-name:hero-tick-14; }
-    .market-hero .tick-15 { animation-name:hero-tick-15; } .market-hero .tick-16 { animation-name:hero-tick-16; }
-    @keyframes hero-tick-1  { 0% { opacity:1; } 10.417% { opacity:0; } }
-    @keyframes hero-tick-2  { 0% { opacity:0; } 10.417% { opacity:1; } 20.833% { opacity:0; } }
-    @keyframes hero-tick-3  { 0% { opacity:0; } 20.833% { opacity:1; } 31.25% { opacity:0; } }
-    @keyframes hero-tick-4  { 0% { opacity:0; } 31.25% { opacity:1; } 41.667% { opacity:0; } }
-    @keyframes hero-tick-5  { 0% { opacity:0; } 41.667% { opacity:1; } 43.75% { opacity:0; } }
-    @keyframes hero-tick-6  { 0% { opacity:0; } 43.75% { opacity:1; } 45.833% { opacity:0; } }
-    @keyframes hero-tick-7  { 0% { opacity:0; } 45.833% { opacity:1; } 47.917% { opacity:0; } }
-    @keyframes hero-tick-8  { 0% { opacity:0; } 47.917% { opacity:1; } 50% { opacity:0; } }
-    @keyframes hero-tick-9  { 0% { opacity:0; } 50% { opacity:1; } 60.417% { opacity:0; } }
-    @keyframes hero-tick-10 { 0% { opacity:0; } 60.417% { opacity:1; } 70.833% { opacity:0; } }
-    @keyframes hero-tick-11 { 0% { opacity:0; } 70.833% { opacity:1; } 81.25% { opacity:0; } }
-    @keyframes hero-tick-12 { 0% { opacity:0; } 81.25% { opacity:1; } 91.667% { opacity:0; } }
-    @keyframes hero-tick-13 { 0% { opacity:0; } 91.667% { opacity:1; } 93.75% { opacity:0; } }
-    @keyframes hero-tick-14 { 0% { opacity:0; } 93.75% { opacity:1; } 95.833% { opacity:0; } }
-    @keyframes hero-tick-15 { 0% { opacity:0; } 95.833% { opacity:1; } 97.917% { opacity:0; } }
-    @keyframes hero-tick-16 { 0% { opacity:0; } 97.917% { opacity:1; } }
     @media (prefers-reduced-motion: reduce) {
-      .market-hero .grid, .market-hero .bar, .market-hero .tick { animation:none; }
+      .market-hero .grid, .market-hero .bar { animation:none; }
       .market-hero .bars-layer.bull { animation:none; opacity:1; }
       .market-hero .bars-layer.bear { animation:none; opacity:0; }
-      .market-hero .tick-4 { opacity:1; }
     }
-    /* The hero script itself checks prefers-reduced-motion and stops redrawing
-       after one frame — this covers only the CSS-driven bars/grid/tickers. */
+    /* The hero script itself checks prefers-reduced-motion, skips the ticker
+       text updates, and stops redrawing after one frame — this covers only the
+       CSS-driven bars/grid. */
     @media print { .market-hero { display:none; } }
 """
 
@@ -557,6 +533,14 @@ _MARKET_HERO_TEMPLATE = """\
       // keeps the net motion trending the phase's way.
       var legDir = 1, legSpeed = 1, legRemainingMs = 0;
       var dwellKind = null;
+      // Snapshot of targetValue at the moment the current dwell phase began —
+      // the ticker numbers (below) use targetValue-minus-this as their organic
+      // "chop", i.e. the exact same leg-driven wobble the trend line is riding,
+      // so the numbers roughly track the arrow instead of moving independently.
+      var dwellAnchorValue = 0;
+      var tickerEls = null;
+      var lastTickerUpdate = -Infinity;
+      var TICKER_UPDATE_MS = 380;
 
       function dwellDrift(biasUp) {
         if (legRemainingMs <= 0) {
@@ -586,10 +570,12 @@ _MARKET_HERO_TEMPLATE = """\
 
       function phaseOf(elapsedMs) {
         var t = elapsedMs % CYCLE_MS;
-        if (t < BULL_MS) return { dwell: true, bull: true };
-        if (t < BULL_MS + TRANSITION_MS) return { dwell: false, drift: -3.2, bull: t < BULL_MS + TRANSITION_MS / 2 };
-        if (t < BULL_MS + TRANSITION_MS + BULL_MS) return { dwell: true, bull: false };
-        return { dwell: false, drift: 3.2, bull: t > CYCLE_MS - TRANSITION_MS / 2 };
+        if (t < BULL_MS) return { dwell: true, bull: true, stage: "bull" };
+        if (t < BULL_MS + TRANSITION_MS) {
+          return { dwell: false, drift: -3.2, bull: t < BULL_MS + TRANSITION_MS / 2, stage: "crash" };
+        }
+        if (t < BULL_MS + TRANSITION_MS + BULL_MS) return { dwell: true, bull: false, stage: "bear" };
+        return { dwell: false, drift: 3.2, bull: t > CYCLE_MS - TRANSITION_MS / 2, stage: "recovery" };
       }
 
       function updateTarget(elapsedMs) {
@@ -599,6 +585,7 @@ _MARKET_HERO_TEMPLATE = """\
           if (dwellKind !== kindKey) {
             dwellKind = kindKey;
             legRemainingMs = 0;
+            dwellAnchorValue = targetValue;
           }
         } else {
           dwellKind = null;
@@ -607,6 +594,54 @@ _MARKET_HERO_TEMPLATE = """\
         // Small noise only — legs are the story now, so texture must stay well
         // under even the slow leg's own speed or it'll read as wiggle again.
         targetValue += drift + (Math.random() - 0.5) * 0.35;
+      }
+
+      // Below this, the arrow reads as flat/sideways rather than trending —
+      // the numbers freeze in place while it's this level, same as a real
+      // ticker showing no move when a stock just isn't doing anything.
+      var TICKER_FLAT_ANGLE = 0.06;
+
+      function tickerUpdate(elapsedMs) {
+        if (!tickerEls || !tickerEls.length) return;
+        if (displayAngle !== null && Math.abs(displayAngle) < TICKER_FLAT_ANGLE) return;
+        var phase = phaseOf(elapsedMs);
+        var t = elapsedMs % CYCLE_MS;
+        // The crash/recovery sweep is deterministic from the cycle clock alone
+        // (unlike the dwell wobble, which rides the live random walk) — this is
+        // what guarantees the numbers genuinely cross zero on schedule, matching
+        // the arrow going negative in the red phase.
+        var chop = targetValue - dwellAnchorValue;
+        for (var i = 0; i < tickerEls.length; i++) {
+          var el = tickerEls[i];
+          var base = parseFloat(el.getAttribute("data-base"));
+          var scale = parseFloat(el.getAttribute("data-scale"));
+          var shown;
+          if (phase.stage === "crash") {
+            var fracC = (t - BULL_MS) / TRANSITION_MS;
+            shown = (75 - 165 * fracC) + chop * 0.35 * scale;
+          } else if (phase.stage === "recovery") {
+            var fracR = (t - (BULL_MS + TRANSITION_MS + BULL_MS)) / TRANSITION_MS;
+            shown = (-75 + 165 * fracR) + chop * 0.35 * scale;
+          } else if (phase.bull) {
+            // Bull dwell: rising chop (an up-leg, arrow trending up) makes the
+            // positive number bigger; a down-leg shrinks it back toward zero.
+            shown = Math.max(base * 0.4, base + chop * scale);
+          } else {
+            // Bear dwell: the sign is flipped from the bull case on purpose.
+            // The arrow trending UP here means recovering, so the loss should
+            // shrink toward zero (less negative) — not grow more negative the
+            // way a naive "+chop" would (that was the bug: the number was
+            // using the same math as the positive side, so it went the wrong
+            // way whenever the arrow ticked up during a red phase). Trending
+            // DOWN (further decline) correctly grows the magnitude instead.
+            shown = -Math.max(base * 0.4, base - chop * scale);
+          }
+          var prev = parseFloat(el.getAttribute("data-prev"));
+          var up = isNaN(prev) ? shown >= 0 : shown >= prev;
+          el.setAttribute("data-prev", shown.toFixed(2));
+          el.className = "tick " + (shown >= 0 ? "tick-pos" : "tick-neg");
+          el.textContent = shown.toFixed(2) + " " + (up ? "▲" : "▼");
+        }
       }
 
       function draw(elapsedMs, dtMs) {
@@ -732,12 +767,20 @@ _MARKET_HERO_TEMPLATE = """\
           while (trail.length > 2 && trail[0].t < cutoff) trail.shift();
         }
 
+        // Reduced motion: leave the server-rendered ticker text alone rather
+        // than rewriting it once and freezing on an arbitrary in-between value.
+        if (!reduceMotion && elapsedMs - lastTickerUpdate >= TICKER_UPDATE_MS) {
+          lastTickerUpdate = elapsedMs;
+          tickerUpdate(elapsedMs);
+        }
+
         draw(elapsedMs, dtMs);
         if (!reduceMotion) requestAnimationFrame(frame);
       }
 
       resize();
       window.addEventListener("resize", resize);
+      tickerEls = document.querySelectorAll(".market-hero .tick");
       for (var seed = -Math.ceil(VISIBLE_MS / APPEND_EVERY_MS); seed <= 0; seed++) {
         var seedT = seed * APPEND_EVERY_MS;
         updateTarget(seedT);
@@ -754,47 +797,32 @@ _MARKET_HERO_TEMPLATE = """\
   </script>
 """
 
-# Each ticker position plays the same 16-frame, 60s story (see hero-tick-1..16
-# above): a rising dwell (frames 1-4), a shared 5s plunge through zero (5-8), a
-# falling/more-negative dwell (9-12), and a shared 5s recovery through zero
-# (13-16) — only the dwell values differ per position; the plunge/recovery
-# numbers are intentionally identical everywhere; one synchronized market-wide
-# swing reads more cohesive than six unrelated ones.
-_HERO_CRASH_FRAMES: tuple[tuple[float, str, str], ...] = (
-    (75.0, "pos", "down"), (30.0, "pos", "down"), (-15.0, "neg", "down"), (-90.0, "neg", "down"),
-)
-_HERO_RECOVERY_FRAMES: tuple[tuple[float, str, str], ...] = (
-    (-75.0, "neg", "up"), (-30.0, "neg", "up"), (15.0, "pos", "up"), (90.0, "pos", "up"),
-)
-_HERO_TICKER_POSITIONS: tuple[tuple[str, str, float], ...] = (
-    ("6%", "30px", 109.25),
-    ("2%", "96px", 77.61),
-    ("38%", "18px", 104.46),
-    ("33%", "132px", 104.61),
-    ("68%", "70px", 127.83),
-    ("85%", "112px", 142.10),
+# Each position's baseline dwell magnitude and a small per-position multiplier
+# applied to the shared organic wobble (see tickerUpdate() in the hero script)
+# so the six numbers don't all move in perfect lockstep even though they share
+# one underlying timeline. The rendered text below is only the pre-JS static
+# fallback (also what's shown under prefers-reduced-motion) — the script
+# rewrites it continuously from there.
+_HERO_TICKER_POSITIONS: tuple[tuple[str, str, float, float], ...] = (
+    ("6%", "30px", 109.25, 1.00),
+    ("2%", "96px", 77.61, 0.85),
+    ("38%", "18px", 104.46, 1.15),
+    ("33%", "132px", 104.61, 0.95),
+    ("68%", "70px", 127.83, 1.05),
+    ("85%", "112px", 142.10, 0.90),
 )
 
 
-def _hero_tick_span(frame_index: int, value: float, sign: str, direction: str) -> str:
-    arrow = "&#9650;" if direction == "up" else "&#9660;"
-    return f'<span class="tick tick-{frame_index} tick-{sign}">{value:.2f} {arrow}</span>'
-
-
-def _hero_ticker_pos_html(left: str, top: str, base: float) -> str:
-    dwell_bull = tuple((base - offset, "pos", "up") for offset in (6.0, 4.0, 2.0, 0.0))
-    dwell_bear = tuple((-(base - offset), "neg", "down") for offset in (6.0, 4.0, 2.0, 0.0))
-    frames = dwell_bull + _HERO_CRASH_FRAMES + dwell_bear + _HERO_RECOVERY_FRAMES
-    spans = "".join(
-        _hero_tick_span(index, value, sign, direction)
-        for index, (value, sign, direction) in enumerate(frames, start=1)
+def _hero_ticker_pos_html(left: str, top: str, base: float, scale: float) -> str:
+    return (
+        f'    <span class="tick tick-pos" style="left:{left}; top:{top};" '
+        f'data-base="{base:.2f}" data-scale="{scale:.2f}">{base:.2f} &#9650;</span>\n'
     )
-    return f'    <span class="ticker-pos" style="left:{left}; top:{top};">{spans}</span>\n'
 
 
 def _market_hero_html() -> str:
     ticker_html = "".join(
-        _hero_ticker_pos_html(left, top, base) for left, top, base in _HERO_TICKER_POSITIONS
+        _hero_ticker_pos_html(left, top, base, scale) for left, top, base, scale in _HERO_TICKER_POSITIONS
     )
     # A plain string replace, not str.format(): the template's inline <script>
     # is full of literal JS braces that str.format() would misparse as fields.
