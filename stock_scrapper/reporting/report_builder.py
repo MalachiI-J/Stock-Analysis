@@ -331,12 +331,26 @@ _REPORT_STYLES = """\
        palette, since the hero's colors were never meant to match the body's. */
     :root, [data-theme="dark"] {
       color-scheme: dark;
-      --page:#10130f; --surface:rgba(255,255,255,0.05); --border:rgba(255,255,255,0.14);
+      /* Opaque now (was rgba(255,255,255,0.05)) — a translucent surface let
+         the page texture show through every card. This solid hex is chosen
+         to match that old composited appearance, so nothing else needed to
+         be re-tuned to compensate. */
+      --page:#10130f; --surface:#1c1f1b; --border:rgba(255,255,255,0.14);
       --ink:#e7e5df; --ink-2:#8a8d87; --muted:#8a8d87;
       --line:rgba(255,255,255,0.10); --th-bg:rgba(255,255,255,0.035);
       --page-grid-a:rgba(150,180,200,0.05); --page-grid-b:rgba(150,180,200,0.04);
+      /* A lightening highlight reads as a soft glow against a near-black
+         page; the same white value would be a no-op against light mode's
+         near-white page (see the light block below for that variant). */
+      --page-glow:rgba(255,255,255,0.10);
+      /* Same color as --page in both themes — a separate name purely so
+         component rules can say "recessed instrument-panel surface" instead
+         of "the page color, again," now that --surface itself is a real,
+         opaque card color and no longer doubles for both roles. */
+      --inset-surface:var(--page);
       --track-bg:rgba(255,255,255,0.10); --chip-bg:rgba(255,255,255,0.06);
       --nav-bg:rgba(16,19,15,0.92); --hover-bg:rgba(255,255,255,0.06);
+      --card-shadow:0 12px 28px rgba(0,0,0,0.35);
       /* Deliberately DARKER/recessed than --surface (used for the active
          circle below) — that contrast is what reads as "raised," not flat. */
       --toggle-track:rgba(255,255,255,0.03); --toggle-shadow:0 1px 3px rgba(0,0,0,.45);
@@ -359,8 +373,14 @@ _REPORT_STYLES = """\
       --ink:#1a1c18; --ink-2:#6b6f68; --muted:#6b6f68;
       --line:rgba(0,0,0,0.08); --th-bg:rgba(0,0,0,0.025);
       --page-grid-a:rgba(90,110,130,0.05); --page-grid-b:rgba(90,110,130,0.04);
+      /* A white glow would be invisible against a near-white page — a very
+         soft, low-alpha dark tint gives the same "a bit more presence near
+         the top" effect without needing a lighter-than-page color to exist. */
+      --page-glow:rgba(20,22,18,0.05);
+      --inset-surface:var(--page);
       --track-bg:rgba(0,0,0,0.08); --chip-bg:rgba(0,0,0,0.045);
       --nav-bg:rgba(247,246,242,0.92); --hover-bg:rgba(0,0,0,0.045);
+      --card-shadow:0 10px 24px rgba(0,0,0,0.10);
       --toggle-track:rgba(0,0,0,0.06); --toggle-shadow:0 1px 2px rgba(0,0,0,.18);
       --good-fg:#27500A; --good-bg:#EAF3DE; --good-border:rgba(39,80,10,0.30);
       --warning-fg:#633806; --warning-bg:#FAEEDA; --warning-border:rgba(99,56,6,0.30);
@@ -372,29 +392,46 @@ _REPORT_STYLES = """\
       --chart-blue:#2a78d6; --chart-orange:#eb6834; --chart-aqua:#1baf7a; --chart-yellow:#c98500;
     }
     * { box-sizing:border-box; }
-    /* Blueprint grid: true perpendicular lines (0deg/90deg, same 48px pitch)
-       rather than a skewed weave, so it reads as a deliberate graph-paper
-       texture. `.page-fade` (first child of body — see markup) is a second,
-       document-anchored copy of the SAME pattern/tokens, mask-faded to
-       nothing over roughly one viewport height: near the hero the two layers
-       overlap (denser), and past that only this steady base layer remains
-       (dimmer, but never zero — no "recede to nothing" for long reports).
-       Both layers use plain `scroll` attachment (no `fixed`) on purpose: a
-       `fixed` layer is viewport-anchored while the fade overlay is document-
-       anchored, and mixing the two would drift the two grids out of phase
-       with each other as the page scrolls. */
+    /* Dot-grid page texture: a sparse field of ~1px dots on a 28px pitch,
+       two interleaved layers (offset by half a cell) from the same
+       --page-grid-a/-b tokens used everywhere else, so it keeps differing
+       correctly between themes automatically. `.page-fade` (first child of
+       body — see markup) is a second, document-anchored copy of the same
+       pattern, mask-faded to nothing over roughly one viewport height: near
+       the hero the two layers overlap (denser), and past that only this
+       steady base layer remains (dimmer, but never zero — no "recede to
+       nothing" for long reports). `.page-glow` is a separate, small radial
+       accent near the top center, driven by its own --page-glow token (a
+       lightening highlight in dark mode; a white glow would be invisible on
+       light mode's near-white page, so that token holds a soft darkening
+       tint there instead) — same idea in both themes, independent of the
+       fade's own masking so its lifecycle stays simple to reason about. Once
+       a card/table has an
+       opaque background (see --surface, step 1), it naturally paints over
+       whichever part of this texture would otherwise show behind it — no
+       extra "stop at the card edge" rule needed. Both grid layers use plain
+       `scroll` attachment (no `fixed`) on purpose: a `fixed` layer is
+       viewport-anchored while the fade overlay is document-anchored, and
+       mixing the two would drift the two grids out of phase with each other
+       as the page scrolls. */
     body { margin:0; color:var(--ink); position:relative;
       font:15px/1.6 var(--sans);
       background-color:var(--page);
       background-image:
-        repeating-linear-gradient(0deg, var(--page-grid-a) 0 1px, transparent 1px 48px),
-        repeating-linear-gradient(90deg, var(--page-grid-b) 0 1px, transparent 1px 48px); }
+        radial-gradient(circle, var(--page-grid-a) 1px, transparent 1.5px),
+        radial-gradient(circle, var(--page-grid-b) 1px, transparent 1.5px);
+      background-size:28px 28px, 28px 28px;
+      background-position:0 0, 14px 14px; }
     .page-fade { position:absolute; top:0; left:0; right:0; height:100vh; z-index:0; pointer-events:none;
       background-image:
-        repeating-linear-gradient(0deg, var(--page-grid-a) 0 1px, transparent 1px 48px),
-        repeating-linear-gradient(90deg, var(--page-grid-b) 0 1px, transparent 1px 48px);
+        radial-gradient(circle, var(--page-grid-a) 1px, transparent 1.5px),
+        radial-gradient(circle, var(--page-grid-b) 1px, transparent 1.5px);
+      background-size:28px 28px, 28px 28px;
+      background-position:0 0, 14px 14px;
       -webkit-mask-image:linear-gradient(to bottom, black, transparent);
       mask-image:linear-gradient(to bottom, black, transparent); }
+    .page-glow { position:absolute; top:0; left:0; right:0; height:60vh; z-index:0; pointer-events:none;
+      background:radial-gradient(ellipse at 50% 0%, var(--page-glow), transparent 60%); }
     .page { max-width:1200px; margin:0 auto; padding:8px 24px 56px; }
     h1,h2,h3,h4 { line-height:1.25; font-weight:600; }
     h1 { font-size:1.7rem; margin-bottom:2px; }
@@ -415,7 +452,14 @@ _REPORT_STYLES = """\
     table.metadata tr:last-child { border-bottom:none; }
     table.metadata th, table.metadata td { border:none; padding:9px 4px; }
     table.metadata th { background:transparent; width:200px; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
-    .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px 18px; margin:14px 0 22px; }
+    /* Elevation lives only on major panels (.card, .stock) — a single drop
+       shadow, no inset highlight, no colored glow. Recessed/secondary
+       elements (.stat, .lists section, details.raw, .notice, the chart)
+       deliberately don't get it — they should read as set INTO the page,
+       not floating above it. */
+    .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px 18px; margin:14px 0 22px;
+      box-shadow:var(--card-shadow); }
+    .card > table { margin:0; }
     .notice { padding:14px 16px; border:1px solid var(--border); border-left:3px solid var(--muted);
       background:var(--surface); color:var(--ink-2); border-radius:8px; margin:18px 0; }
     .regime-head { display:flex; align-items:center; gap:12px; }
@@ -446,11 +490,12 @@ _REPORT_STYLES = """\
     .delta-good { color:var(--good-fg); } .delta-critical { color:var(--critical-fg); } .delta-neutral { color:var(--muted); }
     .chip { display:inline-flex; align-items:center; padding:2px 9px; border-radius:999px; font-size:11.5px;
       color:var(--ink-2); background:var(--chip-bg); border:1px solid var(--border); white-space:nowrap; }
-    .stock { border:1px solid var(--border); background:var(--surface); border-radius:10px; padding:20px; margin:20px 0; scroll-margin-top:52px; }
+    .stock { border:1px solid var(--border); background:var(--surface); border-radius:10px; padding:20px; margin:20px 0; scroll-margin-top:52px;
+      box-shadow:var(--card-shadow); }
     .stock-head { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
     .stock-head h3 { margin:0; font-family:var(--mono); }
     .scores { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:14px 0; }
-    .stat { background:var(--page); border:1px solid var(--border); border-top:2px solid var(--border); border-radius:8px; padding:12px 14px; }
+    .stat { background:var(--inset-surface); border:1px solid var(--border); border-top:2px solid var(--border); border-radius:8px; padding:12px 14px; }
     .stat.stat-good { border-top-color:var(--good-accent-bar); }
     .stat.stat-warning { border-top-color:var(--warning-accent-bar); }
     .stat.stat-serious, .stat.stat-critical { border-top-color:var(--serious-accent-bar); }
@@ -462,15 +507,15 @@ _REPORT_STYLES = """\
       text-transform:uppercase; letter-spacing:.05em; margin-bottom:5px; }
     .primary-gauges .gauge-label .mono { font-size:13px; color:var(--ink); text-transform:none; letter-spacing:normal; }
     .chart-wrap { overflow-x:auto; }
-    .price-chart { width:100%; min-width:660px; height:auto; background:var(--surface); }
+    .price-chart { width:100%; min-width:660px; height:auto; background:var(--inset-surface); }
     .legend { font-size:12px; font-family:var(--mono); } .muted { color:var(--muted); }
     .lists { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:14px; }
-    .lists section { background:var(--page); border:1px solid var(--border); border-radius:8px; padding:10px 14px; }
+    .lists section { background:var(--inset-surface); border:1px solid var(--border); border-radius:8px; padding:10px 14px; }
     .lists section h5 { margin:10px 0 2px; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
     .lists section h5:first-child { margin-top:0; }
     ul { margin-top:6px; padding-left:18px; } ul li { color:var(--ink); } ul li::marker { color:var(--muted); }
     code { overflow-wrap:anywhere; }
-    details.raw { margin:14px 0 0; border:1px solid var(--border); border-radius:8px; background:var(--page); }
+    details.raw { margin:14px 0 0; border:1px solid var(--border); border-radius:8px; background:var(--inset-surface); }
     details.raw > summary { cursor:pointer; padding:10px 14px; font-weight:600; color:var(--ink-2);
       list-style:none; user-select:none; }
     details.raw > summary::-webkit-details-marker { display:none; }
@@ -1096,6 +1141,7 @@ def _render_phase2_html(
 {_THEME_SCRIPT}
 </head>
 <body>
+  <div class="page-glow" aria-hidden="true"></div>
   <div class="page-fade" aria-hidden="true"></div>
 {_market_hero_html()}
   <nav class="term-nav" aria-label="Report sections">
@@ -1116,11 +1162,11 @@ def _render_phase2_html(
   <h2 id="market-regime">Market Regime</h2>
   <div class="card regime"><div class="regime-head">{regime_badge}<span class="regime-confidence">confidence {_score(metadata.get('market_regime_confidence'))}</span></div><h4>Market-regime reasons</h4>{regime_reasons}</div>
   <h2 id="candidates">Candidate Ranking</h2>
-  {candidate_html}
+  <div class="card">{candidate_html}</div>
   <h2 id="highest-risk">Highest-Risk Ranking</h2>
-  {risk_html}
+  <div class="card">{risk_html}</div>
   <h2 id="changes">Changes From Previous Stored Analysis</h2>
-  {changes_html}
+  <div class="card">{changes_html}</div>
   <h2>Data-Quality Concerns</h2>
   {quality_html}
   <h2 id="symbols">Symbol Analysis</h2>
@@ -1406,7 +1452,7 @@ def _price_chart_svg(symbol: str, history: list[dict[str, Any]], cutoff: str | N
         last_index, last_value = adjusted_segments[-1][-1]
         mx, my = x_position(last_index), y_position(last_value)
         marker = (
-            f'<circle cx="{mx:.2f}" cy="{my:.2f}" r="7" fill="var(--surface)"/>'
+            f'<circle cx="{mx:.2f}" cy="{my:.2f}" r="7" fill="var(--inset-surface)"/>'
             f'<circle cx="{mx:.2f}" cy="{my:.2f}" r="4" fill="var(--chart-blue)"/>'
         )
         chip_w, chip_h = 74.0, 22.0
@@ -1446,7 +1492,7 @@ def _price_chart_svg(symbol: str, history: list[dict[str, Any]], cutoff: str | N
     )
     clipped = (
         f'<g clip-path="url(#{clip_id})">'
-        f'<rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" fill="var(--surface)" stroke="var(--border)"/>'
+        f'<rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" fill="var(--inset-surface)" stroke="var(--border)"/>'
         f'{"".join(grid_lines)}{"".join(area_fills)}{reference_line}{"".join(paths)}'
         f'</g>'
     )
