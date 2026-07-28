@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-LATEST_SCHEMA_VERSION = 7
+LATEST_SCHEMA_VERSION = 8
 
 
 def _utc_now() -> str:
@@ -110,6 +110,10 @@ def apply_migrations(db_path: str | Path) -> None:
             _apply_v7(conn)
         else:
             _ensure_phase4_portfolio_tables(conn)
+        if current_version < 8:
+            _apply_v8(conn)
+        else:
+            _ensure_prediction_tracking_tables(conn)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -999,3 +1003,28 @@ def _apply_v7(conn: sqlite3.Connection) -> None:
     _ensure_phase4_portfolio_tables(conn)
     conn.execute("INSERT INTO schema_metadata(schema_version,applied_at,description) VALUES(?,?,?)",
                  (7,_utc_now(),"Add Phase 4 portfolio lots and sales for real-holdings tracking"))
+
+
+def _ensure_prediction_tracking_tables(conn: sqlite3.Connection) -> None:
+    """Add tables recording predict-v3 runs, so accuracy is tracked over time instead
+    of printed once and discarded."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS prediction_runs (
+      run_id TEXT PRIMARY KEY, prediction_version TEXT NOT NULL, as_of_date TEXT NOT NULL,
+      horizon_days INTEGER NOT NULL, benchmark_symbol TEXT, status TEXT NOT NULL, message TEXT,
+      training_samples INTEGER NOT NULL DEFAULT 0, holdout_samples INTEGER NOT NULL DEFAULT 0,
+      training_start_date TEXT, training_end_date TEXT, positive_label_rate REAL,
+      holdout_accuracy REAL, holdout_brier_score REAL, coefficients_json TEXT,
+      predictions_json TEXT, configuration_snapshot_json TEXT, started_at TEXT NOT NULL,
+      completed_at TEXT, error_summary TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS prediction_folds (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, fold_number INTEGER NOT NULL,
+      training_samples INTEGER NOT NULL, test_samples INTEGER NOT NULL, accuracy REAL, brier_score REAL,
+      UNIQUE(run_id, fold_number), FOREIGN KEY(run_id) REFERENCES prediction_runs(run_id) ON DELETE CASCADE)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_prediction_runs_version_as_of ON prediction_runs(prediction_version, as_of_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_prediction_folds_run ON prediction_folds(run_id, fold_number)")
+
+
+def _apply_v8(conn: sqlite3.Connection) -> None:
+    _ensure_prediction_tracking_tables(conn)
+    conn.execute("INSERT INTO schema_metadata(schema_version,applied_at,description) VALUES(?,?,?)",
+                 (8,_utc_now(),"Add prediction_runs/prediction_folds to track predict-v3 accuracy over time"))

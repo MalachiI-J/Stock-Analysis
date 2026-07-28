@@ -74,6 +74,7 @@ from stock_scrapper.portfolio import (
     evaluate_portfolio_performance,
 )
 from stock_scrapper.prediction.config import validate_prediction_config
+from stock_scrapper.prediction.persistence import persist_prediction_run
 from stock_scrapper.prediction.service import run_prediction
 from stock_scrapper.processing.validation import validate_price_records
 from stock_scrapper.trading.config import validate_trading_rules
@@ -1118,11 +1119,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                     service, symbols, histories, trading_dates,
                     as_of_date=effective.isoformat(), rules=prediction_rules, benchmark_symbol=benchmark,
                 )
+                prediction_run_id = f"predict-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
+                conn.execute("BEGIN")
+                try:
+                    persist_prediction_run(
+                        conn, prediction_run_id, result,
+                        prediction_version=prediction_rules["prediction_version"],
+                        benchmark_symbol=benchmark,
+                        configuration_snapshot=prediction_rules,
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
             finally:
                 conn.close()
             if result.status == "insufficient_data":
+                print(f"prediction run: {prediction_run_id}", file=sys.stderr)
                 print(f"Missing data: {result.message}", file=sys.stderr)
                 return int(ExitCode.MISSING_DATA)
+            print(f"prediction run: {prediction_run_id}")
             print(f"Prediction as of {result.as_of_date} | horizon={result.horizon_days} session(s) | model={prediction_rules['prediction_version']}")
             print(
                 f"Trained on {result.training_samples} sample(s) ({result.training_start_date} to "
@@ -1816,6 +1832,36 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(
                     f"  {window.window_type}: {window.evaluation_start_date}.."
                     f"{window.evaluation_end_date} status={window.status} backtest={window.backtest_run_id}"
+                )
+            print()
+            print("Per-window performance vs benchmark (validation and holdout kept separate — never averaged together):")
+            validation_windows = [window for window in walk_result.windows if window.window_type == "validation"]
+            holdout_windows = [window for window in walk_result.windows if window.window_type == "holdout"]
+            for label, windows in (("validation", validation_windows), ("holdout", holdout_windows)):
+                for window in windows:
+                    metrics = getattr(window, "metrics", None)
+                    span = f"{window.evaluation_start_date}..{window.evaluation_end_date}"
+                    if metrics is None:
+                        print(f"  {label} [{span}]: no metrics recorded (status={window.status})")
+                        continue
+                    active_text = "n/a" if metrics.active_return is None else f"{metrics.active_return:+.2%}"
+                    sharpe_text = "n/a" if metrics.sharpe_ratio is None else f"{metrics.sharpe_ratio:.2f}"
+                    benchmark_sharpe_text = (
+                        "n/a" if metrics.benchmark_sharpe_ratio is None else f"{metrics.benchmark_sharpe_ratio:.2f}"
+                    )
+                    verdict = (
+                        "n/a" if metrics.active_return is None
+                        else ("beat benchmark" if metrics.active_return > 0 else "trailed benchmark")
+                    )
+                    print(
+                        f"  {label} [{span}]: active_return={active_text} sharpe={sharpe_text} "
+                        f"(benchmark sharpe={benchmark_sharpe_text}) -> {verdict}"
+                    )
+            if len(validation_windows) <= 1 and len(holdout_windows) <= 1:
+                print(
+                    "  Only one validation window and one holdout exist with current stored history — "
+                    "each of the above is a single data point, not a statistically powered walk-forward "
+                    "verdict. Treat the direction as informative, not as proof of an edge."
                 )
             failed_windows = sum(window.status == "failed" for window in walk_result.windows)
             if failed_windows == len(walk_result.windows):

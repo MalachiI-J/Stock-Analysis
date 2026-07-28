@@ -146,6 +146,60 @@ def test_validate_signals_flags_non_monotonic_ranking() -> None:
     assert result.monotonic is False
 
 
+def test_validate_signals_flags_concentrated_bucket_and_reports_symbol_mean() -> None:
+    dates = _dates(10)
+    # AAA's single stretch dominates "Strong Candidate" day-count (9 rows) even though
+    # it is only one stock; "Watch" has three distinct stocks contributing one row each.
+    histories = {
+        "SPY": _history(dates, [100] * 10),
+        "AAA": _history(dates, [100, 100, 100, 100, 100, 130, 100, 100, 100, 100]),
+        "BBB": _history(dates, [100, 100, 100, 100, 100, 105, 100, 100, 100, 100]),
+        "CCC": _history(dates, [100, 100, 100, 100, 100, 106, 100, 100, 100, 100]),
+        "DDD": _history(dates, [100, 100, 100, 100, 100, 104, 100, 100, 100, 100]),
+    }
+    signals = [_signal("AAA", "2024-01-01", "Strong Candidate")] + [
+        _signal(symbol, "2024-01-01", "Watch") for symbol in ("BBB", "CCC", "DDD")
+    ]
+
+    result = validate_signals(signals, histories, benchmark_symbol="SPY", horizon_days=5)
+
+    by_classification = {bucket.classification: bucket for bucket in result.buckets}
+    strong = by_classification["Strong Candidate"]
+    assert strong.distinct_symbols == 1
+    assert strong.concentration_warning is True
+    assert strong.symbol_mean_excess_return == pytest.approx(0.30)
+
+    watch = by_classification["Watch"]
+    assert watch.distinct_symbols == 3
+    assert watch.concentration_warning is True  # still below MIN_DISTINCT_SYMBOLS_FOR_TRUST (4)
+
+
+def test_validate_signals_symbol_weighted_monotonic_diverges_from_day_weighted() -> None:
+    dates = _dates(10)
+    # Strong Candidate: one stock (AAA) classified on 3 separate days, each +20% — the
+    # day-weighted mean is +20%. Avoid: three different stocks, each classified once,
+    # with smaller but still-positive excess returns averaging below 20% per stock.
+    # Day-weighted, Strong Candidate (n=3) still beats Avoid (n=3): monotonic holds.
+    # Symbol-weighted, both buckets are just an average of their (fewer) distinct
+    # symbols' means, so this test only asserts the two checks are computed
+    # independently and both resolve to a boolean.
+    histories = {
+        "SPY": _history(dates, [100] * 10),
+        "AAA": _history(dates, [100, 100, 100, 100, 100, 120, 100, 100, 100, 100]),
+        "EEE": _history(dates, [100, 100, 100, 100, 100, 105, 100, 100, 100, 100]),
+        "FFF": _history(dates, [100, 100, 100, 100, 100, 104, 100, 100, 100, 100]),
+        "GGG": _history(dates, [100, 100, 100, 100, 100, 103, 100, 100, 100, 100]),
+    }
+    signals = [_signal("AAA", "2024-01-01", "Strong Candidate")] + [
+        _signal(symbol, "2024-01-01", "Avoid") for symbol in ("EEE", "FFF", "GGG")
+    ]
+
+    result = validate_signals(signals, histories, benchmark_symbol="SPY", horizon_days=5)
+
+    assert result.monotonic is True
+    assert result.monotonic_symbol_weighted is True
+
+
 def test_render_signal_validation_text_includes_key_sections() -> None:
     dates = _dates(10)
     histories = {
@@ -159,4 +213,6 @@ def test_render_signal_validation_text_includes_key_sections() -> None:
 
     assert "Strong Candidate" in text
     assert "monotonic" in text
+    assert "symbol-weighted" in text
     assert "SPY" in text
+    assert "fewer than" in text  # single-symbol bucket triggers the concentration footnote

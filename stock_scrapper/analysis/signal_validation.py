@@ -27,6 +27,13 @@ from typing import Any, Mapping, Sequence
 # carry no opportunity signal and are excluded entirely.
 CLASSIFICATION_ORDER: tuple[str, ...] = ("Strong Candidate", "Candidate", "Watch", "Avoid", "High Risk")
 
+# Below this many distinct symbols, a bucket's day-level z-test is not trustworthy: with
+# horizon_days-long overlapping lookaheads, one symbol's classified stretch produces many
+# daily rows that mostly restate the same underlying move, not independent trials. A
+# handful of stocks (or one) going on a single big run can then look like a broad,
+# statistically "significant" population effect when it is really one or two anecdotes.
+MIN_DISTINCT_SYMBOLS_FOR_TRUST = 4
+
 
 def _finite(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
@@ -129,6 +136,9 @@ class ClassificationBucket:
     median_excess_return: float | None = None
     z_score: float | None = None
     p_value: float | None = None
+    distinct_symbols: int = 0
+    symbol_mean_excess_return: float | None = None
+    concentration_warning: bool = False
 
 
 @dataclass(slots=True)
@@ -140,6 +150,7 @@ class SignalValidationResult:
     pooled_hit_rate: float | None
     buckets: list[ClassificationBucket] = field(default_factory=list)
     monotonic: bool | None = None
+    monotonic_symbol_weighted: bool | None = None
 
 
 def validate_signals(
@@ -159,6 +170,10 @@ def validate_signals(
     symbol_indices: dict[str, dict[str, int]] = {}
 
     excess_by_classification: dict[str, list[float]] = {name: [] for name in CLASSIFICATION_ORDER}
+    # Tracked separately from the flat list above so each bucket's symbol diversity and
+    # equal-weighted (one vote per symbol, not per day) mean can be reported alongside
+    # the day-level stats — see MIN_DISTINCT_SYMBOLS_FOR_TRUST.
+    excess_by_symbol: dict[str, dict[str, list[float]]] = {name: {} for name in CLASSIFICATION_ORDER}
     skipped = 0
     for signal in signals:
         classification = _get(signal, "classification")
@@ -184,6 +199,7 @@ def validate_signals(
             skipped += 1
             continue
         excess_by_classification[classification].append(excess)
+        excess_by_symbol[classification].setdefault(symbol, []).append(excess)
 
     all_excess = [value for values in excess_by_classification.values() for value in values]
     total_samples = len(all_excess)
@@ -210,6 +226,11 @@ def validate_signals(
         rest_hits, rest_n = total_hits - hits, total_samples - n
         z_score, p_value = two_proportion_z_test(hits, n, rest_hits, rest_n)
         mean_by_classification[classification] = mean_excess
+
+        per_symbol_means = [sum(values) / len(values) for values in excess_by_symbol[classification].values()]
+        distinct_symbols = len(per_symbol_means)
+        symbol_mean_excess = sum(per_symbol_means) / distinct_symbols if distinct_symbols else None
+
         buckets.append(
             ClassificationBucket(
                 classification=classification,
@@ -219,6 +240,9 @@ def validate_signals(
                 median_excess_return=median_excess,
                 z_score=z_score,
                 p_value=p_value,
+                distinct_symbols=distinct_symbols,
+                symbol_mean_excess_return=symbol_mean_excess,
+                concentration_warning=distinct_symbols < MIN_DISTINCT_SYMBOLS_FOR_TRUST,
             )
         )
 
@@ -226,6 +250,26 @@ def validate_signals(
     monotonic = (
         all(current >= following for current, following in zip(ranked_means, ranked_means[1:]))
         if len(ranked_means) >= 2
+        else None
+    )
+
+    # Same check, but weighting each symbol once regardless of how many days it spent in
+    # a classification — the day-weighted version above is exactly what a concentrated
+    # bucket (one or two symbols classified for a long overlapping-window stretch) can
+    # distort, since that symbol's single outcome then gets counted hundreds of times.
+    symbol_weighted_by_classification = {
+        bucket.classification: bucket.symbol_mean_excess_return
+        for bucket in buckets
+        if bucket.symbol_mean_excess_return is not None
+    }
+    ranked_symbol_means = [
+        symbol_weighted_by_classification[name]
+        for name in CLASSIFICATION_ORDER
+        if name in symbol_weighted_by_classification
+    ]
+    monotonic_symbol_weighted = (
+        all(current >= following for current, following in zip(ranked_symbol_means, ranked_symbol_means[1:]))
+        if len(ranked_symbol_means) >= 2
         else None
     )
 
@@ -237,6 +281,7 @@ def validate_signals(
         pooled_hit_rate=pooled_hit_rate,
         buckets=buckets,
         monotonic=monotonic,
+        monotonic_symbol_weighted=monotonic_symbol_weighted,
     )
 
 
@@ -252,20 +297,41 @@ def render_signal_validation_text(result: SignalValidationResult) -> str:
     if result.pooled_hit_rate is not None:
         lines.append(f"  pooled hit-rate (beat benchmark): {result.pooled_hit_rate:.1%}")
     lines.append("")
-    lines.append(f"  {'classification':<16}{'n':>7}{'hit-rate':>10}{'mean xs ret':>13}{'median xs ret':>15}{'p-value':>10}")
+    lines.append(
+        f"  {'classification':<16}{'n':>7}{'symbols':>9}{'hit-rate':>10}"
+        f"{'mean xs ret':>13}{'median xs ret':>15}{'p-value':>10}"
+    )
+    any_concentration_warning = False
     for bucket in result.buckets:
         if bucket.sample_size == 0:
-            lines.append(f"  {bucket.classification:<16}{0:>7}{'--':>10}{'--':>13}{'--':>15}{'--':>10}")
+            lines.append(f"  {bucket.classification:<16}{0:>7}{'--':>9}{'--':>10}{'--':>13}{'--':>15}{'--':>10}")
             continue
         p_text = f"{bucket.p_value:.4f}" if bucket.p_value is not None else "--"
+        symbols_text = f"{bucket.distinct_symbols}{'*' if bucket.concentration_warning else ' '}"
+        any_concentration_warning = any_concentration_warning or bucket.concentration_warning
         lines.append(
-            f"  {bucket.classification:<16}{bucket.sample_size:>7}"
+            f"  {bucket.classification:<16}{bucket.sample_size:>7}{symbols_text:>9}"
             f"{bucket.hit_rate:>10.1%}{bucket.mean_excess_return:>+13.2%}"
             f"{bucket.median_excess_return:>+15.2%}{p_text:>10}"
         )
+    if any_concentration_warning:
+        lines.append(
+            f"  * fewer than {MIN_DISTINCT_SYMBOLS_FOR_TRUST} distinct symbols back this bucket — its hit-rate/p-value"
+        )
+        lines.append(
+            "    reflects one or two stocks' overlapping-window history repeated many times, not an"
+        )
+        lines.append("    independently-sampled population effect. Treat it as anecdote, not evidence.")
     lines.append("")
     if result.monotonic is None:
         lines.append("  monotonic (Strong Candidate > ... > High Risk by mean excess return): not enough non-empty buckets to check")
     else:
         lines.append(f"  monotonic (Strong Candidate > ... > High Risk by mean excess return): {'yes' if result.monotonic else 'NO'}")
+    if result.monotonic_symbol_weighted is None:
+        lines.append("  monotonic (symbol-weighted, one vote per stock): not enough non-empty buckets to check")
+    else:
+        lines.append(
+            "  monotonic (symbol-weighted, one vote per stock): "
+            f"{'yes' if result.monotonic_symbol_weighted else 'NO'}"
+        )
     return "\n".join(lines)
