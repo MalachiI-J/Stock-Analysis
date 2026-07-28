@@ -320,56 +320,62 @@ def _write_phase2_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
 
 
 _REPORT_STYLES = """\
-    /* Dark is the default look (ties the page to the hero banner below);
-       a light OS preference gets the light variant instead. */
+    /* Data-terminal theme: unconditionally dark, matching the hero banner above
+       it — this page never switches to a light variant, the same way the hero
+       never has (a trading terminal doesn't follow the OS light/dark toggle). */
     :root {
       color-scheme: dark;
-      --surface:#1a1a19; --page:#0d0d0d; --ink:#ffffff; --ink-2:#c3c2b7; --muted:#898781;
-      --line:#2c2c2a; --border:rgba(255,255,255,0.12); --th-bg:#232322;
+      --page:#10130f; --surface:rgba(255,255,255,0.05); --border:rgba(255,255,255,0.14);
+      --ink:#e7e5df; --ink-2:#8a8d87; --muted:#8a8d87;
+      --line:rgba(255,255,255,0.10); --th-bg:rgba(255,255,255,0.035);
       --page-grid-a:rgba(150,180,200,0.05); --page-grid-b:rgba(150,180,200,0.04);
-      --good-fg:#3ddc3d; --good-bg:rgba(12,163,12,0.20); --good-border:rgba(12,163,12,0.45);
-      --warning-fg:#fab219; --warning-bg:rgba(250,178,25,0.20); --warning-border:rgba(250,178,25,0.5);
-      --serious-fg:#ec835a; --serious-bg:rgba(236,131,90,0.20); --serious-border:rgba(236,131,90,0.5);
-      --critical-fg:#e66767; --critical-bg:rgba(230,103,103,0.18); --critical-border:rgba(230,103,103,0.5);
-      --neutral-fg:#c3c2b7; --neutral-bg:rgba(137,135,129,0.20); --neutral-border:rgba(137,135,129,0.4);
+      --mono:"JetBrains Mono","IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+      --sans:system-ui,-apple-system,"Segoe UI",sans-serif;
+      /* Three semantic accents only — color appears exclusively where it means
+         something (a classification, a risk level, a delta), never decoratively. */
+      --good-fg:#5DCAA5; --good-bg:rgba(93,202,165,0.12); --good-border:rgba(93,202,165,0.35);
+      --warning-fg:#FAC775; --warning-bg:rgba(250,199,117,0.12); --warning-border:rgba(250,199,117,0.35);
+      --serious-fg:#F09595; --serious-bg:rgba(240,149,149,0.12); --serious-border:rgba(240,149,149,0.35);
+      --critical-fg:#F09595; --critical-bg:rgba(240,149,149,0.12); --critical-border:rgba(240,149,149,0.35);
+      --neutral-fg:#8a8d87; --neutral-bg:rgba(138,141,135,0.12); --neutral-border:rgba(138,141,135,0.30);
       --chart-blue:#3987e5; --chart-orange:#d95926; --chart-aqua:#199e70; --chart-yellow:#eda100;
-    }
-    @media (prefers-color-scheme: light) {
-      :root {
-        color-scheme: light;
-        --surface:#fcfcfb; --page:#f9f9f7; --ink:#0b0b0b; --ink-2:#52514e; --muted:#898781;
-        --line:#e1e0d9; --border:rgba(11,11,11,0.10); --th-bg:#f1f0ec;
-        --page-grid-a:rgba(90,110,130,0.035); --page-grid-b:rgba(90,110,130,0.03);
-        --good-fg:#006300; --good-bg:rgba(12,163,12,0.12); --good-border:rgba(12,163,12,0.35);
-        --warning-fg:#7a4d00; --warning-bg:rgba(250,178,25,0.18); --warning-border:rgba(250,178,25,0.45);
-        --serious-fg:#8a3216; --serious-bg:rgba(236,131,90,0.18); --serious-border:rgba(236,131,90,0.45);
-        --critical-fg:#d03b3b; --critical-bg:rgba(208,59,59,0.12); --critical-border:rgba(208,59,59,0.35);
-        --neutral-fg:#52514e; --neutral-bg:rgba(137,135,129,0.16); --neutral-border:rgba(137,135,129,0.30);
-        --chart-blue:#2a78d6; --chart-orange:#eb6834; --chart-aqua:#1baf7a; --chart-yellow:#c98500;
-      }
     }
     * { box-sizing:border-box; }
     body { margin:0; color:var(--ink);
-      font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;
+      font:15px/1.6 var(--sans);
       background-color:var(--page);
       background-image:
         repeating-linear-gradient(0deg, var(--page-grid-a) 0 1px, transparent 1px 44px),
         repeating-linear-gradient(100deg, var(--page-grid-b) 0 1px, transparent 1px 76px);
       background-attachment:fixed; }
-    .page { max-width:1200px; margin:0 auto; padding:8px 24px 48px; }
+    .page { max-width:1200px; margin:0 auto; padding:8px 24px 56px; }
     h1,h2,h3,h4 { line-height:1.25; font-weight:600; }
     h1 { font-size:1.7rem; margin-bottom:2px; }
     .subtitle { color:var(--ink-2); margin-top:0; margin-bottom:18px; font-size:14px; }
-    h2 { border-bottom:1px solid var(--line); padding-bottom:8px; margin-top:40px; }
+    h2 { border-bottom:1px solid var(--line); padding-bottom:8px; margin-top:56px; scroll-margin-top:52px; }
+    h2:target { color:var(--good-fg); transition:color 1.8s ease; }
     h4 { margin-bottom:6px; }
     table { width:100%; border-collapse:collapse; margin:12px 0 22px; }
     th,td { border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; }
-    th { background:var(--th-bg); color:var(--ink-2); font-weight:600; } .metadata th { width:210px; }
+    th { background:var(--th-bg); color:var(--ink-2); font-weight:600;
+      font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+    td.num, th.num { text-align:right; }
+    .mono, td.num, .stat-value, .delta, code, .kv dd, .metadata td { font-family:var(--mono); font-variant-numeric:tabular-nums; }
+    /* Run Metadata: a compact key/value layout instead of a bordered grid —
+       hairline row separators only, no visible cell borders. */
+    table.metadata { border:none; margin:0; }
+    table.metadata tr { border-bottom:1px solid var(--line); }
+    table.metadata tr:last-child { border-bottom:none; }
+    table.metadata th, table.metadata td { border:none; padding:9px 4px; }
+    table.metadata th { background:transparent; width:200px; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
     .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px 18px; margin:14px 0 22px; }
     .notice { padding:14px 16px; border:1px solid var(--border); border-left:3px solid var(--muted);
       background:var(--surface); color:var(--ink-2); border-radius:8px; margin:18px 0; }
     .regime-head { display:flex; align-items:center; gap:12px; }
-    .regime-confidence { color:var(--ink-2); font-size:13px; }
+    .regime-confidence { color:var(--ink-2); font-size:13px; font-family:var(--mono); }
+    .card ul { list-style:none; margin:6px 0 0; padding:0; }
+    .card ul li { position:relative; padding-left:16px; margin:4px 0; color:var(--ink); }
+    .card ul li::before { content:"–"; position:absolute; left:0; color:var(--muted); }
     .badge { display:inline-flex; align-items:center; gap:5px; padding:3px 11px; border-radius:999px;
       font-size:13px; font-weight:600; border:1px solid transparent; white-space:nowrap; }
     .badge-good { color:var(--good-fg); background:var(--good-bg); border-color:var(--good-border); }
@@ -377,20 +383,46 @@ _REPORT_STYLES = """\
     .badge-serious { color:var(--serious-fg); background:var(--serious-bg); border-color:var(--serious-border); }
     .badge-critical { color:var(--critical-fg); background:var(--critical-bg); border-color:var(--critical-border); }
     .badge-neutral { color:var(--neutral-fg); background:var(--neutral-bg); border-color:var(--neutral-border); }
-    .stock { border:1px solid var(--border); background:var(--surface); border-radius:10px; padding:20px; margin:20px 0; }
-    .stock-head { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
-    .stock-head h3 { margin:0; }
+    /* Score gauge: a thin 0-100 bar so relative strength reads at a glance
+       without comparing two numbers by eye. */
+    .gauge-row { display:inline-flex; align-items:center; gap:8px; }
+    .gauge { position:relative; width:56px; height:5px; border-radius:999px; background:rgba(255,255,255,0.10); overflow:hidden; flex:0 0 auto; }
+    .gauge.gauge-lg { width:100%; height:7px; }
+    .gauge .gauge-fill { position:absolute; top:0; left:0; bottom:0; border-radius:999px; }
+    .gauge-good .gauge-fill { background:var(--good-fg); }
+    .gauge-warning .gauge-fill { background:var(--warning-fg); }
+    .gauge-serious .gauge-fill, .gauge-critical .gauge-fill { background:var(--serious-fg); }
+    .gauge-neutral .gauge-fill { background:var(--neutral-fg); }
+    /* Signed deltas: color + caret instead of plain +/- text. Risk uses an
+       inverted color rule (a drop in risk is good) — see _delta_html(). */
+    .delta { font-weight:600; white-space:nowrap; }
+    .delta-good { color:var(--good-fg); } .delta-critical { color:var(--critical-fg); } .delta-neutral { color:var(--muted); }
+    .chip { display:inline-flex; align-items:center; padding:2px 9px; border-radius:999px; font-size:11.5px;
+      color:var(--ink-2); background:rgba(255,255,255,0.06); border:1px solid var(--border); white-space:nowrap; }
+    .stock { border:1px solid var(--border); background:var(--surface); border-radius:10px; padding:20px; margin:20px 0; scroll-margin-top:52px; }
+    .stock-head { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+    .stock-head h3 { margin:0; font-family:var(--mono); }
     .scores { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:14px 0; }
-    .stat { background:var(--page); border:1px solid var(--border); border-radius:8px; padding:12px 14px; }
+    .stat { background:var(--page); border:1px solid var(--border); border-top:2px solid var(--border); border-radius:8px; padding:12px 14px; }
+    .stat.stat-good { border-top-color:var(--good-border); }
+    .stat.stat-warning { border-top-color:var(--warning-border); }
+    .stat.stat-serious, .stat.stat-critical { border-top-color:var(--serious-border); }
     .stat .stat-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
     .stat .stat-value { font-size:1.5rem; font-weight:600; margin-top:3px; }
     .stat .stat-sub { margin-top:5px; }
+    .primary-gauges { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; margin:14px 0 18px; }
+    .primary-gauges .gauge-label { display:flex; justify-content:space-between; font-size:12px; color:var(--muted);
+      text-transform:uppercase; letter-spacing:.05em; margin-bottom:5px; }
+    .primary-gauges .gauge-label .mono { font-size:13px; color:var(--ink); text-transform:none; letter-spacing:normal; }
     .chart-wrap { overflow-x:auto; }
     .price-chart { width:100%; min-width:660px; height:auto; background:var(--surface); }
-    .legend { font-size:12px; } .muted { color:var(--muted); }
+    .legend { font-size:12px; font-family:var(--mono); } .muted { color:var(--muted); }
     .lists { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:14px; }
     .lists section { background:var(--page); border:1px solid var(--border); border-radius:8px; padding:10px 14px; }
-    ul { margin-top:6px; } code { overflow-wrap:anywhere; }
+    .lists section h5 { margin:10px 0 2px; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+    .lists section h5:first-child { margin-top:0; }
+    ul { margin-top:6px; padding-left:18px; } ul li { color:var(--ink); } ul li::marker { color:var(--muted); }
+    code { overflow-wrap:anywhere; }
     details.raw { margin:14px 0 0; border:1px solid var(--border); border-radius:8px; background:var(--page); }
     details.raw > summary { cursor:pointer; padding:10px 14px; font-weight:600; color:var(--ink-2);
       list-style:none; user-select:none; }
@@ -399,6 +431,17 @@ _REPORT_STYLES = """\
     details.raw[open] > summary::before { content:"▾ "; }
     details.raw .raw-body { padding:0 14px 14px; }
     details.raw table { margin:8px 0 14px; }
+
+    /* Sticky jump nav — CSS-only "current section" cue via :target on the
+       headings themselves (see h2:target above); a real scroll-spy needs JS,
+       which this report intentionally limits to the decorative hero only. */
+    .term-nav { position:sticky; top:0; z-index:5; display:flex; flex-wrap:wrap; gap:2px 4px;
+      background:rgba(16,19,15,0.92); backdrop-filter:blur(6px); border-bottom:1px solid var(--border);
+      padding:10px 24px; }
+    .term-nav a { color:var(--ink-2); text-decoration:none; font-family:var(--mono); font-size:12px;
+      text-transform:uppercase; letter-spacing:.06em; padding:5px 10px; border-radius:6px; }
+    .term-nav a:hover { color:var(--ink); background:rgba(255,255,255,0.06); }
+    @media print { .term-nav { display:none; } }
 
     /* Animated hero banner (decorative only; aria-hidden). Everything runs off one
        shared 60s timeline: a bull dwell (0-25s), a 5s falling transition that carries
@@ -874,23 +917,27 @@ def _render_phase2_html(
 </head>
 <body>
 {_market_hero_html()}
+  <nav class="term-nav" aria-label="Report sections">
+    <a href="#metadata">Metadata</a><a href="#market-regime">Market regime</a><a href="#candidates">Candidates</a>
+    <a href="#highest-risk">Highest risk</a><a href="#changes">Changes</a><a href="#symbols">Symbols</a>
+  </nav>
   <div class="page">
   <h1>Stock Scrapper Phase 2 Research Report</h1>
   <p class="subtitle">As of {_escape(report_date)} &nbsp;·&nbsp; {_display(metadata.get('data_through_date'))}</p>
   <div class="notice"><strong>Research disclaimer:</strong> Educational research only; not personalized financial advice. Scores and classifications do not guarantee investment performance.</div>
-  <h2>Run Metadata</h2>
+  <h2 id="metadata">Run Metadata</h2>
   <div class="card"><table class="metadata"><tbody>{metadata_html}</tbody></table></div>
-  <h2>Market Regime</h2>
+  <h2 id="market-regime">Market Regime</h2>
   <div class="card regime"><div class="regime-head">{regime_badge}<span class="regime-confidence">confidence {_score(metadata.get('market_regime_confidence'))}</span></div><h4>Market-regime reasons</h4>{regime_reasons}</div>
-  <h2>Candidate Ranking</h2>
+  <h2 id="candidates">Candidate Ranking</h2>
   {candidate_html}
-  <h2>Highest-Risk Ranking</h2>
+  <h2 id="highest-risk">Highest-Risk Ranking</h2>
   {risk_html}
-  <h2>Changes From Previous Stored Analysis</h2>
+  <h2 id="changes">Changes From Previous Stored Analysis</h2>
   {changes_html}
   <h2>Data-Quality Concerns</h2>
   {quality_html}
-  <h2>Symbol Analysis</h2>
+  <h2 id="symbols">Symbol Analysis</h2>
   {detail_html or '<p>No symbol results were available.</p>'}
   <h2>Methodology</h2>
   <p>This report presents deterministic, explainable Phase 2 classifications using data available through the stated as-of date. Opportunity, measured risk, and confidence are separate 0–100 scales. Missing inputs remain unavailable rather than being silently treated as zero.</p>
@@ -913,15 +960,46 @@ def _ranking_table(
     rows = []
     for result in results:
         symbol = str(result.get("symbol", "")).upper()
+        classification_status = _CLASSIFICATION_STATUS.get(str(result.get("classification") or ""), "neutral")
+        risk_status = _RISK_LEVEL_STATUS.get(str(result.get("risk_level") or ""), "neutral")
+        opportunity_cell = (
+            f'<span class="gauge-row">{_score(result.get("opportunity_score"))}'
+            f'{_gauge_html(result.get("opportunity_score"), classification_status)}</span>'
+        )
+        risk_cell = (
+            f'<span class="gauge-row">{_score(result.get("risk_score"))}'
+            f'{_gauge_html(result.get("risk_score"), risk_status)}</span>'
+        )
         rows.append(
             "<tr>"
-            f"<td>{ranks.get(symbol, '')}</td><td>{_escape(symbol)}</td>"
+            f'<td class="num">{ranks.get(symbol, "")}</td>'
+            f'<td><a class="mono" href="#{_symbol_anchor_id(symbol)}">{_escape(symbol)}</a></td>'
             f"<td>{_badge(result.get('classification'), _CLASSIFICATION_STATUS)}</td>"
-            f"<td>{_score(result.get('opportunity_score'))}</td>"
-            f"<td>{_score(result.get('risk_score'))}</td>"
-            f"<td>{_score(result.get('confidence_score'))}</td></tr>"
+            f'<td class="num">{opportunity_cell}</td>'
+            f'<td class="num">{risk_cell}</td>'
+            f'<td class="num">{_score(result.get("confidence_score"))}</td></tr>'
         )
-    return "<table><thead><tr><th>Rank</th><th>Symbol</th><th>Classification</th><th>Opportunity</th><th>Risk</th><th>Confidence</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+    return (
+        '<table><thead><tr><th>Rank</th><th>Symbol</th><th>Classification</th>'
+        '<th class="num">Opportunity</th><th class="num">Risk</th><th class="num">Confidence</th></tr></thead>'
+        "<tbody>" + "".join(rows) + "</tbody></table>"
+    )
+
+
+def _grouped_lists_html(groups: Sequence[tuple[str, Sequence[tuple[str, Any]]]]) -> str:
+    """Renders each group as one card containing only its non-empty sub-items —
+    a symbol with nothing to say under a given sub-item shows no placeholder at
+    all, and a group with nothing under any of its sub-items renders nothing."""
+    sections = []
+    for group_title, sub_items in groups:
+        parts = [
+            f"<h5>{_escape(sub_title)}</h5>" + _render_list(items, "")
+            for sub_title, values in sub_items
+            if (items := _as_list(values))
+        ]
+        if parts:
+            sections.append(f"<section><h4>{_escape(group_title)}</h4>{''.join(parts)}</section>")
+    return "".join(sections)
 
 
 def _result_section(entry: dict[str, Any]) -> str:
@@ -937,33 +1015,42 @@ def _result_section(entry: dict[str, Any]) -> str:
             ("Indicator snapshot", "indicators"),
         )
     )
-    lists = (
-        ("Positive factors", result.get("positive_factors")),
-        ("Risk factors", result.get("risk_factors")),
-        ("Confidence limitations", result.get("confidence_limitations")),
-        ("Data-quality concerns", entry.get("quality_concerns")),
-        ("Market-regime effects", result.get("market_regime_effects")),
-        ("Improvement conditions", result.get("improvement_conditions")),
-        ("Weakening conditions", result.get("weakening_conditions")),
-        ("Blocking reasons", result.get("blocking_reasons")),
-        ("Flags", result.get("flags")),
+    groups = (
+        ("Why", (
+            ("Positive factors", result.get("positive_factors")),
+            ("Market-regime effects", result.get("market_regime_effects")),
+        )),
+        ("Watch for", (
+            ("Risk factors", result.get("risk_factors")),
+            ("Weakening conditions", result.get("weakening_conditions")),
+            ("Blocking reasons", result.get("blocking_reasons")),
+        )),
+        ("Would change this", (
+            ("Improvement conditions", result.get("improvement_conditions")),
+            ("Confidence limitations", result.get("confidence_limitations")),
+            ("Data-quality concerns", entry.get("quality_concerns")),
+        )),
     )
-    list_html = "".join(
-        f"<section><h4>{_escape(title)}</h4>{_render_list(values, 'None recorded.')}</section>"
-        for title, values in lists
-    )
+    list_html = _grouped_lists_html(groups)
+    classification_status = _CLASSIFICATION_STATUS.get(str(result.get("classification") or ""), "neutral")
+    risk_status = _RISK_LEVEL_STATUS.get(str(result.get("risk_level") or ""), "neutral")
     classification_badge = _badge(result.get("classification"), _CLASSIFICATION_STATUS)
     risk_level_badge = _badge(result.get("risk_level"), _RISK_LEVEL_STATUS)
-    return f"""<article class="stock">
-<div class="stock-head"><h3>{_escape(symbol)}</h3>{classification_badge}</div>
+    flags_html = "".join(f'<span class="chip">{_escape(flag)}</span>' for flag in _as_list(result.get("flags")))
+    return f"""<article class="stock" id="{_symbol_anchor_id(symbol)}">
+<div class="stock-head"><h3>{_escape(symbol)}</h3>{classification_badge}{flags_html}</div>
 <p><strong>Primary reason:</strong> {_display(result.get('primary_reason'))}<br />
 <strong>Data through:</strong> {_display(result.get('data_through_date'))} &nbsp; <strong>Trend state:</strong> {_display(result.get('trend_state'))}</p>
 <div class="scores">
-<div class="stat"><div class="stat-label">Opportunity</div><div class="stat-value">{_score(result.get('opportunity_score'))}</div></div>
-<div class="stat"><div class="stat-label">Measured risk</div><div class="stat-value">{_score(result.get('risk_score'))}</div><div class="stat-sub">{risk_level_badge}</div></div>
+<div class="stat stat-{classification_status}"><div class="stat-label">Opportunity</div><div class="stat-value">{_score(result.get('opportunity_score'))}</div></div>
+<div class="stat stat-{risk_status}"><div class="stat-label">Measured risk</div><div class="stat-value">{_score(result.get('risk_score'))}</div><div class="stat-sub">{risk_level_badge}</div></div>
 <div class="stat"><div class="stat-label">Confidence</div><div class="stat-value">{_score(result.get('confidence_score'))}</div></div>
 <div class="stat"><div class="stat-label">Candidate rank</div><div class="stat-value">{_display(entry.get('candidate_rank'))}</div></div>
 <div class="stat"><div class="stat-label">Risk rank</div><div class="stat-value">{_display(entry.get('risk_rank'))}</div></div>
+</div>
+<div class="primary-gauges">
+<div><div class="gauge-label"><span>Opportunity</span><span class="mono">{_score(result.get('opportunity_score'))}</span></div>{_gauge_html(result.get('opportunity_score'), classification_status, large=True)}</div>
+<div><div class="gauge-label"><span>Measured risk</span><span class="mono">{_score(result.get('risk_score'))}</span></div>{_gauge_html(result.get('risk_score'), risk_status, large=True)}</div>
 </div>
 <h4>Adjusted Price and Moving Averages</h4>{chart}
 <div class="lists">{list_html}</div>
@@ -990,16 +1077,23 @@ def _changes_table(entries: list[dict[str, Any]]) -> str:
         return "<p>No results were available for comparison.</p>"
     rows = "".join(
         "<tr>"
-        f"<td>{_display(entry['result'].get('symbol'))}</td>"
-        f"<td>{_display((entry.get('previous') or {}).get('classification'))}</td>"
-        f"<td>{_display(entry['result'].get('classification'))}</td>"
-        f"<td>{_score_change(entry['change'].get('opportunity_score_change'))}</td>"
-        f"<td>{_score_change(entry['change'].get('risk_score_change'))}</td>"
-        f"<td>{_score_change(entry['change'].get('confidence_score_change'))}</td>"
+        f'<td class="mono">{_display(entry["result"].get("symbol"))}</td>'
+        f'<td>{_badge((entry.get("previous") or {}).get("classification"), _CLASSIFICATION_STATUS)}</td>'
+        f'<td>{_badge(entry["result"].get("classification"), _CLASSIFICATION_STATUS)}</td>'
+        f'<td class="num">{_delta_html(entry["change"].get("opportunity_score_change"))}</td>'
+        # Risk Δ is inverted: a falling risk score is the favorable direction,
+        # so a negative delta reads green here even though it's the same sign
+        # that would read red for Opportunity/Confidence.
+        f'<td class="num">{_delta_html(entry["change"].get("risk_score_change"), invert=True)}</td>'
+        f'<td class="num">{_delta_html(entry["change"].get("confidence_score_change"))}</td>'
         f"<td>{_display(entry['change'].get('summary'))}</td></tr>"
         for entry in entries
     )
-    return "<table><thead><tr><th>Symbol</th><th>Previous</th><th>Current</th><th>Opportunity Δ</th><th>Risk Δ</th><th>Confidence Δ</th><th>Summary</th></tr></thead><tbody>" + rows + "</tbody></table>"
+    return (
+        '<table><thead><tr><th>Symbol</th><th>Previous</th><th>Current</th>'
+        '<th class="num">Opportunity Δ</th><th class="num">Risk Δ</th><th class="num">Confidence Δ</th>'
+        "<th>Summary</th></tr></thead><tbody>" + rows + "</tbody></table>"
+    )
 
 
 def _quality_table(issues: list[dict[str, Any]]) -> str:
@@ -1059,6 +1153,20 @@ def _price_chart_svg(symbol: str, history: list[dict[str, Any]], cutoff: str | N
         value = maximum - fraction * (maximum - minimum)
         grid.append(f'<line x1="{left:.1f}" y1="{y:.1f}" x2="{width-right:.1f}" y2="{y:.1f}" stroke="var(--line)"/><text x="{left-7:.1f}" y="{y+4:.1f}" text-anchor="end" font-size="11" fill="var(--ink-2)">{value:.2f}</text>')
 
+    safe_id = _safe_html_id(symbol)
+    fill_gradient_id = f"price-fill-{safe_id}"
+    plot_bottom = top + plot_height
+    area_fills = []
+    for segment in _contiguous_segments(series["adjusted-price"]):
+        if len(segment) < 2:
+            continue
+        coordinates = " ".join(f"{x_position(index):.2f},{y_position(value):.2f}" for index, value in segment)
+        first_x, last_x = x_position(segment[0][0]), x_position(segment[-1][0])
+        area_fills.append(
+            f'<polygon points="{first_x:.2f},{plot_bottom:.2f} {coordinates} {last_x:.2f},{plot_bottom:.2f}" '
+            f'fill="url(#{fill_gradient_id})" stroke="none"/>'
+        )
+
     paths = []
     for name, values in series.items():
         for segment in _contiguous_segments(values):
@@ -1074,9 +1182,13 @@ def _price_chart_svg(symbol: str, history: list[dict[str, Any]], cutoff: str | N
         x = left + index * 150
         legend.append(f'<line x1="{x:.1f}" y1="{height-12:.1f}" x2="{x+22:.1f}" y2="{height-12:.1f}" stroke="{colors[name]}" stroke-width="3"/><text class="legend" x="{x+28:.1f}" y="{height-8:.1f}" fill="var(--ink-2)">{labels[name]}</text>')
 
-    safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "-", symbol).strip("-") or "symbol"
     first_date, last_date = points[0][0], points[-1][0]
-    return f'''<div class="chart-wrap"><svg class="price-chart" viewBox="0 0 {int(width)} {int(height)}" role="img" aria-labelledby="chart-{_escape(safe_id)}-title"><title id="chart-{_escape(safe_id)}-title">{_escape(symbol)} adjusted price with 20-, 50-, and 200-session moving averages</title><rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" fill="var(--surface)" stroke="var(--border)"/>{''.join(grid)}{''.join(paths)}<text x="{left:.1f}" y="{height-bottom+18:.1f}" font-size="11" fill="var(--ink-2)">{_escape(first_date)}</text><text x="{width-right:.1f}" y="{height-bottom+18:.1f}" text-anchor="end" font-size="11" fill="var(--ink-2)">{_escape(last_date)}</text>{''.join(legend)}</svg></div>'''
+    defs = (
+        f'<defs><linearGradient id="{fill_gradient_id}" x1="0" y1="0" x2="0" y2="1">'
+        f'<stop offset="0%" stop-color="var(--chart-blue)" stop-opacity="0.22"/>'
+        f'<stop offset="100%" stop-color="var(--chart-blue)" stop-opacity="0"/></linearGradient></defs>'
+    )
+    return f'''<div class="chart-wrap"><svg class="price-chart" viewBox="0 0 {int(width)} {int(height)}" role="img" aria-labelledby="chart-{_escape(safe_id)}-title"><title id="chart-{_escape(safe_id)}-title">{_escape(symbol)} adjusted price with 20-, 50-, and 200-session moving averages</title>{defs}<rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" fill="var(--surface)" stroke="var(--border)"/>{''.join(grid)}{''.join(area_fills)}{''.join(paths)}<text x="{left:.1f}" y="{height-bottom+18:.1f}" font-size="11" fill="var(--ink-2)">{_escape(first_date)}</text><text x="{width-right:.1f}" y="{height-bottom+18:.1f}" text-anchor="end" font-size="11" fill="var(--ink-2)">{_escape(last_date)}</text>{''.join(legend)}</svg></div>'''
 
 
 def _chart_points(history: list[dict[str, Any]], cutoff: str | None) -> list[tuple[str, float | None]]:
@@ -1380,9 +1492,37 @@ def _badge(value: Any, status_map: Mapping[str, str]) -> str:
     return f'<span class="badge badge-{status}">{_escape(label)}</span>'
 
 
-def _score_change(value: Any) -> str:
+def _gauge_html(value: Any, status: str, large: bool = False) -> str:
+    """A thin 0-100 bar so relative strength reads without comparing two numbers by eye."""
     number = _finite_number(value)
-    return '<span class="muted">Unavailable</span>' if number is None else f"{number:+.2f}"
+    if number is None:
+        return ""
+    pct = max(0.0, min(100.0, number))
+    classes = f"gauge gauge-{status}" + (" gauge-lg" if large else "")
+    return f'<span class="{classes}"><span class="gauge-fill" style="width:{pct:.1f}%"></span></span>'
+
+
+def _delta_html(value: Any, invert: bool = False) -> str:
+    """Signed delta with a caret and color. ``invert`` flips the good/bad read —
+    used for Risk Δ, where a drop in risk is the favorable direction."""
+    number = _finite_number(value)
+    if number is None:
+        return '<span class="muted">Unavailable</span>'
+    if number == 0:
+        status, caret = "neutral", "•"
+    else:
+        favorable = (number < 0) if invert else (number > 0)
+        status = "good" if favorable else "critical"
+        caret = "▲" if number > 0 else "▼"
+    return f'<span class="delta delta-{status}">{caret} {number:+.2f}</span>'
+
+
+def _safe_html_id(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]+", "-", text).strip("-") or "id"
+
+
+def _symbol_anchor_id(symbol: str) -> str:
+    return f"symbol-{_safe_html_id(symbol)}"
 
 
 def _flatten_row_for_csv(row: dict[str, Any]) -> dict[str, Any]:
