@@ -527,19 +527,47 @@ _MARKET_HERO_TEMPLATE = """\
         window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
       var CYCLE_MS = 60000, BULL_MS = 25000, TRANSITION_MS = 5000;
-      // Points carry their own timestamp so x-position is a continuous function
-      // of "now" (recomputed every animation frame) instead of a step that only
-      // moves once per append — that discretization was the visible stutter.
-      var VISIBLE_MS = 20000, APPEND_EVERY_MS = 220;
+      // Trail samples carry their own timestamp so x-position is a continuous
+      // function of "now" (recomputed every animation frame) instead of a step
+      // that only moves once per append — that discretization was the stutter.
+      var VISIBLE_MS = 20000, APPEND_EVERY_MS = 220, SAMPLE_EVERY_MS = 70;
       var dpr = window.devicePixelRatio || 1;
-      var points = [];
-      var value = 100;
+      // `targetValue` is the underlying stochastic walk (updated in slow, decisive
+      // steps by the leg system below). `displayValue` is the ONE continuously
+      // eased quantity actually drawn — every recorded trail sample and the live
+      // tip both come from it, so there is never a seam between "history" and
+      // "now" the way there was when the tip had its own separate smoothing
+      // layered on top of already-smoothed historical points (that mismatch is
+      // what caused the line to visibly dip under/over the arrowhead).
+      var trail = [];
+      var targetValue = 100;
       var startedAt = Date.now();
-      var lastAppend = -Infinity;
+      var lastTargetUpdate = -Infinity;
+      var lastSampleAt = -Infinity;
       var lastFrameAt = 0;
-      var smoothed = null;
       var displayValue = null;
       var displayMin = null, displayMax = null;
+      var displayAngle = null;
+      // Dwell phases (the 25s bull/bear stretches) run a chain of ~5s legs, each
+      // randomly up or down. Speed (not direction odds) is what makes the phase
+      // "generally" trend the right way: a leg that runs WITH the phase's color
+      // (up during green, down during red) moves fast; a leg AGAINST it (a dip
+      // during green, a relief bounce during red) moves slowly. Direction is a
+      // genuine 50/50 coin flip each leg — the fast/slow asymmetry alone is what
+      // keeps the net motion trending the phase's way.
+      var legDir = 1, legSpeed = 1, legRemainingMs = 0;
+      var dwellKind = null;
+
+      function dwellDrift(biasUp) {
+        if (legRemainingMs <= 0) {
+          legRemainingMs = 4000 + Math.random() * 2400;
+          legDir = Math.random() < 0.5 ? 1 : -1;
+          var withPhase = (legDir === 1) === biasUp;
+          legSpeed = withPhase ? 1.8 + Math.random() * 1.2 : 0.25 + Math.random() * 0.35;
+        }
+        legRemainingMs -= APPEND_EVERY_MS;
+        return legDir * legSpeed;
+      }
 
       // Frame-rate independent easing: converges toward `target` at a fixed
       // half-life regardless of how far apart two draw() calls land in time,
@@ -558,34 +586,35 @@ _MARKET_HERO_TEMPLATE = """\
 
       function phaseOf(elapsedMs) {
         var t = elapsedMs % CYCLE_MS;
-        if (t < BULL_MS) return { drift: 0.55, bull: true };
-        if (t < BULL_MS + TRANSITION_MS) return { drift: -3.2, bull: t < BULL_MS + TRANSITION_MS / 2 };
-        if (t < BULL_MS + TRANSITION_MS + BULL_MS) return { drift: -0.55, bull: false };
-        return { drift: 3.2, bull: t > CYCLE_MS - TRANSITION_MS / 2 };
+        if (t < BULL_MS) return { dwell: true, bull: true };
+        if (t < BULL_MS + TRANSITION_MS) return { dwell: false, drift: -3.2, bull: t < BULL_MS + TRANSITION_MS / 2 };
+        if (t < BULL_MS + TRANSITION_MS + BULL_MS) return { dwell: true, bull: false };
+        return { dwell: false, drift: 3.2, bull: t > CYCLE_MS - TRANSITION_MS / 2 };
       }
 
-      function appendPoint(elapsedMs) {
+      function updateTarget(elapsedMs) {
         var phase = phaseOf(elapsedMs);
-        value += phase.drift + (Math.random() - 0.5) * 2.2;
-        // Light exponential smoothing so consecutive points don't zigzag —
-        // the drift/phase story still comes through, just without noise spikes.
-        smoothed = smoothed === null ? value : smoothed * 0.7 + value * 0.3;
-        points.push({ t: elapsedMs, v: smoothed });
-        var cutoff = elapsedMs - VISIBLE_MS - APPEND_EVERY_MS * 2;
-        while (points.length > 2 && points[0].t < cutoff) points.shift();
+        if (phase.dwell) {
+          var kindKey = phase.bull ? "bull" : "bear";
+          if (dwellKind !== kindKey) {
+            dwellKind = kindKey;
+            legRemainingMs = 0;
+          }
+        } else {
+          dwellKind = null;
+        }
+        var drift = phase.dwell ? dwellDrift(phase.bull) : phase.drift;
+        // Small noise only — legs are the story now, so texture must stay well
+        // under even the slow leg's own speed or it'll read as wiggle again.
+        targetValue += drift + (Math.random() - 0.5) * 0.35;
       }
 
       function draw(elapsedMs, dtMs) {
         var w = canvas.width, h = canvas.height;
         ctx.clearRect(0, 0, w, h);
-        if (points.length < 2) return;
-        var latest = points[points.length - 1].v;
-        // Ease toward the newest sample instead of snapping to it — this is what
-        // keeps the tip's position (see tipX below) fixed and steady rather than
-        // popping back out to the canvas edge every append.
-        displayValue = ease(displayValue, latest, 260, dtMs);
+        if (trail.length < 2) return;
 
-        var rawValues = points.map(function (p) { return p.v; }).concat([displayValue]);
+        var rawValues = trail.map(function (p) { return p.v; }).concat([displayValue]);
         var rawMin = Math.min.apply(null, rawValues), rawMax = Math.max.apply(null, rawValues);
         var pad = (rawMax - rawMin) * 0.18 || 6;
         rawMin -= pad; rawMax += pad;
@@ -611,9 +640,11 @@ _MARKET_HERO_TEMPLATE = """\
         function xAt(p) { return tipX - (elapsedMs - p.t) * pxPerMs; }
         function yAt(v) { return h - ((v - min) / (max - min)) * h; }
 
-        var history = points.slice(0, points.length - 1);
-        var xs = history.map(xAt).concat([tipX]);
-        var ys = history.map(function (p) { return yAt(p.v); }).concat([yAt(displayValue)]);
+        // `trail` is a rolling record of the SAME continuously-eased displayValue
+        // drawn as the tip below — not a separate, noisier source — so the last
+        // history sample and the tip always sit on the same smooth trajectory.
+        var xs = trail.map(xAt).concat([tipX]);
+        var ys = trail.map(function (p) { return yAt(p.v); }).concat([yAt(displayValue)]);
         var startIdx = 0;
         while (startIdx < xs.length - 2 && xs[startIdx + 1] < -20 * dpr) startIdx++;
 
@@ -651,11 +682,23 @@ _MARKET_HERO_TEMPLATE = """\
         tracePath();
         ctx.stroke();
 
-        var lastI = xs.length - 1, prevI = xs.length - 2;
+        var lastI = xs.length - 1;
         var tipY = ys[lastI];
-        var angle = Math.atan2(tipY - ys[prevI], tipX - xs[prevI]);
+        // The arrowhead's angle used to come from just the last two samples —
+        // one tick of noise was enough to flip it, so it flickered. Instead,
+        // look back ~1.4s for the reference point (long enough to reflect the
+        // leg's actual trend, not a single jittery step) and ease the angle
+        // itself, so the head only turns once the trend genuinely changes.
+        var lookbackTime = elapsedMs - 1400;
+        var refIdx = 0;
+        for (var li = trail.length - 1; li >= 0; li--) {
+          if (trail[li].t <= lookbackTime) { refIdx = li; break; }
+        }
+        var refX = xs[refIdx], refY = ys[refIdx];
+        var targetAngle = Math.atan2(tipY - refY, tipX - refX);
+        displayAngle = ease(displayAngle, targetAngle, 700, dtMs);
         ctx.translate(tipX, tipY);
-        ctx.rotate(angle);
+        ctx.rotate(displayAngle);
         ctx.fillStyle = color;
         ctx.beginPath();
         ctx.moveTo(14 * dpr, 0);
@@ -670,10 +713,22 @@ _MARKET_HERO_TEMPLATE = """\
         var elapsedMs = Date.now() - startedAt;
         var dtMs = lastFrameAt ? Math.min(elapsedMs - lastFrameAt, 100) : 16.7;
         lastFrameAt = elapsedMs;
-        if (elapsedMs - lastAppend >= APPEND_EVERY_MS) {
-          lastAppend = elapsedMs;
-          appendPoint(elapsedMs);
+
+        if (elapsedMs - lastTargetUpdate >= APPEND_EVERY_MS) {
+          lastTargetUpdate = elapsedMs;
+          updateTarget(elapsedMs);
         }
+        // The single easing pass: every trail sample recorded below, and the
+        // live tip drawn in draw(), both read this same value.
+        displayValue = ease(displayValue, targetValue, 180, dtMs);
+
+        if (elapsedMs - lastSampleAt >= SAMPLE_EVERY_MS) {
+          lastSampleAt = elapsedMs;
+          trail.push({ t: elapsedMs, v: displayValue });
+          var cutoff = elapsedMs - VISIBLE_MS - SAMPLE_EVERY_MS * 2;
+          while (trail.length > 2 && trail[0].t < cutoff) trail.shift();
+        }
+
         draw(elapsedMs, dtMs);
         if (!reduceMotion) requestAnimationFrame(frame);
       }
@@ -681,9 +736,13 @@ _MARKET_HERO_TEMPLATE = """\
       resize();
       window.addEventListener("resize", resize);
       for (var seed = -Math.ceil(VISIBLE_MS / APPEND_EVERY_MS); seed <= 0; seed++) {
-        appendPoint(seed * APPEND_EVERY_MS);
+        var seedT = seed * APPEND_EVERY_MS;
+        updateTarget(seedT);
+        trail.push({ t: seedT, v: targetValue });
       }
-      lastAppend = 0;
+      displayValue = targetValue;
+      lastTargetUpdate = 0;
+      lastSampleAt = 0;
       requestAnimationFrame(frame);
     } catch (err) {
       // Decorative animation only; never let it disrupt the report itself.
