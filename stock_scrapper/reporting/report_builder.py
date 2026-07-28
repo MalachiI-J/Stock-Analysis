@@ -83,6 +83,33 @@ _HISTORY_PAYLOAD_KEYS = frozenset(
     {"history", "price_history", "historical_prices", "chart_history", "price_series", "date_series", "dates"}
 )
 
+# Status-color mapping for badges: reuses the report's fixed status palette
+# (good/warning/serious/critical/neutral) rather than inventing new colors per
+# field, so "Strong Candidate" and "Low risk" read as the same kind of good.
+_CLASSIFICATION_STATUS: dict[str, str] = {
+    "Strong Candidate": "good",
+    "Candidate": "good",
+    "Watch": "warning",
+    "Avoid": "serious",
+    "High Risk": "critical",
+    "Insufficient Data": "neutral",
+    "Data Blocked": "neutral",
+}
+_RISK_LEVEL_STATUS: dict[str, str] = {
+    "Low": "good",
+    "Moderate": "warning",
+    "Elevated": "serious",
+    "High": "critical",
+    "Unavailable": "neutral",
+}
+_REGIME_STATUS: dict[str, str] = {
+    "Risk-On": "good",
+    "Neutral": "neutral",
+    "Risk-Off": "serious",
+    "Stress": "critical",
+    "Insufficient Market Data": "neutral",
+}
+
 
 def write_phase2_reports(
     output_dir: str | Path,
@@ -292,6 +319,664 @@ def _write_phase2_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
     return path
 
 
+_REPORT_STYLES = """\
+    /* Data-terminal theme: dark by default, with a light counterpart selected
+       by [data-theme] on <html> (set by the theme script in <head>, before
+       paint, so there's no flash of the wrong theme). Every color used below
+       is one of these custom properties — never a hardcoded hex scattered
+       through a component rule — so switching theme is one attribute flip,
+       not a per-component conditional. The hero banner never reads these
+       tokens at all (it uses its own literal colors), which is what keeps it
+       identical in both modes. */
+    :root, [data-theme="dark"] {
+      color-scheme: dark;
+      --page:#10130f; --surface:rgba(255,255,255,0.05); --border:rgba(255,255,255,0.14);
+      --ink:#e7e5df; --ink-2:#8a8d87; --muted:#8a8d87;
+      --line:rgba(255,255,255,0.10); --th-bg:rgba(255,255,255,0.035);
+      --page-grid-a:rgba(150,180,200,0.05); --page-grid-b:rgba(150,180,200,0.04);
+      --track-bg:rgba(255,255,255,0.10); --chip-bg:rgba(255,255,255,0.06);
+      --nav-bg:rgba(16,19,15,0.92); --hover-bg:rgba(255,255,255,0.06);
+      /* Deliberately DARKER/recessed than --surface (used for the active
+         circle below) — that contrast is what reads as "raised," not flat. */
+      --toggle-track:rgba(255,255,255,0.03); --toggle-shadow:0 1px 3px rgba(0,0,0,.45);
+      --mono:"JetBrains Mono","IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+      --sans:system-ui,-apple-system,"Segoe UI",sans-serif;
+      /* Three semantic accents only — color appears exclusively where it means
+         something (a classification, a risk level, a delta), never decoratively. */
+      --good-fg:#5DCAA5; --good-bg:rgba(93,202,165,0.12); --good-border:rgba(93,202,165,0.35);
+      --warning-fg:#FAC775; --warning-bg:rgba(250,199,117,0.12); --warning-border:rgba(250,199,117,0.35);
+      --serious-fg:#F09595; --serious-bg:rgba(240,149,149,0.12); --serious-border:rgba(240,149,149,0.35);
+      --critical-fg:#F09595; --critical-bg:rgba(240,149,149,0.12); --critical-border:rgba(240,149,149,0.35);
+      --neutral-fg:#8a8d87; --neutral-bg:rgba(138,141,135,0.12); --neutral-border:rgba(138,141,135,0.30);
+      --good-accent-bar:var(--good-border); --warning-accent-bar:var(--warning-border);
+      --serious-accent-bar:var(--serious-border); --critical-accent-bar:var(--serious-border);
+      --chart-blue:#3987e5; --chart-orange:#d95926; --chart-aqua:#199e70; --chart-yellow:#eda100;
+    }
+    [data-theme="light"] {
+      color-scheme: light;
+      --page:#F7F6F2; --surface:#FFFFFF; --border:rgba(0,0,0,0.10);
+      --ink:#1a1c18; --ink-2:#6b6f68; --muted:#6b6f68;
+      --line:rgba(0,0,0,0.08); --th-bg:rgba(0,0,0,0.025);
+      --page-grid-a:rgba(90,110,130,0.05); --page-grid-b:rgba(90,110,130,0.04);
+      --track-bg:rgba(0,0,0,0.08); --chip-bg:rgba(0,0,0,0.045);
+      --nav-bg:rgba(247,246,242,0.92); --hover-bg:rgba(0,0,0,0.045);
+      --toggle-track:rgba(0,0,0,0.06); --toggle-shadow:0 1px 2px rgba(0,0,0,.18);
+      --good-fg:#27500A; --good-bg:#EAF3DE; --good-border:rgba(39,80,10,0.30);
+      --warning-fg:#633806; --warning-bg:#FAEEDA; --warning-border:rgba(99,56,6,0.30);
+      --serious-fg:#791F1F; --serious-bg:#FCEBEB; --serious-border:rgba(121,31,31,0.28);
+      --critical-fg:#791F1F; --critical-bg:#FCEBEB; --critical-border:rgba(121,31,31,0.28);
+      --neutral-fg:#6b6f68; --neutral-bg:rgba(0,0,0,0.06); --neutral-border:rgba(0,0,0,0.18);
+      --good-accent-bar:#639922; --warning-accent-bar:#BA7517;
+      --serious-accent-bar:#BA3B3B; --critical-accent-bar:#BA3B3B;
+      --chart-blue:#2a78d6; --chart-orange:#eb6834; --chart-aqua:#1baf7a; --chart-yellow:#c98500;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink);
+      font:15px/1.6 var(--sans);
+      background-color:var(--page);
+      background-image:
+        repeating-linear-gradient(0deg, var(--page-grid-a) 0 1px, transparent 1px 44px),
+        repeating-linear-gradient(100deg, var(--page-grid-b) 0 1px, transparent 1px 76px);
+      background-attachment:fixed; }
+    .page { max-width:1200px; margin:0 auto; padding:8px 24px 56px; }
+    h1,h2,h3,h4 { line-height:1.25; font-weight:600; }
+    h1 { font-size:1.7rem; margin-bottom:2px; }
+    .subtitle { color:var(--ink-2); margin-top:0; margin-bottom:18px; font-size:14px; }
+    h2 { border-bottom:1px solid var(--line); padding-bottom:8px; margin-top:56px; scroll-margin-top:52px; }
+    h2:target { color:var(--good-fg); transition:color 1.8s ease; }
+    h4 { margin-bottom:6px; }
+    table { width:100%; border-collapse:collapse; margin:12px 0 22px; }
+    th,td { border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; }
+    th { background:var(--th-bg); color:var(--ink-2); font-weight:600;
+      font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+    td.num, th.num { text-align:right; }
+    .mono, td.num, .stat-value, .delta, code, .kv dd, .metadata td { font-family:var(--mono); font-variant-numeric:tabular-nums; }
+    /* Run Metadata: a compact key/value layout instead of a bordered grid —
+       hairline row separators only, no visible cell borders. */
+    table.metadata { border:none; margin:0; }
+    table.metadata tr { border-bottom:1px solid var(--line); }
+    table.metadata tr:last-child { border-bottom:none; }
+    table.metadata th, table.metadata td { border:none; padding:9px 4px; }
+    table.metadata th { background:transparent; width:200px; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+    .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px 18px; margin:14px 0 22px; }
+    .notice { padding:14px 16px; border:1px solid var(--border); border-left:3px solid var(--muted);
+      background:var(--surface); color:var(--ink-2); border-radius:8px; margin:18px 0; }
+    .regime-head { display:flex; align-items:center; gap:12px; }
+    .regime-confidence { color:var(--ink-2); font-size:13px; font-family:var(--mono); }
+    .card ul { list-style:none; margin:6px 0 0; padding:0; }
+    .card ul li { position:relative; padding-left:16px; margin:4px 0; color:var(--ink); }
+    .card ul li::before { content:"–"; position:absolute; left:0; color:var(--muted); }
+    .badge { display:inline-flex; align-items:center; gap:5px; padding:3px 11px; border-radius:999px;
+      font-size:13px; font-weight:600; border:1px solid transparent; white-space:nowrap; }
+    .badge-good { color:var(--good-fg); background:var(--good-bg); border-color:var(--good-border); }
+    .badge-warning { color:var(--warning-fg); background:var(--warning-bg); border-color:var(--warning-border); }
+    .badge-serious { color:var(--serious-fg); background:var(--serious-bg); border-color:var(--serious-border); }
+    .badge-critical { color:var(--critical-fg); background:var(--critical-bg); border-color:var(--critical-border); }
+    .badge-neutral { color:var(--neutral-fg); background:var(--neutral-bg); border-color:var(--neutral-border); }
+    /* Score gauge: a thin 0-100 bar so relative strength reads at a glance
+       without comparing two numbers by eye. */
+    .gauge-row { display:inline-flex; align-items:center; gap:8px; }
+    .gauge { position:relative; width:56px; height:5px; border-radius:999px; background:var(--track-bg); overflow:hidden; flex:0 0 auto; }
+    .gauge.gauge-lg { width:100%; height:7px; }
+    .gauge .gauge-fill { position:absolute; top:0; left:0; bottom:0; border-radius:999px; }
+    .gauge-good .gauge-fill { background:var(--good-fg); }
+    .gauge-warning .gauge-fill { background:var(--warning-fg); }
+    .gauge-serious .gauge-fill, .gauge-critical .gauge-fill { background:var(--serious-fg); }
+    .gauge-neutral .gauge-fill { background:var(--neutral-fg); }
+    /* Signed deltas: color + caret instead of plain +/- text. Risk uses an
+       inverted color rule (a drop in risk is good) — see _delta_html(). */
+    .delta { font-weight:600; white-space:nowrap; }
+    .delta-good { color:var(--good-fg); } .delta-critical { color:var(--critical-fg); } .delta-neutral { color:var(--muted); }
+    .chip { display:inline-flex; align-items:center; padding:2px 9px; border-radius:999px; font-size:11.5px;
+      color:var(--ink-2); background:var(--chip-bg); border:1px solid var(--border); white-space:nowrap; }
+    .stock { border:1px solid var(--border); background:var(--surface); border-radius:10px; padding:20px; margin:20px 0; scroll-margin-top:52px; }
+    .stock-head { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+    .stock-head h3 { margin:0; font-family:var(--mono); }
+    .scores { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:14px 0; }
+    .stat { background:var(--page); border:1px solid var(--border); border-top:2px solid var(--border); border-radius:8px; padding:12px 14px; }
+    .stat.stat-good { border-top-color:var(--good-accent-bar); }
+    .stat.stat-warning { border-top-color:var(--warning-accent-bar); }
+    .stat.stat-serious, .stat.stat-critical { border-top-color:var(--serious-accent-bar); }
+    .stat .stat-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+    .stat .stat-value { font-size:1.5rem; font-weight:600; margin-top:3px; }
+    .stat .stat-sub { margin-top:5px; }
+    .primary-gauges { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; margin:14px 0 18px; }
+    .primary-gauges .gauge-label { display:flex; justify-content:space-between; font-size:12px; color:var(--muted);
+      text-transform:uppercase; letter-spacing:.05em; margin-bottom:5px; }
+    .primary-gauges .gauge-label .mono { font-size:13px; color:var(--ink); text-transform:none; letter-spacing:normal; }
+    .chart-wrap { overflow-x:auto; }
+    .price-chart { width:100%; min-width:660px; height:auto; background:var(--surface); }
+    .legend { font-size:12px; font-family:var(--mono); } .muted { color:var(--muted); }
+    .lists { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:14px; }
+    .lists section { background:var(--page); border:1px solid var(--border); border-radius:8px; padding:10px 14px; }
+    .lists section h5 { margin:10px 0 2px; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+    .lists section h5:first-child { margin-top:0; }
+    ul { margin-top:6px; padding-left:18px; } ul li { color:var(--ink); } ul li::marker { color:var(--muted); }
+    code { overflow-wrap:anywhere; }
+    details.raw { margin:14px 0 0; border:1px solid var(--border); border-radius:8px; background:var(--page); }
+    details.raw > summary { cursor:pointer; padding:10px 14px; font-weight:600; color:var(--ink-2);
+      list-style:none; user-select:none; }
+    details.raw > summary::-webkit-details-marker { display:none; }
+    details.raw > summary::before { content:"▸ "; }
+    details.raw[open] > summary::before { content:"▾ "; }
+    details.raw .raw-body { padding:0 14px 14px; }
+    details.raw table { margin:8px 0 14px; }
+
+    /* Sticky jump nav — CSS-only "current section" cue via :target on the
+       headings themselves (see h2:target above); a real scroll-spy needs JS,
+       which this report intentionally limits to the decorative hero only. */
+    .term-nav { position:sticky; top:0; z-index:5; display:flex; flex-wrap:wrap; align-items:center;
+      justify-content:space-between; gap:8px;
+      background:var(--nav-bg); backdrop-filter:blur(6px); border-bottom:1px solid var(--border);
+      padding:8px 24px; }
+    .term-nav .term-nav-links { display:flex; flex-wrap:wrap; gap:2px 4px; }
+    .term-nav a { color:var(--ink-2); text-decoration:none; font-family:var(--mono); font-size:12px;
+      text-transform:uppercase; letter-spacing:.06em; padding:5px 10px; border-radius:6px; }
+    .term-nav a:hover { color:var(--ink); background:var(--hover-bg); }
+    /* Theme toggle: both icons always shown (never just one implying "click to
+       switch") — the active mode sits on a raised circle, the inactive one is
+       dimmed, so current state is unambiguous without reading anything. */
+    .theme-toggle { display:inline-flex; align-items:center; gap:2px; background:var(--toggle-track);
+      border:1px solid var(--border); border-radius:999px; padding:3px; flex:0 0 auto; }
+    .theme-btn { display:inline-flex; align-items:center; justify-content:center; width:26px; height:26px;
+      border-radius:50%; border:none; background:transparent; color:var(--muted); cursor:pointer;
+      font-size:13px; line-height:1; padding:0; }
+    .theme-btn:hover { color:var(--ink); }
+    .theme-btn.is-active { background:var(--surface); color:var(--ink); box-shadow:var(--toggle-shadow); }
+    .theme-btn:focus-visible { outline:2px solid var(--good-fg); outline-offset:2px; }
+    @media print { .term-nav { display:none; } }
+
+    /* Animated hero banner (decorative only; aria-hidden). Everything runs off one
+       shared 60s timeline: a bull dwell (0-25s), a 5s falling transition that carries
+       the numbers through zero into negative (25-30s), a bear dwell (30-55s), and a
+       5s rising transition back through zero (55-60s) — so the mood change is a
+       story, not a hard cut. Independently, the trend line "draws" toward its own
+       arrowhead every 1.6s (motion concentrated at the tip, never the whole shape
+       moving), and the bars/grid keep a fast ambient pulse/drift underneath it all. */
+    .market-hero { position:relative; overflow:hidden; height:240px;
+      background:radial-gradient(120% 130% at 15% 10%, #0d1613 0%, #060907 55%, #020302 100%);
+      border-bottom:1px solid rgba(255,255,255,0.06); }
+    .market-hero .grid { position:absolute; inset:0;
+      background-image:
+        repeating-linear-gradient(0deg, rgba(150,180,200,0.16) 0 1px, transparent 1px 40px),
+        repeating-linear-gradient(100deg, rgba(150,180,200,0.14) 0 1px, transparent 1px 70px);
+      -webkit-mask-image:linear-gradient(to bottom, black, transparent 82%);
+      mask-image:linear-gradient(to bottom, black, transparent 82%);
+      animation:hero-grid-drift 26s linear infinite; }
+    @keyframes hero-grid-drift { 0% { background-position:0 0, 0 0; } 100% { background-position:0 160px, 140px 0; } }
+    .market-hero .bars-layer { position:absolute; inset:0; display:flex; align-items:flex-end;
+      gap:12px; padding:0 26px 26px 26px; }
+    .market-hero .bar { flex:0 0 20px; width:20px; border-radius:3px 3px 0 0; transform-origin:bottom;
+      animation-name:hero-bar-pulse; animation-duration:7.5s; animation-timing-function:ease-in-out;
+      animation-iteration-count:infinite; }
+    .market-hero .bars-layer.bull .bar { background:linear-gradient(to top, rgba(20,90,40,0) 0%, rgba(46,222,110,.65) 100%);
+      box-shadow:0 0 16px rgba(46,222,110,.35); }
+    .market-hero .bars-layer.bear .bar { background:linear-gradient(to top, rgba(90,20,20,0) 0%, rgba(230,70,70,.65) 100%);
+      box-shadow:0 0 16px rgba(230,70,70,.35); }
+    /* Subtle only — this used to swing to 1.12 on a 4.2s cycle, which read as
+       distracting bouncing; a small, slow breathing motion still says "alive"
+       without competing with the trend line for attention. */
+    @keyframes hero-bar-pulse { 0%,100% { transform:scaleY(1); } 50% { transform:scaleY(1.035); } }
+    /* The trend line is the one genuinely procedural piece (see hero script below):
+       a real, continuously-extending random-walk series drawn to a canvas, not a
+       fixed shape looping through CSS states — that's what an actually-evolving
+       line needs, and CSS keyframes fundamentally can't express it. */
+    .market-hero .trend-canvas { position:absolute; inset:0; width:100%; height:100%; }
+    .market-hero .bars-layer.bull { animation:hero-bull-cycle 60s ease-in-out infinite; }
+    .market-hero .bars-layer.bear { animation:hero-bear-cycle 60s ease-in-out infinite; }
+    @keyframes hero-bull-cycle { 0%,41.667% { opacity:1; } 50%,91.667% { opacity:0; } 100% { opacity:1; } }
+    @keyframes hero-bear-cycle { 0%,41.667% { opacity:0; } 50%,91.667% { opacity:1; } 100% { opacity:0; } }
+
+    /* Ticker numbers: each position is a single element whose text/color the hero
+       script (below) rewrites every ~380ms — driven by the same shared value and
+       phase timeline as the trend line, so the numbers change constantly and
+       roughly track the arrow instead of jumping between a handful of baked
+       keyframes every several seconds. Positive/green during the bull dwell,
+       negative/red during the bear dwell, sweeping through zero during the two
+       transitions — see tickerUpdate() in the script for the actual shape. */
+    .market-hero .tick { position:absolute; left:0; top:0; font:600 15px/1 ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+      letter-spacing:.02em; white-space:nowrap; }
+    .market-hero .tick.tick-pos { color:#5CF08A; text-shadow:0 0 10px rgba(92,240,138,.75); }
+    .market-hero .tick.tick-neg { color:#FF6B6B; text-shadow:0 0 10px rgba(255,107,107,.75); }
+    @media (prefers-reduced-motion: reduce) {
+      .market-hero .grid, .market-hero .bar { animation:none; }
+      .market-hero .bars-layer.bull { animation:none; opacity:1; }
+      .market-hero .bars-layer.bear { animation:none; opacity:0; }
+    }
+    /* The hero script itself checks prefers-reduced-motion, skips the ticker
+       text updates, and stops redrawing after one frame — this covers only the
+       CSS-driven bars/grid. */
+    @media print { .market-hero { display:none; } }
+"""
+
+_MARKET_HERO_TEMPLATE = """\
+  <div class="market-hero" aria-hidden="true">
+    <div class="grid"></div>
+    <div class="bars-layer bull">
+      <div class="bar" style="height:34px; animation-delay:0.0s"></div><div class="bar" style="height:58px; animation-delay:.3s"></div>
+      <div class="bar" style="height:44px; animation-delay:.6s"></div><div class="bar" style="height:72px; animation-delay:.9s"></div>
+      <div class="bar" style="height:52px; animation-delay:1.2s"></div><div class="bar" style="height:90px; animation-delay:1.5s"></div>
+      <div class="bar" style="height:68px; animation-delay:1.8s"></div><div class="bar" style="height:106px; animation-delay:2.1s"></div>
+      <div class="bar" style="height:82px; animation-delay:2.4s"></div><div class="bar" style="height:122px; animation-delay:2.7s"></div>
+      <div class="bar" style="height:96px; animation-delay:3.0s"></div><div class="bar" style="height:138px; animation-delay:3.3s"></div>
+      <div class="bar" style="height:110px; animation-delay:3.6s"></div><div class="bar" style="height:152px; animation-delay:3.9s"></div>
+      <div class="bar" style="height:124px; animation-delay:4.2s"></div><div class="bar" style="height:166px; animation-delay:4.5s"></div>
+    </div>
+    <div class="bars-layer bear">
+      <div class="bar" style="height:34px; animation-delay:0.0s"></div><div class="bar" style="height:58px; animation-delay:.3s"></div>
+      <div class="bar" style="height:44px; animation-delay:.6s"></div><div class="bar" style="height:72px; animation-delay:.9s"></div>
+      <div class="bar" style="height:52px; animation-delay:1.2s"></div><div class="bar" style="height:90px; animation-delay:1.5s"></div>
+      <div class="bar" style="height:68px; animation-delay:1.8s"></div><div class="bar" style="height:106px; animation-delay:2.1s"></div>
+      <div class="bar" style="height:82px; animation-delay:2.4s"></div><div class="bar" style="height:122px; animation-delay:2.7s"></div>
+      <div class="bar" style="height:96px; animation-delay:3.0s"></div><div class="bar" style="height:138px; animation-delay:3.3s"></div>
+      <div class="bar" style="height:110px; animation-delay:3.6s"></div><div class="bar" style="height:152px; animation-delay:3.9s"></div>
+      <div class="bar" style="height:124px; animation-delay:4.2s"></div><div class="bar" style="height:166px; animation-delay:4.5s"></div>
+    </div>
+    <canvas class="trend-canvas" aria-hidden="true"></canvas>
+{ticker_html}  </div>
+  <script>
+  // Decorative only: draws a genuinely evolving random-walk line onto the hero
+  // canvas above. Nothing here reads or touches report data — this is the only
+  // scripted element anywhere in the document. Silently no-ops if canvas isn't
+  // supported, and stops redrawing (leaving one static
+  // frame) when the visitor prefers reduced motion.
+  (function () {
+    try {
+      var canvas = document.querySelector(".market-hero .trend-canvas");
+      if (!canvas || !canvas.getContext) return;
+      var ctx = canvas.getContext("2d");
+      var reduceMotion = window.matchMedia &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+      var CYCLE_MS = 60000, BULL_MS = 25000, TRANSITION_MS = 5000;
+      // Trail samples carry their own timestamp so x-position is a continuous
+      // function of "now" (recomputed every animation frame) instead of a step
+      // that only moves once per append — that discretization was the stutter.
+      var VISIBLE_MS = 20000, APPEND_EVERY_MS = 220, SAMPLE_EVERY_MS = 70;
+      var dpr = window.devicePixelRatio || 1;
+      // `targetValue` is the underlying stochastic walk (updated in slow, decisive
+      // steps by the leg system below). `displayValue` is the ONE continuously
+      // eased quantity actually drawn — every recorded trail sample and the live
+      // tip both come from it, so there is never a seam between "history" and
+      // "now" the way there was when the tip had its own separate smoothing
+      // layered on top of already-smoothed historical points (that mismatch is
+      // what caused the line to visibly dip under/over the arrowhead).
+      var trail = [];
+      var targetValue = 100;
+      var startedAt = Date.now();
+      var lastTargetUpdate = -Infinity;
+      var lastSampleAt = -Infinity;
+      var lastFrameAt = 0;
+      var displayValue = null;
+      var displayMin = null, displayMax = null;
+      var displayAngle = null;
+      // Dwell phases (the 25s bull/bear stretches) run a chain of ~5s legs, each
+      // randomly up or down. Speed (not direction odds) is what makes the phase
+      // "generally" trend the right way: a leg that runs WITH the phase's color
+      // (up during green, down during red) moves fast; a leg AGAINST it (a dip
+      // during green, a relief bounce during red) moves slowly. Direction is a
+      // genuine 50/50 coin flip each leg — the fast/slow asymmetry alone is what
+      // keeps the net motion trending the phase's way.
+      var legDir = 1, legSpeed = 1, legRemainingMs = 0;
+      var dwellKind = null;
+      // Snapshot of targetValue at the moment the current dwell phase began —
+      // the ticker numbers (below) use targetValue-minus-this as their organic
+      // "chop", i.e. the exact same leg-driven wobble the trend line is riding,
+      // so the numbers roughly track the arrow instead of moving independently.
+      var dwellAnchorValue = 0;
+      var tickerEls = null;
+      var lastTickerUpdate = -Infinity;
+      var TICKER_UPDATE_MS = 380;
+
+      function dwellDrift(biasUp) {
+        if (legRemainingMs <= 0) {
+          legRemainingMs = 4000 + Math.random() * 2400;
+          legDir = Math.random() < 0.5 ? 1 : -1;
+          var withPhase = (legDir === 1) === biasUp;
+          legSpeed = withPhase ? 1.8 + Math.random() * 1.2 : 0.25 + Math.random() * 0.35;
+        }
+        legRemainingMs -= APPEND_EVERY_MS;
+        return legDir * legSpeed;
+      }
+
+      // Frame-rate independent easing: converges toward `target` at a fixed
+      // half-life regardless of how far apart two draw() calls land in time,
+      // so motion looks the same on a 60Hz or 144Hz display.
+      function ease(current, target, halfLifeMs, dtMs) {
+        if (current === null) return target;
+        var rate = 1 - Math.pow(0.5, dtMs / halfLifeMs);
+        return current + (target - current) * rate;
+      }
+
+      function resize() {
+        var rect = canvas.parentElement.getBoundingClientRect();
+        canvas.width = Math.max(1, Math.round(rect.width * dpr));
+        canvas.height = Math.max(1, Math.round(rect.height * dpr));
+      }
+
+      function phaseOf(elapsedMs) {
+        var t = elapsedMs % CYCLE_MS;
+        if (t < BULL_MS) return { dwell: true, bull: true, stage: "bull" };
+        if (t < BULL_MS + TRANSITION_MS) {
+          return { dwell: false, drift: -3.2, bull: t < BULL_MS + TRANSITION_MS / 2, stage: "crash" };
+        }
+        if (t < BULL_MS + TRANSITION_MS + BULL_MS) return { dwell: true, bull: false, stage: "bear" };
+        return { dwell: false, drift: 3.2, bull: t > CYCLE_MS - TRANSITION_MS / 2, stage: "recovery" };
+      }
+
+      function updateTarget(elapsedMs) {
+        var phase = phaseOf(elapsedMs);
+        if (phase.dwell) {
+          var kindKey = phase.bull ? "bull" : "bear";
+          if (dwellKind !== kindKey) {
+            dwellKind = kindKey;
+            legRemainingMs = 0;
+            dwellAnchorValue = targetValue;
+          }
+        } else {
+          dwellKind = null;
+        }
+        var drift = phase.dwell ? dwellDrift(phase.bull) : phase.drift;
+        // Small noise only — legs are the story now, so texture must stay well
+        // under even the slow leg's own speed or it'll read as wiggle again.
+        targetValue += drift + (Math.random() - 0.5) * 0.35;
+      }
+
+      // Below this, the arrow reads as flat/sideways rather than trending —
+      // the numbers freeze in place while it's this level, same as a real
+      // ticker showing no move when a stock just isn't doing anything.
+      var TICKER_FLAT_ANGLE = 0.06;
+
+      function tickerUpdate(elapsedMs) {
+        if (!tickerEls || !tickerEls.length) return;
+        if (displayAngle !== null && Math.abs(displayAngle) < TICKER_FLAT_ANGLE) return;
+        var phase = phaseOf(elapsedMs);
+        var t = elapsedMs % CYCLE_MS;
+        // The crash/recovery sweep is deterministic from the cycle clock alone
+        // (unlike the dwell wobble, which rides the live random walk) — this is
+        // what guarantees the numbers genuinely cross zero on schedule, matching
+        // the arrow going negative in the red phase.
+        var chop = targetValue - dwellAnchorValue;
+        for (var i = 0; i < tickerEls.length; i++) {
+          var el = tickerEls[i];
+          var base = parseFloat(el.getAttribute("data-base"));
+          var scale = parseFloat(el.getAttribute("data-scale"));
+          var shown;
+          if (phase.stage === "crash") {
+            var fracC = (t - BULL_MS) / TRANSITION_MS;
+            shown = (75 - 165 * fracC) + chop * 0.35 * scale;
+          } else if (phase.stage === "recovery") {
+            var fracR = (t - (BULL_MS + TRANSITION_MS + BULL_MS)) / TRANSITION_MS;
+            shown = (-75 + 165 * fracR) + chop * 0.35 * scale;
+          } else if (phase.bull) {
+            // Bull dwell: rising chop (an up-leg, arrow trending up) makes the
+            // positive number bigger; a down-leg shrinks it back toward zero.
+            shown = Math.max(base * 0.4, base + chop * scale);
+          } else {
+            // Bear dwell: the sign is flipped from the bull case on purpose.
+            // The arrow trending UP here means recovering, so the loss should
+            // shrink toward zero (less negative) — not grow more negative the
+            // way a naive "+chop" would (that was the bug: the number was
+            // using the same math as the positive side, so it went the wrong
+            // way whenever the arrow ticked up during a red phase). Trending
+            // DOWN (further decline) correctly grows the magnitude instead.
+            shown = -Math.max(base * 0.4, base - chop * scale);
+          }
+          var prev = parseFloat(el.getAttribute("data-prev"));
+          var up = isNaN(prev) ? shown >= 0 : shown >= prev;
+          el.setAttribute("data-prev", shown.toFixed(2));
+          el.className = "tick " + (shown >= 0 ? "tick-pos" : "tick-neg");
+          el.textContent = shown.toFixed(2) + " " + (up ? "▲" : "▼");
+        }
+      }
+
+      function draw(elapsedMs, dtMs) {
+        var w = canvas.width, h = canvas.height;
+        ctx.clearRect(0, 0, w, h);
+        if (trail.length < 2) return;
+
+        var rawValues = trail.map(function (p) { return p.v; }).concat([displayValue]);
+        var rawMin = Math.min.apply(null, rawValues), rawMax = Math.max.apply(null, rawValues);
+        var pad = (rawMax - rawMin) * 0.18 || 6;
+        rawMin -= pad; rawMax += pad;
+        // Ease the vertical scale itself too — recomputing min/max from the raw
+        // window every frame otherwise makes the whole chart "breathe"/rescale
+        // as points slide in and out, which reads as unsteady even once the
+        // line itself is smooth.
+        displayMin = ease(displayMin, rawMin, 600, dtMs);
+        displayMax = ease(displayMax, rawMax, 600, dtMs);
+        var min = displayMin, max = displayMax;
+
+        var pxPerMs = w / VISIBLE_MS;
+        var bull = phaseOf(elapsedMs).bull;
+        var color = bull ? "#eafff0" : "#fff0ee";
+        var glow = bull ? "rgba(92,240,138,.85)" : "rgba(255,107,107,.85)";
+        var fillTop = bull ? "rgba(92,240,138,.22)" : "rgba(255,107,107,.22)";
+        var fillBottom = bull ? "rgba(92,240,138,0)" : "rgba(255,107,107,0)";
+        // The tip sits well clear of the canvas edge — proportional to width so
+        // the gap reads consistently at any report/window size — and only its y
+        // eases, so the line never touches or snaps against the border.
+        var tipX = w - Math.max(70 * dpr, w * 0.09);
+
+        function xAt(p) { return tipX - (elapsedMs - p.t) * pxPerMs; }
+        function yAt(v) { return h - ((v - min) / (max - min)) * h; }
+
+        // `trail` is a rolling record of the SAME continuously-eased displayValue
+        // drawn as the tip below — not a separate, noisier source — so the last
+        // history sample and the tip always sit on the same smooth trajectory.
+        var xs = trail.map(xAt).concat([tipX]);
+        var ys = trail.map(function (p) { return yAt(p.v); }).concat([yAt(displayValue)]);
+        var startIdx = 0;
+        while (startIdx < xs.length - 2 && xs[startIdx + 1] < -20 * dpr) startIdx++;
+
+        var lastI = xs.length - 1;
+        var tipY = ys[lastI];
+        // The arrowhead's angle comes from a point just under half a second
+        // back — far enough that one noisy sample can't flip it (the earlier
+        // flicker bug), but close enough that it can never meaningfully diverge
+        // from the curve actually drawn into the tip. (A longer 1.4s lookback,
+        // plus forcing the line's own geometry to bend onto that angle, is what
+        // produced the disconnected-looking "two separate pieces" artifact —
+        // the forced bend and the real data could point different directions.)
+        var lookbackTime = elapsedMs - 420;
+        var refIdx = 0;
+        for (var li = trail.length - 1; li >= 0; li--) {
+          if (trail[li].t <= lookbackTime) { refIdx = li; break; }
+        }
+        var refX = xs[refIdx], refY = ys[refIdx];
+        var targetAngle = Math.atan2(tipY - refY, tipX - refX);
+        displayAngle = ease(displayAngle, targetAngle, 320, dtMs);
+
+        function tracePath() {
+          ctx.beginPath();
+          ctx.moveTo(xs[startIdx], ys[startIdx]);
+          // Quadratic-through-midpoints: draws a smooth curve through the data
+          // instead of sharp straight segments between every jittery sample.
+          for (var i = startIdx + 1; i < xs.length - 1; i++) {
+            var midX = (xs[i] + xs[i + 1]) / 2, midY = (ys[i] + ys[i + 1]) / 2;
+            ctx.quadraticCurveTo(xs[i], ys[i], midX, midY);
+          }
+          ctx.lineTo(xs[xs.length - 1], ys[xs.length - 1]);
+        }
+
+        ctx.save();
+        tracePath();
+        ctx.lineTo(xs[xs.length - 1], h);
+        ctx.lineTo(xs[startIdx], h);
+        ctx.closePath();
+        var fillGrad = ctx.createLinearGradient(0, 0, 0, h);
+        fillGrad.addColorStop(0, fillTop);
+        fillGrad.addColorStop(1, fillBottom);
+        ctx.fillStyle = fillGrad;
+        ctx.fill();
+        ctx.restore();
+
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.shadowColor = glow;
+        ctx.shadowBlur = 10 * dpr;
+        ctx.lineWidth = 4 * dpr;
+        ctx.lineJoin = "round";
+        ctx.lineCap = "round";
+        tracePath();
+        ctx.stroke();
+
+        ctx.translate(tipX, tipY);
+        ctx.rotate(displayAngle);
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(14 * dpr, 0);
+        ctx.lineTo(-8 * dpr, -7 * dpr);
+        ctx.lineTo(-8 * dpr, 7 * dpr);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
+
+      function frame() {
+        var elapsedMs = Date.now() - startedAt;
+        var dtMs = lastFrameAt ? Math.min(elapsedMs - lastFrameAt, 100) : 16.7;
+        lastFrameAt = elapsedMs;
+
+        if (elapsedMs - lastTargetUpdate >= APPEND_EVERY_MS) {
+          lastTargetUpdate = elapsedMs;
+          updateTarget(elapsedMs);
+        }
+        // The single easing pass: every trail sample recorded below, and the
+        // live tip drawn in draw(), both read this same value.
+        displayValue = ease(displayValue, targetValue, 180, dtMs);
+
+        if (elapsedMs - lastSampleAt >= SAMPLE_EVERY_MS) {
+          lastSampleAt = elapsedMs;
+          trail.push({ t: elapsedMs, v: displayValue });
+          var cutoff = elapsedMs - VISIBLE_MS - SAMPLE_EVERY_MS * 2;
+          while (trail.length > 2 && trail[0].t < cutoff) trail.shift();
+        }
+
+        // Reduced motion: leave the server-rendered ticker text alone rather
+        // than rewriting it once and freezing on an arbitrary in-between value.
+        if (!reduceMotion && elapsedMs - lastTickerUpdate >= TICKER_UPDATE_MS) {
+          lastTickerUpdate = elapsedMs;
+          tickerUpdate(elapsedMs);
+        }
+
+        draw(elapsedMs, dtMs);
+        if (!reduceMotion) requestAnimationFrame(frame);
+      }
+
+      resize();
+      window.addEventListener("resize", resize);
+      tickerEls = document.querySelectorAll(".market-hero .tick");
+      for (var seed = -Math.ceil(VISIBLE_MS / APPEND_EVERY_MS); seed <= 0; seed++) {
+        var seedT = seed * APPEND_EVERY_MS;
+        updateTarget(seedT);
+        trail.push({ t: seedT, v: targetValue });
+      }
+      displayValue = targetValue;
+      lastTargetUpdate = 0;
+      lastSampleAt = 0;
+      requestAnimationFrame(frame);
+    } catch (err) {
+      // Decorative animation only; never let it disrupt the report itself.
+    }
+  })();
+  </script>
+"""
+
+# Each position's baseline dwell magnitude and a small per-position multiplier
+# applied to the shared organic wobble (see tickerUpdate() in the hero script)
+# so the six numbers don't all move in perfect lockstep even though they share
+# one underlying timeline. The rendered text below is only the pre-JS static
+# fallback (also what's shown under prefers-reduced-motion) — the script
+# rewrites it continuously from there.
+_HERO_TICKER_POSITIONS: tuple[tuple[str, str, float, float], ...] = (
+    ("6%", "30px", 109.25, 1.00),
+    ("2%", "96px", 77.61, 0.85),
+    ("38%", "18px", 104.46, 1.15),
+    ("33%", "132px", 104.61, 0.95),
+    ("68%", "70px", 127.83, 1.05),
+    ("85%", "112px", 142.10, 0.90),
+)
+
+
+def _hero_ticker_pos_html(left: str, top: str, base: float, scale: float) -> str:
+    return (
+        f'    <span class="tick tick-pos" style="left:{left}; top:{top};" '
+        f'data-base="{base:.2f}" data-scale="{scale:.2f}">{base:.2f} &#9650;</span>\n'
+    )
+
+
+def _market_hero_html() -> str:
+    ticker_html = "".join(
+        _hero_ticker_pos_html(left, top, base, scale) for left, top, base, scale in _HERO_TICKER_POSITIONS
+    )
+    # A plain string replace, not str.format(): the template's inline <script>
+    # is full of literal JS braces that str.format() would misparse as fields.
+    return _MARKET_HERO_TEMPLATE.replace("{ticker_html}", ticker_html)
+
+
+# Resolves and persists the report's light/dark theme. This is the one other
+# scripted element in the document besides the hero animation — like that one,
+# it touches only a UI preference (never report data), runs synchronously in
+# <head> before <body> paints (so there's no flash of the wrong theme), and is
+# wrapped in try/catch so a failure here can never break the report itself.
+#
+# Default is always dark — deliberately NOT OS-detected via prefers-color-scheme
+# — matching the hero banner's mood until the visitor opts into light mode
+# themselves. localStorage is what makes that choice stick across later
+# reports: each report is written to its own new HTML file (a fresh
+# stock_summary_<date>_<hash>.html), so nothing server-side can remember a
+# preference between them — the browser's storage for the page's origin is
+# the only thing that carries over. In practice that means it reliably
+# persists across reports opened the same way in the same browser profile;
+# whether that key is shared across separate local files at all depends on
+# how that browser partitions storage for file:// pages, which is outside
+# what a static report can control.
+_THEME_SCRIPT = """\
+  <script>
+  (function () {
+    try {
+      var root = document.documentElement;
+      var STORAGE_KEY = "stockScrapperReportTheme";
+
+      function storedTheme() {
+        try { return window.localStorage.getItem(STORAGE_KEY); } catch (err) { return null; }
+      }
+
+      function applyTheme(theme) {
+        root.setAttribute("data-theme", theme);
+        var buttons = document.querySelectorAll(".theme-btn");
+        for (var i = 0; i < buttons.length; i++) {
+          var btn = buttons[i];
+          var active = btn.getAttribute("data-set-theme") === theme;
+          btn.classList.toggle("is-active", active);
+          btn.setAttribute("aria-pressed", active ? "true" : "false");
+        }
+      }
+
+      var initialTheme = storedTheme() || "dark";
+      applyTheme(initialTheme);
+
+      document.addEventListener("DOMContentLoaded", function () {
+        applyTheme(initialTheme);
+        var toggle = document.querySelector(".theme-toggle");
+        if (!toggle) return;
+        toggle.addEventListener("click", function (event) {
+          var btn = event.target.closest ? event.target.closest(".theme-btn") : null;
+          if (!btn) return;
+          var theme = btn.getAttribute("data-set-theme");
+          applyTheme(theme);
+          try { window.localStorage.setItem(STORAGE_KEY, theme); } catch (err) {}
+        });
+      });
+    } catch (err) {
+      // Decorative preference only; never let it disrupt the report itself.
+    }
+  })();
+  </script>
+"""
+
+
 def _render_phase2_html(
     report_date: str,
     metadata: dict[str, Any],
@@ -323,6 +1008,7 @@ def _render_phase2_html(
     detail_html = "".join(_result_section(entry) for entry in entries)
     changes_html = _changes_table(entries)
     quality_html = _quality_table(quality_issues)
+    regime_badge = _badge(metadata.get("market_regime"), _REGIME_STATUS)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -331,47 +1017,46 @@ def _render_phase2_html(
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Stock Scrapper Phase 2 Report — {_escape(report_date)}</title>
   <style>
-    :root {{ color-scheme: light; --ink:#172033; --muted:#5f6b7a; --line:#d6dce5; --panel:#f7f9fc; }}
-    body {{ max-width:1200px; margin:0 auto; padding:24px; color:var(--ink); font:15px/1.5 Arial,sans-serif; }}
-    h1,h2,h3,h4 {{ line-height:1.2; }} h2 {{ border-bottom:2px solid var(--line); padding-bottom:6px; margin-top:34px; }}
-    table {{ width:100%; border-collapse:collapse; margin:12px 0 22px; }}
-    th,td {{ border:1px solid var(--line); padding:7px 9px; text-align:left; vertical-align:top; }}
-    th {{ background:#eef2f7; }} .metadata th {{ width:210px; }}
-    .notice {{ padding:12px 14px; border-left:5px solid #b45309; background:#fff7ed; margin:18px 0; }}
-    .regime {{ padding:14px; background:#eef6ff; border:1px solid #bfdbfe; }}
-    .stock {{ border:1px solid var(--line); border-radius:8px; padding:18px; margin:20px 0; }}
-    .scores {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:12px 0; }}
-    .score {{ background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px; }}
-    .score strong {{ display:block; font-size:1.3rem; }}
-    .chart-wrap {{ overflow-x:auto; }} .price-chart {{ width:100%; min-width:660px; height:auto; background:white; }}
-    .legend {{ font-size:12px; }} .muted {{ color:var(--muted); }}
-    .lists {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:14px; }}
-    .lists section {{ background:var(--panel); padding:10px 14px; }} ul {{ margin-top:6px; }}
-    code {{ overflow-wrap:anywhere; }}
+{_REPORT_STYLES}
   </style>
+{_THEME_SCRIPT}
 </head>
 <body>
+{_market_hero_html()}
+  <nav class="term-nav" aria-label="Report sections">
+    <div class="term-nav-links">
+    <a href="#metadata">Metadata</a><a href="#market-regime">Market regime</a><a href="#candidates">Candidates</a>
+    <a href="#highest-risk">Highest risk</a><a href="#changes">Changes</a><a href="#symbols">Symbols</a>
+    </div>
+    <div class="theme-toggle" role="group" aria-label="Theme">
+      <button type="button" class="theme-btn" data-set-theme="light" aria-pressed="false" title="Light mode" aria-label="Light mode">&#9728;</button>
+      <button type="button" class="theme-btn is-active" data-set-theme="dark" aria-pressed="true" title="Dark mode" aria-label="Dark mode">&#9789;</button>
+    </div>
+  </nav>
+  <div class="page">
   <h1>Stock Scrapper Phase 2 Research Report</h1>
+  <p class="subtitle">As of {_escape(report_date)} &nbsp;·&nbsp; {_display(metadata.get('data_through_date'))}</p>
   <div class="notice"><strong>Research disclaimer:</strong> Educational research only; not personalized financial advice. Scores and classifications do not guarantee investment performance.</div>
-  <h2>Run Metadata</h2>
-  <table class="metadata"><tbody>{metadata_html}</tbody></table>
-  <h2>Market Regime</h2>
-  <div class="regime"><strong>{_display(metadata.get('market_regime'))}</strong> — confidence {_score(metadata.get('market_regime_confidence'))}<h3>Market-regime reasons</h3>{regime_reasons}</div>
-  <h2>Candidate Ranking</h2>
+  <h2 id="metadata">Run Metadata</h2>
+  <div class="card"><table class="metadata"><tbody>{metadata_html}</tbody></table></div>
+  <h2 id="market-regime">Market Regime</h2>
+  <div class="card regime"><div class="regime-head">{regime_badge}<span class="regime-confidence">confidence {_score(metadata.get('market_regime_confidence'))}</span></div><h4>Market-regime reasons</h4>{regime_reasons}</div>
+  <h2 id="candidates">Candidate Ranking</h2>
   {candidate_html}
-  <h2>Highest-Risk Ranking</h2>
+  <h2 id="highest-risk">Highest-Risk Ranking</h2>
   {risk_html}
-  <h2>Changes From Previous Stored Analysis</h2>
+  <h2 id="changes">Changes From Previous Stored Analysis</h2>
   {changes_html}
   <h2>Data-Quality Concerns</h2>
   {quality_html}
-  <h2>Symbol Analysis</h2>
+  <h2 id="symbols">Symbol Analysis</h2>
   {detail_html or '<p>No symbol results were available.</p>'}
   <h2>Methodology</h2>
   <p>This report presents deterministic, explainable Phase 2 classifications using data available through the stated as-of date. Opportunity, measured risk, and confidence are separate 0–100 scales. Missing inputs remain unavailable rather than being silently treated as zero.</p>
   <p>Charts use adjusted closing prices supplied to the report and trailing, non-centered 20-, 50-, and 200-session simple moving averages. Rows later than the report/as-of date are excluded from charts. Candidate ranking uses higher opportunity, then higher confidence, lower risk, and symbol as a deterministic tie-breaker. Highest-risk ranking is descending by measured risk.</p>
   <h2>Research Disclaimer</h2>
   <p>This software is for educational and research use only. It does not provide personalized financial advice or recommend trades. Historical analysis does not guarantee future performance. Free market data may be delayed, revised, incomplete, or affected by survivorship and static-watchlist bias.</p>
+  </div>
 </body>
 </html>
 """
@@ -387,15 +1072,46 @@ def _ranking_table(
     rows = []
     for result in results:
         symbol = str(result.get("symbol", "")).upper()
+        classification_status = _CLASSIFICATION_STATUS.get(str(result.get("classification") or ""), "neutral")
+        risk_status = _RISK_LEVEL_STATUS.get(str(result.get("risk_level") or ""), "neutral")
+        opportunity_cell = (
+            f'<span class="gauge-row">{_score(result.get("opportunity_score"))}'
+            f'{_gauge_html(result.get("opportunity_score"), classification_status)}</span>'
+        )
+        risk_cell = (
+            f'<span class="gauge-row">{_score(result.get("risk_score"))}'
+            f'{_gauge_html(result.get("risk_score"), risk_status)}</span>'
+        )
         rows.append(
             "<tr>"
-            f"<td>{ranks.get(symbol, '')}</td><td>{_escape(symbol)}</td>"
-            f"<td>{_display(result.get('classification'))}</td>"
-            f"<td>{_score(result.get('opportunity_score'))}</td>"
-            f"<td>{_score(result.get('risk_score'))}</td>"
-            f"<td>{_score(result.get('confidence_score'))}</td></tr>"
+            f'<td class="num">{ranks.get(symbol, "")}</td>'
+            f'<td><a class="mono" href="#{_symbol_anchor_id(symbol)}">{_escape(symbol)}</a></td>'
+            f"<td>{_badge(result.get('classification'), _CLASSIFICATION_STATUS)}</td>"
+            f'<td class="num">{opportunity_cell}</td>'
+            f'<td class="num">{risk_cell}</td>'
+            f'<td class="num">{_score(result.get("confidence_score"))}</td></tr>'
         )
-    return "<table><thead><tr><th>Rank</th><th>Symbol</th><th>Classification</th><th>Opportunity</th><th>Risk</th><th>Confidence</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+    return (
+        '<table><thead><tr><th>Rank</th><th>Symbol</th><th>Classification</th>'
+        '<th class="num">Opportunity</th><th class="num">Risk</th><th class="num">Confidence</th></tr></thead>'
+        "<tbody>" + "".join(rows) + "</tbody></table>"
+    )
+
+
+def _grouped_lists_html(groups: Sequence[tuple[str, Sequence[tuple[str, Any]]]]) -> str:
+    """Renders each group as one card containing only its non-empty sub-items —
+    a symbol with nothing to say under a given sub-item shows no placeholder at
+    all, and a group with nothing under any of its sub-items renders nothing."""
+    sections = []
+    for group_title, sub_items in groups:
+        parts = [
+            f"<h5>{_escape(sub_title)}</h5>" + _render_list(items, "")
+            for sub_title, values in sub_items
+            if (items := _as_list(values))
+        ]
+        if parts:
+            sections.append(f"<section><h4>{_escape(group_title)}</h4>{''.join(parts)}</section>")
+    return "".join(sections)
 
 
 def _result_section(entry: dict[str, Any]) -> str:
@@ -411,30 +1127,49 @@ def _result_section(entry: dict[str, Any]) -> str:
             ("Indicator snapshot", "indicators"),
         )
     )
-    lists = (
-        ("Positive factors", result.get("positive_factors")),
-        ("Risk factors", result.get("risk_factors")),
-        ("Confidence limitations", result.get("confidence_limitations")),
-        ("Data-quality concerns", entry.get("quality_concerns")),
-        ("Market-regime effects", result.get("market_regime_effects")),
-        ("Improvement conditions", result.get("improvement_conditions")),
-        ("Weakening conditions", result.get("weakening_conditions")),
-        ("Blocking reasons", result.get("blocking_reasons")),
-        ("Flags", result.get("flags")),
+    groups = (
+        ("Why", (
+            ("Positive factors", result.get("positive_factors")),
+            ("Market-regime effects", result.get("market_regime_effects")),
+        )),
+        ("Watch for", (
+            ("Risk factors", result.get("risk_factors")),
+            ("Weakening conditions", result.get("weakening_conditions")),
+            ("Blocking reasons", result.get("blocking_reasons")),
+        )),
+        ("Would change this", (
+            ("Improvement conditions", result.get("improvement_conditions")),
+            ("Confidence limitations", result.get("confidence_limitations")),
+            ("Data-quality concerns", entry.get("quality_concerns")),
+        )),
     )
-    list_html = "".join(
-        f"<section><h4>{_escape(title)}</h4>{_render_list(values, 'None recorded.')}</section>"
-        for title, values in lists
-    )
-    return f"""<article class="stock">
-<h3>{_escape(symbol)} — {_display(result.get('classification'))}</h3>
+    list_html = _grouped_lists_html(groups)
+    classification_status = _CLASSIFICATION_STATUS.get(str(result.get("classification") or ""), "neutral")
+    risk_status = _RISK_LEVEL_STATUS.get(str(result.get("risk_level") or ""), "neutral")
+    classification_badge = _badge(result.get("classification"), _CLASSIFICATION_STATUS)
+    risk_level_badge = _badge(result.get("risk_level"), _RISK_LEVEL_STATUS)
+    flags_html = "".join(f'<span class="chip">{_escape(flag)}</span>' for flag in _as_list(result.get("flags")))
+    return f"""<article class="stock" id="{_symbol_anchor_id(symbol)}">
+<div class="stock-head"><h3>{_escape(symbol)}</h3>{classification_badge}{flags_html}</div>
 <p><strong>Primary reason:</strong> {_display(result.get('primary_reason'))}<br />
 <strong>Data through:</strong> {_display(result.get('data_through_date'))} &nbsp; <strong>Trend state:</strong> {_display(result.get('trend_state'))}</p>
-<div class="scores"><div class="score">Opportunity<strong>{_score(result.get('opportunity_score'))}</strong></div><div class="score">Measured risk<strong>{_score(result.get('risk_score'))}</strong><span>{_display(result.get('risk_level'))}</span></div><div class="score">Confidence<strong>{_score(result.get('confidence_score'))}</strong></div><div class="score">Candidate rank<strong>{_display(entry.get('candidate_rank'))}</strong></div><div class="score">Risk rank<strong>{_display(entry.get('risk_rank'))}</strong></div></div>
+<div class="scores">
+<div class="stat stat-{classification_status}"><div class="stat-label">Opportunity</div><div class="stat-value">{_score(result.get('opportunity_score'))}</div></div>
+<div class="stat stat-{risk_status}"><div class="stat-label">Measured risk</div><div class="stat-value">{_score(result.get('risk_score'))}</div><div class="stat-sub">{risk_level_badge}</div></div>
+<div class="stat"><div class="stat-label">Confidence</div><div class="stat-value">{_score(result.get('confidence_score'))}</div></div>
+<div class="stat"><div class="stat-label">Candidate rank</div><div class="stat-value">{_display(entry.get('candidate_rank'))}</div></div>
+<div class="stat"><div class="stat-label">Risk rank</div><div class="stat-value">{_display(entry.get('risk_rank'))}</div></div>
+</div>
+<div class="primary-gauges">
+<div><div class="gauge-label"><span>Opportunity</span><span class="mono">{_score(result.get('opportunity_score'))}</span></div>{_gauge_html(result.get('opportunity_score'), classification_status, large=True)}</div>
+<div><div class="gauge-label"><span>Measured risk</span><span class="mono">{_score(result.get('risk_score'))}</span></div>{_gauge_html(result.get('risk_score'), risk_status, large=True)}</div>
+</div>
 <h4>Adjusted Price and Moving Averages</h4>{chart}
 <div class="lists">{list_html}</div>
 <h4>Changes from previous stored analysis</h4><p>{_display(entry['change'].get('summary'))}</p>
+<details class="raw"><summary>Raw scoring data (components &amp; indicators)</summary><div class="raw-body">
 {component_html}
+</div></details>
 </article>"""
 
 
@@ -454,16 +1189,23 @@ def _changes_table(entries: list[dict[str, Any]]) -> str:
         return "<p>No results were available for comparison.</p>"
     rows = "".join(
         "<tr>"
-        f"<td>{_display(entry['result'].get('symbol'))}</td>"
-        f"<td>{_display((entry.get('previous') or {}).get('classification'))}</td>"
-        f"<td>{_display(entry['result'].get('classification'))}</td>"
-        f"<td>{_score_change(entry['change'].get('opportunity_score_change'))}</td>"
-        f"<td>{_score_change(entry['change'].get('risk_score_change'))}</td>"
-        f"<td>{_score_change(entry['change'].get('confidence_score_change'))}</td>"
+        f'<td class="mono">{_display(entry["result"].get("symbol"))}</td>'
+        f'<td>{_badge((entry.get("previous") or {}).get("classification"), _CLASSIFICATION_STATUS)}</td>'
+        f'<td>{_badge(entry["result"].get("classification"), _CLASSIFICATION_STATUS)}</td>'
+        f'<td class="num">{_delta_html(entry["change"].get("opportunity_score_change"))}</td>'
+        # Risk Δ is inverted: a falling risk score is the favorable direction,
+        # so a negative delta reads green here even though it's the same sign
+        # that would read red for Opportunity/Confidence.
+        f'<td class="num">{_delta_html(entry["change"].get("risk_score_change"), invert=True)}</td>'
+        f'<td class="num">{_delta_html(entry["change"].get("confidence_score_change"))}</td>'
         f"<td>{_display(entry['change'].get('summary'))}</td></tr>"
         for entry in entries
     )
-    return "<table><thead><tr><th>Symbol</th><th>Previous</th><th>Current</th><th>Opportunity Δ</th><th>Risk Δ</th><th>Confidence Δ</th><th>Summary</th></tr></thead><tbody>" + rows + "</tbody></table>"
+    return (
+        '<table><thead><tr><th>Symbol</th><th>Previous</th><th>Current</th>'
+        '<th class="num">Opportunity Δ</th><th class="num">Risk Δ</th><th class="num">Confidence Δ</th>'
+        "<th>Summary</th></tr></thead><tbody>" + rows + "</tbody></table>"
+    )
 
 
 def _quality_table(issues: list[dict[str, Any]]) -> str:
@@ -510,10 +1252,10 @@ def _price_chart_svg(symbol: str, history: list[dict[str, Any]], cutoff: str | N
         return top + (maximum - value) * plot_height / (maximum - minimum)
 
     colors = {
-        "adjusted-price": "#1d4ed8",
-        "sma-20": "#d97706",
-        "sma-50": "#15803d",
-        "sma-200": "#7e22ce",
+        "adjusted-price": "var(--chart-blue)",
+        "sma-20": "var(--chart-orange)",
+        "sma-50": "var(--chart-aqua)",
+        "sma-200": "var(--chart-yellow)",
     }
     labels = {"adjusted-price": "Adjusted price", "sma-20": "SMA20", "sma-50": "SMA50", "sma-200": "SMA200"}
     grid = []
@@ -521,7 +1263,21 @@ def _price_chart_svg(symbol: str, history: list[dict[str, Any]], cutoff: str | N
         fraction = tick / 4
         y = top + fraction * plot_height
         value = maximum - fraction * (maximum - minimum)
-        grid.append(f'<line x1="{left:.1f}" y1="{y:.1f}" x2="{width-right:.1f}" y2="{y:.1f}" stroke="#e5e7eb"/><text x="{left-7:.1f}" y="{y+4:.1f}" text-anchor="end" font-size="11" fill="#4b5563">{value:.2f}</text>')
+        grid.append(f'<line x1="{left:.1f}" y1="{y:.1f}" x2="{width-right:.1f}" y2="{y:.1f}" stroke="var(--line)"/><text x="{left-7:.1f}" y="{y+4:.1f}" text-anchor="end" font-size="11" fill="var(--ink-2)">{value:.2f}</text>')
+
+    safe_id = _safe_html_id(symbol)
+    fill_gradient_id = f"price-fill-{safe_id}"
+    plot_bottom = top + plot_height
+    area_fills = []
+    for segment in _contiguous_segments(series["adjusted-price"]):
+        if len(segment) < 2:
+            continue
+        coordinates = " ".join(f"{x_position(index):.2f},{y_position(value):.2f}" for index, value in segment)
+        first_x, last_x = x_position(segment[0][0]), x_position(segment[-1][0])
+        area_fills.append(
+            f'<polygon points="{first_x:.2f},{plot_bottom:.2f} {coordinates} {last_x:.2f},{plot_bottom:.2f}" '
+            f'fill="url(#{fill_gradient_id})" stroke="none"/>'
+        )
 
     paths = []
     for name, values in series.items():
@@ -536,11 +1292,15 @@ def _price_chart_svg(symbol: str, history: list[dict[str, Any]], cutoff: str | N
     legend = []
     for index, name in enumerate(series):
         x = left + index * 150
-        legend.append(f'<line x1="{x:.1f}" y1="{height-12:.1f}" x2="{x+22:.1f}" y2="{height-12:.1f}" stroke="{colors[name]}" stroke-width="3"/><text class="legend" x="{x+28:.1f}" y="{height-8:.1f}" fill="#374151">{labels[name]}</text>')
+        legend.append(f'<line x1="{x:.1f}" y1="{height-12:.1f}" x2="{x+22:.1f}" y2="{height-12:.1f}" stroke="{colors[name]}" stroke-width="3"/><text class="legend" x="{x+28:.1f}" y="{height-8:.1f}" fill="var(--ink-2)">{labels[name]}</text>')
 
-    safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "-", symbol).strip("-") or "symbol"
     first_date, last_date = points[0][0], points[-1][0]
-    return f'''<div class="chart-wrap"><svg class="price-chart" viewBox="0 0 {int(width)} {int(height)}" role="img" aria-labelledby="chart-{_escape(safe_id)}-title"><title id="chart-{_escape(safe_id)}-title">{_escape(symbol)} adjusted price with 20-, 50-, and 200-session moving averages</title><rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" fill="#fff" stroke="#d1d5db"/>{''.join(grid)}{''.join(paths)}<text x="{left:.1f}" y="{height-bottom+18:.1f}" font-size="11">{_escape(first_date)}</text><text x="{width-right:.1f}" y="{height-bottom+18:.1f}" text-anchor="end" font-size="11">{_escape(last_date)}</text>{''.join(legend)}</svg></div>'''
+    defs = (
+        f'<defs><linearGradient id="{fill_gradient_id}" x1="0" y1="0" x2="0" y2="1">'
+        f'<stop offset="0%" stop-color="var(--chart-blue)" stop-opacity="0.22"/>'
+        f'<stop offset="100%" stop-color="var(--chart-blue)" stop-opacity="0"/></linearGradient></defs>'
+    )
+    return f'''<div class="chart-wrap"><svg class="price-chart" viewBox="0 0 {int(width)} {int(height)}" role="img" aria-labelledby="chart-{_escape(safe_id)}-title"><title id="chart-{_escape(safe_id)}-title">{_escape(symbol)} adjusted price with 20-, 50-, and 200-session moving averages</title>{defs}<rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" fill="var(--surface)" stroke="var(--border)"/>{''.join(grid)}{''.join(area_fills)}{''.join(paths)}<text x="{left:.1f}" y="{height-bottom+18:.1f}" font-size="11" fill="var(--ink-2)">{_escape(first_date)}</text><text x="{width-right:.1f}" y="{height-bottom+18:.1f}" text-anchor="end" font-size="11" fill="var(--ink-2)">{_escape(last_date)}</text>{''.join(legend)}</svg></div>'''
 
 
 def _chart_points(history: list[dict[str, Any]], cutoff: str | None) -> list[tuple[str, float | None]]:
@@ -836,9 +1596,45 @@ def _score(value: Any) -> str:
     return '<span class="muted">Unavailable</span>' if number is None else f"{number:.2f}"
 
 
-def _score_change(value: Any) -> str:
+def _badge(value: Any, status_map: Mapping[str, str]) -> str:
+    """A status pill: text label plus a color, never color alone (icon+label rule)."""
+    text = "" if value is None else str(value)
+    status = status_map.get(text, "neutral")
+    label = text or "Unavailable"
+    return f'<span class="badge badge-{status}">{_escape(label)}</span>'
+
+
+def _gauge_html(value: Any, status: str, large: bool = False) -> str:
+    """A thin 0-100 bar so relative strength reads without comparing two numbers by eye."""
     number = _finite_number(value)
-    return '<span class="muted">Unavailable</span>' if number is None else f"{number:+.2f}"
+    if number is None:
+        return ""
+    pct = max(0.0, min(100.0, number))
+    classes = f"gauge gauge-{status}" + (" gauge-lg" if large else "")
+    return f'<span class="{classes}"><span class="gauge-fill" style="width:{pct:.1f}%"></span></span>'
+
+
+def _delta_html(value: Any, invert: bool = False) -> str:
+    """Signed delta with a caret and color. ``invert`` flips the good/bad read —
+    used for Risk Δ, where a drop in risk is the favorable direction."""
+    number = _finite_number(value)
+    if number is None:
+        return '<span class="muted">Unavailable</span>'
+    if number == 0:
+        status, caret = "neutral", "•"
+    else:
+        favorable = (number < 0) if invert else (number > 0)
+        status = "good" if favorable else "critical"
+        caret = "▲" if number > 0 else "▼"
+    return f'<span class="delta delta-{status}">{caret} {number:+.2f}</span>'
+
+
+def _safe_html_id(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]+", "-", text).strip("-") or "id"
+
+
+def _symbol_anchor_id(symbol: str) -> str:
+    return f"symbol-{_safe_html_id(symbol)}"
 
 
 def _flatten_row_for_csv(row: dict[str, Any]) -> dict[str, Any]:
