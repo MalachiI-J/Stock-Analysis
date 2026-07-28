@@ -183,8 +183,9 @@ def test_phase2_report_contains_complete_offline_research_content(tmp_path: Path
 
     content = paths["html"].read_text(encoding="utf-8")
     for expected in (
-        "Run Metadata",
-        "As-of date",
+        "Stock Analyzer",
+        "vs <span class=\"mono\">SPY</span> benchmark",
+        "Run details",
         "Data-through date",
         "Scoring version",
         "Configuration hash",
@@ -208,6 +209,8 @@ def test_phase2_report_contains_complete_offline_research_content(tmp_path: Path
         "Long-term trend is positive",
     ):
         assert expected in content
+    assert "Run Metadata" not in content
+    assert "Stock Scrapper Phase 2" not in content
     for series in ("adjusted-price", "sma-20", "sma-50", "sma-200"):
         assert f'data-series="{series}"' in content
     assert "<svg" in content
