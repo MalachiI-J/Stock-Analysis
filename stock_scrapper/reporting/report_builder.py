@@ -326,16 +326,31 @@ _REPORT_STYLES = """\
        is one of these custom properties — never a hardcoded hex scattered
        through a component rule — so switching theme is one attribute flip,
        not a per-component conditional. The hero banner never reads these
-       tokens at all (it uses its own literal colors), which is what keeps it
-       identical in both modes. */
+       specific tokens (it uses its own literal colors, recolored by its own
+       [data-theme="light"] overrides further down) — same mechanism, its own
+       palette, since the hero's colors were never meant to match the body's. */
     :root, [data-theme="dark"] {
       color-scheme: dark;
-      --page:#10130f; --surface:rgba(255,255,255,0.05); --border:rgba(255,255,255,0.14);
+      /* Opaque now (was rgba(255,255,255,0.05)) — a translucent surface let
+         the page texture show through every card. This solid hex is chosen
+         to match that old composited appearance, so nothing else needed to
+         be re-tuned to compensate. */
+      --page:#10130f; --surface:#1c1f1b; --border:rgba(255,255,255,0.14);
       --ink:#e7e5df; --ink-2:#8a8d87; --muted:#8a8d87;
       --line:rgba(255,255,255,0.10); --th-bg:rgba(255,255,255,0.035);
       --page-grid-a:rgba(150,180,200,0.05); --page-grid-b:rgba(150,180,200,0.04);
+      /* A lightening highlight reads as a soft glow against a near-black
+         page; the same white value would be a no-op against light mode's
+         near-white page (see the light block below for that variant). */
+      --page-glow:rgba(255,255,255,0.10);
+      /* Same color as --page in both themes — a separate name purely so
+         component rules can say "recessed instrument-panel surface" instead
+         of "the page color, again," now that --surface itself is a real,
+         opaque card color and no longer doubles for both roles. */
+      --inset-surface:var(--page);
       --track-bg:rgba(255,255,255,0.10); --chip-bg:rgba(255,255,255,0.06);
       --nav-bg:rgba(16,19,15,0.92); --hover-bg:rgba(255,255,255,0.06);
+      --card-shadow:0 12px 28px rgba(0,0,0,0.35);
       /* Deliberately DARKER/recessed than --surface (used for the active
          circle below) — that contrast is what reads as "raised," not flat. */
       --toggle-track:rgba(255,255,255,0.03); --toggle-shadow:0 1px 3px rgba(0,0,0,.45);
@@ -358,8 +373,14 @@ _REPORT_STYLES = """\
       --ink:#1a1c18; --ink-2:#6b6f68; --muted:#6b6f68;
       --line:rgba(0,0,0,0.08); --th-bg:rgba(0,0,0,0.025);
       --page-grid-a:rgba(90,110,130,0.05); --page-grid-b:rgba(90,110,130,0.04);
+      /* A white glow would be invisible against a near-white page — a very
+         soft, low-alpha dark tint gives the same "a bit more presence near
+         the top" effect without needing a lighter-than-page color to exist. */
+      --page-glow:rgba(20,22,18,0.05);
+      --inset-surface:var(--page);
       --track-bg:rgba(0,0,0,0.08); --chip-bg:rgba(0,0,0,0.045);
       --nav-bg:rgba(247,246,242,0.92); --hover-bg:rgba(0,0,0,0.045);
+      --card-shadow:0 10px 24px rgba(0,0,0,0.10);
       --toggle-track:rgba(0,0,0,0.06); --toggle-shadow:0 1px 2px rgba(0,0,0,.18);
       --good-fg:#27500A; --good-bg:#EAF3DE; --good-border:rgba(39,80,10,0.30);
       --warning-fg:#633806; --warning-bg:#FAEEDA; --warning-border:rgba(99,56,6,0.30);
@@ -371,13 +392,46 @@ _REPORT_STYLES = """\
       --chart-blue:#2a78d6; --chart-orange:#eb6834; --chart-aqua:#1baf7a; --chart-yellow:#c98500;
     }
     * { box-sizing:border-box; }
-    body { margin:0; color:var(--ink);
+    /* Dot-grid page texture: a sparse field of ~1px dots on a 28px pitch,
+       two interleaved layers (offset by half a cell) from the same
+       --page-grid-a/-b tokens used everywhere else, so it keeps differing
+       correctly between themes automatically. `.page-fade` (first child of
+       body — see markup) is a second, document-anchored copy of the same
+       pattern, mask-faded to nothing over roughly one viewport height: near
+       the hero the two layers overlap (denser), and past that only this
+       steady base layer remains (dimmer, but never zero — no "recede to
+       nothing" for long reports). `.page-glow` is a separate, small radial
+       accent near the top center, driven by its own --page-glow token (a
+       lightening highlight in dark mode; a white glow would be invisible on
+       light mode's near-white page, so that token holds a soft darkening
+       tint there instead) — same idea in both themes, independent of the
+       fade's own masking so its lifecycle stays simple to reason about. Once
+       a card/table has an
+       opaque background (see --surface, step 1), it naturally paints over
+       whichever part of this texture would otherwise show behind it — no
+       extra "stop at the card edge" rule needed. Both grid layers use plain
+       `scroll` attachment (no `fixed`) on purpose: a `fixed` layer is
+       viewport-anchored while the fade overlay is document-anchored, and
+       mixing the two would drift the two grids out of phase with each other
+       as the page scrolls. */
+    body { margin:0; color:var(--ink); position:relative;
       font:15px/1.6 var(--sans);
       background-color:var(--page);
       background-image:
-        repeating-linear-gradient(0deg, var(--page-grid-a) 0 1px, transparent 1px 44px),
-        repeating-linear-gradient(100deg, var(--page-grid-b) 0 1px, transparent 1px 76px);
-      background-attachment:fixed; }
+        radial-gradient(circle, var(--page-grid-a) 1px, transparent 1.5px),
+        radial-gradient(circle, var(--page-grid-b) 1px, transparent 1.5px);
+      background-size:28px 28px, 28px 28px;
+      background-position:0 0, 14px 14px; }
+    .page-fade { position:absolute; top:0; left:0; right:0; height:100vh; z-index:0; pointer-events:none;
+      background-image:
+        radial-gradient(circle, var(--page-grid-a) 1px, transparent 1.5px),
+        radial-gradient(circle, var(--page-grid-b) 1px, transparent 1.5px);
+      background-size:28px 28px, 28px 28px;
+      background-position:0 0, 14px 14px;
+      -webkit-mask-image:linear-gradient(to bottom, black, transparent);
+      mask-image:linear-gradient(to bottom, black, transparent); }
+    .page-glow { position:absolute; top:0; left:0; right:0; height:60vh; z-index:0; pointer-events:none;
+      background:radial-gradient(ellipse at 50% 0%, var(--page-glow), transparent 60%); }
     .page { max-width:1200px; margin:0 auto; padding:8px 24px 56px; }
     h1,h2,h3,h4 { line-height:1.25; font-weight:600; }
     h1 { font-size:1.7rem; margin-bottom:2px; }
@@ -398,7 +452,14 @@ _REPORT_STYLES = """\
     table.metadata tr:last-child { border-bottom:none; }
     table.metadata th, table.metadata td { border:none; padding:9px 4px; }
     table.metadata th { background:transparent; width:200px; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
-    .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px 18px; margin:14px 0 22px; }
+    /* Elevation lives only on major panels (.card, .stock) — a single drop
+       shadow, no inset highlight, no colored glow. Recessed/secondary
+       elements (.stat, .lists section, details.raw, .notice, the chart)
+       deliberately don't get it — they should read as set INTO the page,
+       not floating above it. */
+    .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px 18px; margin:14px 0 22px;
+      box-shadow:var(--card-shadow); }
+    .card > table { margin:0; }
     .notice { padding:14px 16px; border:1px solid var(--border); border-left:3px solid var(--muted);
       background:var(--surface); color:var(--ink-2); border-radius:8px; margin:18px 0; }
     .regime-head { display:flex; align-items:center; gap:12px; }
@@ -429,11 +490,12 @@ _REPORT_STYLES = """\
     .delta-good { color:var(--good-fg); } .delta-critical { color:var(--critical-fg); } .delta-neutral { color:var(--muted); }
     .chip { display:inline-flex; align-items:center; padding:2px 9px; border-radius:999px; font-size:11.5px;
       color:var(--ink-2); background:var(--chip-bg); border:1px solid var(--border); white-space:nowrap; }
-    .stock { border:1px solid var(--border); background:var(--surface); border-radius:10px; padding:20px; margin:20px 0; scroll-margin-top:52px; }
+    .stock { border:1px solid var(--border); background:var(--surface); border-radius:10px; padding:20px; margin:20px 0; scroll-margin-top:52px;
+      box-shadow:var(--card-shadow); }
     .stock-head { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
     .stock-head h3 { margin:0; font-family:var(--mono); }
     .scores { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:14px 0; }
-    .stat { background:var(--page); border:1px solid var(--border); border-top:2px solid var(--border); border-radius:8px; padding:12px 14px; }
+    .stat { background:var(--inset-surface); border:1px solid var(--border); border-top:2px solid var(--border); border-radius:8px; padding:12px 14px; }
     .stat.stat-good { border-top-color:var(--good-accent-bar); }
     .stat.stat-warning { border-top-color:var(--warning-accent-bar); }
     .stat.stat-serious, .stat.stat-critical { border-top-color:var(--serious-accent-bar); }
@@ -445,15 +507,15 @@ _REPORT_STYLES = """\
       text-transform:uppercase; letter-spacing:.05em; margin-bottom:5px; }
     .primary-gauges .gauge-label .mono { font-size:13px; color:var(--ink); text-transform:none; letter-spacing:normal; }
     .chart-wrap { overflow-x:auto; }
-    .price-chart { width:100%; min-width:660px; height:auto; background:var(--surface); }
+    .price-chart { width:100%; min-width:660px; height:auto; background:var(--inset-surface); }
     .legend { font-size:12px; font-family:var(--mono); } .muted { color:var(--muted); }
     .lists { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:14px; }
-    .lists section { background:var(--page); border:1px solid var(--border); border-radius:8px; padding:10px 14px; }
+    .lists section { background:var(--inset-surface); border:1px solid var(--border); border-radius:8px; padding:10px 14px; }
     .lists section h5 { margin:10px 0 2px; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
     .lists section h5:first-child { margin-top:0; }
     ul { margin-top:6px; padding-left:18px; } ul li { color:var(--ink); } ul li::marker { color:var(--muted); }
     code { overflow-wrap:anywhere; }
-    details.raw { margin:14px 0 0; border:1px solid var(--border); border-radius:8px; background:var(--page); }
+    details.raw { margin:14px 0 0; border:1px solid var(--border); border-radius:8px; background:var(--inset-surface); }
     details.raw > summary { cursor:pointer; padding:10px 14px; font-weight:600; color:var(--ink-2);
       list-style:none; user-select:none; }
     details.raw > summary::-webkit-details-marker { display:none; }
@@ -551,6 +613,32 @@ _REPORT_STYLES = """\
       letter-spacing:.02em; white-space:nowrap; }
     .market-hero .tick.tick-pos { color:#5CF08A; text-shadow:0 0 10px rgba(92,240,138,.75); }
     .market-hero .tick.tick-neg { color:#FF6B6B; text-shadow:0 0 10px rgba(255,107,107,.75); }
+
+    /* Light-mode hero: same composition, recolored for a light backdrop. A
+       bright neon glow that reads as "alive" against near-black looks washed
+       out (bars) or garish (ticker text) on a light surface — light mode
+       trades glow for saturation/depth instead. Colors only; the cycle,
+       timing, and layout above are untouched. */
+    [data-theme="light"] .market-hero {
+      background:radial-gradient(120% 130% at 15% 10%, #ffffff 0%, #f2f0ea 55%, #e8e4d8 100%);
+      border-bottom:1px solid rgba(0,0,0,0.08);
+    }
+    [data-theme="light"] .market-hero .grid {
+      background-image:
+        repeating-linear-gradient(0deg, rgba(60,75,95,0.12) 0 1px, transparent 1px 40px),
+        repeating-linear-gradient(90deg, rgba(60,75,95,0.10) 0 1px, transparent 1px 70px);
+    }
+    [data-theme="light"] .market-hero .bars-layer.bull .bar {
+      background:linear-gradient(to top, rgba(20,90,40,0) 0%, rgba(29,122,58,.82) 100%);
+      box-shadow:none;
+    }
+    [data-theme="light"] .market-hero .bars-layer.bear .bar {
+      background:linear-gradient(to top, rgba(110,20,20,0) 0%, rgba(178,42,42,.82) 100%);
+      box-shadow:none;
+    }
+    [data-theme="light"] .market-hero .tick.tick-pos { color:#27500A; text-shadow:none; }
+    [data-theme="light"] .market-hero .tick.tick-neg { color:#791F1F; text-shadow:none; }
+
     @media (prefers-reduced-motion: reduce) {
       .market-hero .grid, .market-hero .bar { animation:none; }
       .market-hero .bars-layer.bull { animation:none; opacity:1; }
@@ -762,10 +850,28 @@ _MARKET_HERO_TEMPLATE = """\
 
         var pxPerMs = w / VISIBLE_MS;
         var bull = phaseOf(elapsedMs).bull;
-        var color = bull ? "#eafff0" : "#fff0ee";
-        var glow = bull ? "rgba(92,240,138,.85)" : "rgba(255,107,107,.85)";
-        var fillTop = bull ? "rgba(92,240,138,.22)" : "rgba(255,107,107,.22)";
-        var fillBottom = bull ? "rgba(92,240,138,0)" : "rgba(255,107,107,0)";
+        // Canvas drawing can't read CSS variables, so the theme is checked here
+        // directly — cheap enough every frame, and it's how the line repaints
+        // correctly the moment someone flips the toggle, no reload needed. Dark
+        // keeps its original near-white/glow look; light swaps to deeper,
+        // saturated strokes (matching --good-fg/--serious-fg's light-mode hex)
+        // with the glow removed, since contrast on white comes from a darker
+        // mark, not a bloom.
+        var isLightTheme = document.documentElement.getAttribute("data-theme") === "light";
+        var color, glow, fillTop, fillBottom, lineShadowBlur;
+        if (isLightTheme) {
+          color = bull ? "#27500A" : "#791F1F";
+          glow = bull ? "rgba(39,80,10,.35)" : "rgba(121,31,31,.35)";
+          fillTop = bull ? "rgba(39,80,10,0.18)" : "rgba(121,31,31,0.18)";
+          fillBottom = bull ? "rgba(39,80,10,0)" : "rgba(121,31,31,0)";
+          lineShadowBlur = 0;
+        } else {
+          color = bull ? "#eafff0" : "#fff0ee";
+          glow = bull ? "rgba(92,240,138,.85)" : "rgba(255,107,107,.85)";
+          fillTop = bull ? "rgba(92,240,138,.22)" : "rgba(255,107,107,.22)";
+          fillBottom = bull ? "rgba(92,240,138,0)" : "rgba(255,107,107,0)";
+          lineShadowBlur = 10 * dpr;
+        }
         // The tip sits well clear of the canvas edge — proportional to width so
         // the gap reads consistently at any report/window size — and only its y
         // eases, so the line never touches or snaps against the border.
@@ -827,7 +933,7 @@ _MARKET_HERO_TEMPLATE = """\
         ctx.save();
         ctx.strokeStyle = color;
         ctx.shadowColor = glow;
-        ctx.shadowBlur = 10 * dpr;
+        ctx.shadowBlur = lineShadowBlur;
         ctx.lineWidth = 4 * dpr;
         ctx.lineJoin = "round";
         ctx.lineCap = "round";
@@ -848,6 +954,20 @@ _MARKET_HERO_TEMPLATE = """\
 
       function frame() {
         var elapsedMs = Date.now() - startedAt;
+        // Backgrounded/inactive tabs throttle or fully pause requestAnimationFrame,
+        // but Date.now() keeps advancing — so the first frame after switching back
+        // can see a jump of seconds, minutes, or more. Left alone, that huge jump
+        // blows most of `trail` past the cutoff below (a real gap that size looks
+        // like "all this history is stale, drop it") and leaves the arrow's
+        // lookback angle referencing whatever sparse, stale points survive —
+        // which is what read as the arrow snapping to point the wrong way. Treat
+        // any gap bigger than one background-throttle tick as time that never
+        // happened: fold it into startedAt so elapsedMs picks back up exactly
+        // where it left off, instead of jumping.
+        if (lastFrameAt && elapsedMs - lastFrameAt > 1000) {
+          startedAt += elapsedMs - lastFrameAt;
+          elapsedMs = lastFrameAt;
+        }
         var dtMs = lastFrameAt ? Math.min(elapsedMs - lastFrameAt, 100) : 16.7;
         lastFrameAt = elapsedMs;
 
@@ -1035,6 +1155,8 @@ def _render_phase2_html(
 {_THEME_SCRIPT}
 </head>
 <body>
+  <div class="page-glow" aria-hidden="true"></div>
+  <div class="page-fade" aria-hidden="true"></div>
 {_market_hero_html()}
   <nav class="term-nav" aria-label="Report sections">
     <div class="term-nav-links">
@@ -1054,11 +1176,11 @@ def _render_phase2_html(
   <h2 id="market-regime">Market Regime</h2>
   <div class="card regime"><div class="regime-head">{regime_badge}<span class="regime-confidence">confidence {_score(metadata.get('market_regime_confidence'))}</span></div><h4>Market-regime reasons</h4>{regime_reasons}</div>
   <h2 id="candidates">Candidate Ranking</h2>
-  {candidate_html}
+  <div class="card">{candidate_html}</div>
   <h2 id="highest-risk">Highest-Risk Ranking</h2>
-  {risk_html}
+  <div class="card">{risk_html}</div>
   <h2 id="changes">Changes From Previous Stored Analysis</h2>
-  {changes_html}
+  <div class="card">{changes_html}</div>
   <h2>Data-Quality Concerns</h2>
   {quality_html}
   <h2 id="symbols">Symbol Analysis</h2>
@@ -1253,9 +1375,12 @@ def _price_chart_svg(symbol: str, history: list[dict[str, Any]], cutoff: str | N
     if not available_values:
         return '<p class="muted">No adjusted-price history was available for this chart.</p>'
 
-    width, height = 900.0, 320.0
-    left, right, top, bottom = 58.0, 18.0, 24.0, 42.0
+    width, height = 900.0, 340.0
+    # Right margin is widened (18 -> 90) to fit the end-of-line price chip
+    # without crowding the plot.
+    left, right, top, bottom = 58.0, 90.0, 24.0, 62.0
     plot_width, plot_height = width - left - right, height - top - bottom
+    plot_bottom = top + plot_height
     minimum, maximum = min(available_values), max(available_values)
     padding = (maximum - minimum) * 0.05 if maximum != minimum else max(abs(maximum) * 0.05, 1.0)
     minimum -= padding
@@ -1274,16 +1399,22 @@ def _price_chart_svg(symbol: str, history: list[dict[str, Any]], cutoff: str | N
         "sma-200": "var(--chart-yellow)",
     }
     labels = {"adjusted-price": "Adjusted price", "sma-20": "SMA20", "sma-50": "SMA50", "sma-200": "SMA200"}
-    grid = []
+
+    # Gridlines live inside the rounded clip; their value labels sit in the
+    # left margin, outside it (a clip-path would silently delete anything
+    # positioned outside its own shape, including text that's meant to sit
+    # to the left of the plot rect).
+    grid_lines, grid_labels = [], []
     for tick in range(5):
         fraction = tick / 4
         y = top + fraction * plot_height
         value = maximum - fraction * (maximum - minimum)
-        grid.append(f'<line x1="{left:.1f}" y1="{y:.1f}" x2="{width-right:.1f}" y2="{y:.1f}" stroke="var(--line)"/><text x="{left-7:.1f}" y="{y+4:.1f}" text-anchor="end" font-size="11" fill="var(--ink-2)">{value:.2f}</text>')
+        grid_lines.append(f'<line x1="{left:.1f}" y1="{y:.1f}" x2="{width-right:.1f}" y2="{y:.1f}" stroke="var(--line)"/>')
+        grid_labels.append(f'<text x="{left-7:.1f}" y="{y+4:.1f}" text-anchor="end" font-size="11" fill="var(--ink-2)">{value:.2f}</text>')
 
     safe_id = _safe_html_id(symbol)
     fill_gradient_id = f"price-fill-{safe_id}"
-    plot_bottom = top + plot_height
+    clip_id = f"plot-clip-{safe_id}"
     area_fills = []
     for segment in _contiguous_segments(series["adjusted-price"]):
         if len(segment) < 2:
@@ -1293,6 +1424,27 @@ def _price_chart_svg(symbol: str, history: list[dict[str, Any]], cutoff: str | N
         area_fills.append(
             f'<polygon points="{first_x:.2f},{plot_bottom:.2f} {coordinates} {last_x:.2f},{plot_bottom:.2f}" '
             f'fill="url(#{fill_gradient_id})" stroke="none"/>'
+        )
+
+    # 52-week-high reference: a dashed, muted line — not a fifth series color,
+    # since it isn't data, just a benchmark drawn from data already in hand.
+    # Skipped outright for very short histories where "52-week" isn't meaningful.
+    valid_prices = [value for value in prices if value is not None]
+    fifty_two_week_high = None
+    if len(valid_prices) >= 20:
+        trailing_valid = [value for value in prices[-252:] if value is not None]
+        if trailing_valid:
+            fifty_two_week_high = max(trailing_valid)
+    reference_line, reference_label = "", ""
+    if fifty_two_week_high is not None:
+        ref_y = y_position(fifty_two_week_high)
+        reference_line = (
+            f'<line x1="{left:.1f}" y1="{ref_y:.2f}" x2="{width-right:.1f}" y2="{ref_y:.2f}" '
+            f'stroke="var(--ink-2)" stroke-width="1" stroke-dasharray="4 4" opacity="0.7"/>'
+        )
+        reference_label = (
+            f'<text x="{left+8:.1f}" y="{ref_y-6:.2f}" font-size="10.5" fill="var(--muted)">'
+            f"52w high &#183; {fifty_two_week_high:.2f}</text>"
         )
 
     paths = []
@@ -1305,18 +1457,60 @@ def _price_chart_svg(symbol: str, history: list[dict[str, Any]], cutoff: str | N
             else:
                 paths.append(f'<polyline data-series="{name}" points="{coordinates}" fill="none" stroke="{colors[name]}" stroke-width="{2.2 if name == "adjusted-price" else 1.7}"/>')
 
+    # End-of-line marker + current-price chip, adjusted-price only. Drawn
+    # outside the clip path so neither is cut off if the last point lands
+    # near the rounded corner.
+    marker, chip = "", ""
+    adjusted_segments = _contiguous_segments(series["adjusted-price"])
+    if adjusted_segments:
+        last_index, last_value = adjusted_segments[-1][-1]
+        mx, my = x_position(last_index), y_position(last_value)
+        marker = (
+            f'<circle cx="{mx:.2f}" cy="{my:.2f}" r="7" fill="var(--inset-surface)"/>'
+            f'<circle cx="{mx:.2f}" cy="{my:.2f}" r="4" fill="var(--chart-blue)"/>'
+        )
+        chip_w, chip_h = 74.0, 22.0
+        chip_x, chip_y = mx + 12, my - chip_h / 2
+        chip = (
+            f'<rect x="{chip_x:.2f}" y="{chip_y:.2f}" width="{chip_w:.1f}" height="{chip_h:.1f}" rx="11" '
+            f'fill="var(--chip-bg)" stroke="var(--border)"/>'
+            f'<text x="{chip_x+chip_w/2:.2f}" y="{chip_y+chip_h/2+4:.2f}" text-anchor="middle" '
+            f'font-family="var(--mono)" font-size="12" fill="var(--ink)">{last_value:.2f}</text>'
+        )
+
     legend = []
     for index, name in enumerate(series):
         x = left + index * 150
         legend.append(f'<line x1="{x:.1f}" y1="{height-12:.1f}" x2="{x+22:.1f}" y2="{height-12:.1f}" stroke="{colors[name]}" stroke-width="3"/><text class="legend" x="{x+28:.1f}" y="{height-8:.1f}" fill="var(--ink-2)">{labels[name]}</text>')
 
+    # Two intermediate date ticks (roughly the 1/3 and 2/3 marks) beyond the
+    # existing first/last labels — short marks off the bottom axis, not
+    # full-height gridlines, so they read as axis ticks rather than data.
+    tick_marks = []
+    if len(points) >= 6:
+        for fraction in (1 / 3, 2 / 3):
+            index = round(fraction * (len(points) - 1))
+            tx = x_position(index)
+            tick_marks.append(
+                f'<line x1="{tx:.2f}" y1="{plot_bottom:.1f}" x2="{tx:.2f}" y2="{plot_bottom+5:.1f}" stroke="var(--line)"/>'
+                f'<text x="{tx:.2f}" y="{height-bottom+18:.1f}" text-anchor="middle" font-size="11" fill="var(--ink-2)">{_escape(points[index][0])}</text>'
+            )
+
     first_date, last_date = points[0][0], points[-1][0]
     defs = (
         f'<defs><linearGradient id="{fill_gradient_id}" x1="0" y1="0" x2="0" y2="1">'
         f'<stop offset="0%" stop-color="var(--chart-blue)" stop-opacity="0.22"/>'
-        f'<stop offset="100%" stop-color="var(--chart-blue)" stop-opacity="0"/></linearGradient></defs>'
+        f'<stop offset="100%" stop-color="var(--chart-blue)" stop-opacity="0"/></linearGradient>'
+        f'<clipPath id="{clip_id}"><rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" rx="10"/></clipPath>'
+        f'</defs>'
     )
-    return f'''<div class="chart-wrap"><svg class="price-chart" viewBox="0 0 {int(width)} {int(height)}" role="img" aria-labelledby="chart-{_escape(safe_id)}-title"><title id="chart-{_escape(safe_id)}-title">{_escape(symbol)} adjusted price with 20-, 50-, and 200-session moving averages</title>{defs}<rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" fill="var(--surface)" stroke="var(--border)"/>{''.join(grid)}{''.join(area_fills)}{''.join(paths)}<text x="{left:.1f}" y="{height-bottom+18:.1f}" font-size="11" fill="var(--ink-2)">{_escape(first_date)}</text><text x="{width-right:.1f}" y="{height-bottom+18:.1f}" text-anchor="end" font-size="11" fill="var(--ink-2)">{_escape(last_date)}</text>{''.join(legend)}</svg></div>'''
+    clipped = (
+        f'<g clip-path="url(#{clip_id})">'
+        f'<rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" fill="var(--inset-surface)" stroke="var(--border)"/>'
+        f'{"".join(grid_lines)}{"".join(area_fills)}{reference_line}{"".join(paths)}'
+        f'</g>'
+    )
+    return f'''<div class="chart-wrap"><svg class="price-chart" viewBox="0 0 {int(width)} {int(height)}" role="img" aria-labelledby="chart-{_escape(safe_id)}-title"><title id="chart-{_escape(safe_id)}-title">{_escape(symbol)} adjusted price with 20-, 50-, and 200-session moving averages</title>{defs}{clipped}{"".join(grid_labels)}{reference_label}{marker}{chip}<text x="{left:.1f}" y="{height-bottom+18:.1f}" font-size="11" fill="var(--ink-2)">{_escape(first_date)}</text>{"".join(tick_marks)}<text x="{width-right:.1f}" y="{height-bottom+18:.1f}" text-anchor="end" font-size="11" fill="var(--ink-2)">{_escape(last_date)}</text>{''.join(legend)}</svg></div>'''
 
 
 def _chart_points(history: list[dict[str, Any]], cutoff: str | None) -> list[tuple[str, float | None]]:
