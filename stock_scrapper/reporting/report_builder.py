@@ -954,6 +954,20 @@ _MARKET_HERO_TEMPLATE = """\
 
       function frame() {
         var elapsedMs = Date.now() - startedAt;
+        // Backgrounded/inactive tabs throttle or fully pause requestAnimationFrame,
+        // but Date.now() keeps advancing — so the first frame after switching back
+        // can see a jump of seconds, minutes, or more. Left alone, that huge jump
+        // blows most of `trail` past the cutoff below (a real gap that size looks
+        // like "all this history is stale, drop it") and leaves the arrow's
+        // lookback angle referencing whatever sparse, stale points survive —
+        // which is what read as the arrow snapping to point the wrong way. Treat
+        // any gap bigger than one background-throttle tick as time that never
+        // happened: fold it into startedAt so elapsedMs picks back up exactly
+        // where it left off, instead of jumping.
+        if (lastFrameAt && elapsedMs - lastFrameAt > 1000) {
+          startedAt += elapsedMs - lastFrameAt;
+          elapsedMs = lastFrameAt;
+        }
         var dtMs = lastFrameAt ? Math.min(elapsedMs - lastFrameAt, 100) : 16.7;
         lastFrameAt = elapsedMs;
 
