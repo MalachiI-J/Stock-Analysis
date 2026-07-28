@@ -391,8 +391,8 @@ _REPORT_STYLES = """\
       font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
     td.num, th.num { text-align:right; }
     .mono, td.num, .stat-value, .delta, code, .kv dd, .metadata td { font-family:var(--mono); font-variant-numeric:tabular-nums; }
-    /* Run Metadata: a compact key/value layout instead of a bordered grid —
-       hairline row separators only, no visible cell borders. */
+    /* Shared key/value table style (used by the footer's run-details
+       disclosure): hairline row separators only, no visible cell borders. */
     table.metadata { border:none; margin:0; }
     table.metadata tr { border-bottom:1px solid var(--line); }
     table.metadata tr:last-child { border-bottom:none; }
@@ -461,6 +461,19 @@ _REPORT_STYLES = """\
     details.raw[open] > summary::before { content:"▾ "; }
     details.raw .raw-body { padding:0 14px 14px; }
     details.raw table { margin:8px 0 14px; }
+
+    /* Footer run-details disclosure: a hairline rule + generous top margin so
+       it reads as trailing metadata, not part of the Research Disclaimer text
+       above it. Chevron rotates via a plain CSS transform on [open] — no JS. */
+    details.run-footer { margin-top:52px; padding-top:20px; border-top:1px solid var(--line); scroll-margin-top:52px; }
+    details.run-footer > summary { cursor:pointer; list-style:none; user-select:none;
+      display:inline-flex; align-items:center; gap:6px; color:var(--muted);
+      font-size:12px; text-transform:uppercase; letter-spacing:.06em; }
+    details.run-footer > summary::-webkit-details-marker { display:none; }
+    details.run-footer > summary .chevron { display:inline-block; transition:transform .2s ease; }
+    details.run-footer[open] > summary .chevron { transform:rotate(180deg); }
+    details.run-footer .run-footer-body { margin-top:12px; max-width:480px; }
+    details.run-footer table.metadata { margin:0; }
 
     /* Sticky jump nav — CSS-only "current section" cue via :target on the
        headings themselves (see h2:target above); a real scroll-spy needs JS,
@@ -989,18 +1002,18 @@ def _render_phase2_html(
     risk_rank = {str(item.get("symbol", "")).upper(): rank for rank, item in enumerate(risk_order, 1)}
     regime_reasons = _render_list(metadata.get("market_regime_reasons"), "No regime reasons were recorded.")
 
-    metadata_rows = [
-        ("Report date", report_date),
-        ("As-of date", metadata.get("as_of_date")),
+    # Report date, As-of date, and Benchmark live in the header subtitle now —
+    # this footer only carries the run-identification fields that don't fit
+    # there, collapsed by default since they're reference detail, not headline.
+    footer_rows = [
         ("Data-through date", metadata.get("data_through_date")),
         ("Analysis run", metadata.get("analysis_run_id") or metadata.get("run_id")),
         ("Scoring version", metadata.get("scoring_version")),
         ("Configuration hash", metadata.get("configuration_hash")),
-        ("Benchmark", metadata.get("benchmark_symbol")),
         ("Generated at", metadata.get("generated_at")),
     ]
-    metadata_html = "".join(
-        f"<tr><th>{_escape(label)}</th><td>{_display(value)}</td></tr>" for label, value in metadata_rows
+    footer_html = "".join(
+        f"<tr><th>{_escape(label)}</th><td>{_display(value)}</td></tr>" for label, value in footer_rows
     )
 
     candidate_html = _ranking_table(candidate_order, candidate_rank, empty_message="No Candidate or Strong Candidate results.")
@@ -1015,7 +1028,7 @@ def _render_phase2_html(
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Stock Scrapper Phase 2 Report — {_escape(report_date)}</title>
+  <title>Stock Analyzer — {_escape(report_date)}</title>
   <style>
 {_REPORT_STYLES}
   </style>
@@ -1025,8 +1038,9 @@ def _render_phase2_html(
 {_market_hero_html()}
   <nav class="term-nav" aria-label="Report sections">
     <div class="term-nav-links">
-    <a href="#metadata">Metadata</a><a href="#market-regime">Market regime</a><a href="#candidates">Candidates</a>
+    <a href="#market-regime">Market regime</a><a href="#candidates">Candidates</a>
     <a href="#highest-risk">Highest risk</a><a href="#changes">Changes</a><a href="#symbols">Symbols</a>
+    <a href="#run-details">Run details</a>
     </div>
     <div class="theme-toggle" role="group" aria-label="Theme">
       <button type="button" class="theme-btn" data-set-theme="light" aria-pressed="false" title="Light mode" aria-label="Light mode">&#9728;</button>
@@ -1034,11 +1048,9 @@ def _render_phase2_html(
     </div>
   </nav>
   <div class="page">
-  <h1>Stock Scrapper Phase 2 Research Report</h1>
-  <p class="subtitle">As of {_escape(report_date)} &nbsp;·&nbsp; {_display(metadata.get('data_through_date'))}</p>
+  <h1>Stock Analyzer</h1>
+  <p class="subtitle">As of {_escape(report_date)} &nbsp;·&nbsp; vs <span class="mono">{_display(metadata.get('benchmark_symbol'))}</span> benchmark</p>
   <div class="notice"><strong>Research disclaimer:</strong> Educational research only; not personalized financial advice. Scores and classifications do not guarantee investment performance.</div>
-  <h2 id="metadata">Run Metadata</h2>
-  <div class="card"><table class="metadata"><tbody>{metadata_html}</tbody></table></div>
   <h2 id="market-regime">Market Regime</h2>
   <div class="card regime"><div class="regime-head">{regime_badge}<span class="regime-confidence">confidence {_score(metadata.get('market_regime_confidence'))}</span></div><h4>Market-regime reasons</h4>{regime_reasons}</div>
   <h2 id="candidates">Candidate Ranking</h2>
@@ -1056,6 +1068,10 @@ def _render_phase2_html(
   <p>Charts use adjusted closing prices supplied to the report and trailing, non-centered 20-, 50-, and 200-session simple moving averages. Rows later than the report/as-of date are excluded from charts. Candidate ranking uses higher opportunity, then higher confidence, lower risk, and symbol as a deterministic tie-breaker. Highest-risk ranking is descending by measured risk.</p>
   <h2>Research Disclaimer</h2>
   <p>This software is for educational and research use only. It does not provide personalized financial advice or recommend trades. Historical analysis does not guarantee future performance. Free market data may be delayed, revised, incomplete, or affected by survivorship and static-watchlist bias.</p>
+  <details class="run-footer" id="run-details">
+  <summary><span class="chevron">&#9662;</span> Run details</summary>
+  <div class="run-footer-body"><table class="metadata"><tbody>{footer_html}</tbody></table></div>
+  </details>
   </div>
 </body>
 </html>
