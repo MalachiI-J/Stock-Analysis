@@ -920,20 +920,24 @@ def _market_hero_html() -> str:
 # it touches only a UI preference (never report data), runs synchronously in
 # <head> before <body> paints (so there's no flash of the wrong theme), and is
 # wrapped in try/catch so a failure here can never break the report itself.
+#
+# Default is always dark — deliberately NOT OS-detected via prefers-color-scheme
+# — matching the hero banner's mood until the visitor opts into light mode
+# themselves. localStorage is what makes that choice stick across later
+# reports: each report is written to its own new HTML file (a fresh
+# stock_summary_<date>_<hash>.html), so nothing server-side can remember a
+# preference between them — the browser's storage for the page's origin is
+# the only thing that carries over. In practice that means it reliably
+# persists across reports opened the same way in the same browser profile;
+# whether that key is shared across separate local files at all depends on
+# how that browser partitions storage for file:// pages, which is outside
+# what a static report can control.
 _THEME_SCRIPT = """\
   <script>
   (function () {
     try {
       var root = document.documentElement;
       var STORAGE_KEY = "stockScrapperReportTheme";
-
-      function systemTheme() {
-        try {
-          if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) return "light";
-          if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) return "dark";
-        } catch (err) {}
-        return "dark";
-      }
 
       function storedTheme() {
         try { return window.localStorage.getItem(STORAGE_KEY); } catch (err) { return null; }
@@ -950,7 +954,7 @@ _THEME_SCRIPT = """\
         }
       }
 
-      var initialTheme = storedTheme() || systemTheme();
+      var initialTheme = storedTheme() || "dark";
       applyTheme(initialTheme);
 
       document.addEventListener("DOMContentLoaded", function () {
