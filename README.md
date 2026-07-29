@@ -188,25 +188,50 @@ mostly tech-weighted names to 25 spanning healthcare, staples, media,
 telecom, industrials, auto, financials, energy, and utilities — including
 several names with genuine multi-year drawdowns (INTC, PYPL, BA, T, VZ)
 rather than only names that happened to ride a single tech/AI bull market.
-That mattered: with the narrower 17-symbol universe, `predict`'s holdout
-accuracy trailed its own baseline in 4 of 5 folds; with the wider,
-25-symbol universe (roughly five years of history), it now beats its own
-fold-specific baseline in 4 of 5 folds on accuracy (one fold clearly
-misses), while its Brier score remains close to and mixed against its own
-baseline — a meaningfully different and more encouraging picture than the
-narrower sample gave, but four folds over one overlapping historical window
-is still not multiple independent periods of confirmation. `score_v1`'s
-classification, meanwhile, looks *less* convincing with the wider sample:
-"Watch" (now dominated by defensive/staples/utility/telecom names) posted a
-clearly negative mean excess return, and "Strong Candidate"'s symbol-weighted
-mean excess return is now slightly negative — both are as consistent with
-"the benchmark was itself increasingly driven by a handful of mega-cap/AI
-names over this window" as with anything score_v1 is measuring. Neither
-signal has demonstrated a validated edge yet, and this is stated plainly
-rather than glossed over. A future claim of validated edge would require the
-purged/baseline-compared model to beat its fold-specific baselines
-consistently across multiple non-overlapping periods — not four folds over
-one window, and not on a rerun of the same data. See Limitations.
+`historical_lookback_years` was then extended from 5 to 20, which matters
+independently of universe width: with ~5 years of history the portfolio
+`walk-forward` command could only fit one validation window plus one
+holdout, so a single window's outcome — good or bad — was never enough to
+trust on its own. With 20 years it fits 15 validation windows plus one
+holdout, a roughly 15x increase in independent evaluation blocks (see the
+distinction above between one block and many).
+
+The wider, deeper evidence base now gives a consistent, and mostly negative,
+answer for both signals:
+
+- **`score_v1` portfolio walk-forward** (15 validation windows + 1 holdout,
+  2009–2026): the strategy beat SPY in only 5 of 15 validation windows
+  (33%) and lost the holdout outright (most recent 12 months: active return
+  −11.95%, Sharpe 0.47 vs. benchmark Sharpe 1.35). No consistent edge across
+  independent periods.
+- **`score_v1` classification hit-rate** (`validate-signals`, 109,706
+  classified rows, 20–25 distinct symbols per bucket — resolving the
+  concentration problem described above): "Strong Candidate" shows a real
+  but thin edge (mean excess return +0.99%; symbol-weighted 95% CI
+  [+0.01%, +1.42%], barely excluding zero). Monotonicity still fails, and
+  now more seriously than before — "High Risk" posts the *largest* excess
+  return of any bucket (mean +3.24%; symbol-weighted CI [+1.82%, +4.48%],
+  clearly excluding zero, backed by 20 distinct symbols), so this is no
+  longer a two-symbol concentration artifact but a genuine, well-supported
+  inversion in the risk classification. It is reported here as an honest
+  anomaly, not evidence of a usable signal — it could reflect a real risk
+  premium (riskier names carry higher expected return) or a miscalibration
+  in how risk is scored; distinguishing those would require dedicated
+  investigation, not a reinterpretation of this data.
+- **`predict-v3`** (54,627 samples, 2008–2026, 5 purged walk-forward folds):
+  holdout accuracy 50.6% against a sample-weighted baseline of 51.6%, and
+  Brier score 0.2504 against a baseline of 0.2497 — below baseline on both
+  metrics overall. Only 1 of 5 folds beats its own fold-specific baseline on
+  accuracy; the most recent fold (2023–2026) is the worst of all five.
+
+Taken together, neither signal has demonstrated a validated edge, and the
+deeper, wider sample makes that conclusion more solid than the earlier
+narrower one did — this is not a case where more data revealed a hidden
+edge; if anything it removed ambiguity in the negative direction. This is
+stated plainly rather than glossed over. A future claim of validated edge
+would require a model or ranking to beat its own fold/window-specific
+baseline consistently across multiple non-overlapping periods, not on a
+rerun of the same data. See Limitations.
 
 ## Phase 4 real-portfolio tracking
 

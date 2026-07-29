@@ -402,6 +402,13 @@ def _symbols_from_args(args: argparse.Namespace, watchlist: Sequence[str]) -> li
     return list(dict.fromkeys(str(symbol).strip().upper() for symbol in values if str(symbol).strip()))
 
 
+def _max_price_age_days(config: dict[str, Any]) -> int:
+    """A generous sanity-check ceiling for validate_price_records' "stale_record"
+    check, derived from historical_lookback_years so legitimately-collected old rows
+    are never flagged as data-quality issues just for being as old as configured."""
+    return int(config.get("historical_lookback_years", 5)) * 366 + 30
+
+
 def update_symbols(
     config: dict[str, Any],
     logger: Any,
@@ -465,7 +472,10 @@ def update_symbols(
                         raise MissingDataError(
                             f"No stored or newly collected price history exists for {symbol}"
                         )
-                    issues = validate_price_records(complete_history, symbol=symbol, now_date=date.today())
+                    issues = validate_price_records(
+                        complete_history, symbol=symbol, now_date=date.today(),
+                        max_age_days=_max_price_age_days(config),
+                    )
                     fingerprints: list[str] = []
                     for issue in issues:
                         record_quality_issue(conn, issue)
@@ -513,7 +523,9 @@ def validate_database(config: dict[str, Any], logger: Any) -> list[dict[str, Any
         for symbol in load_watchlist(config["watchlist_path"]):
             history = fetch_price_history(conn, symbol)
             if history:
-                detected = validate_price_records(history, symbol=symbol, now_date=date.today())
+                detected = validate_price_records(
+                    history, symbol=symbol, now_date=date.today(), max_age_days=_max_price_age_days(config)
+                )
             else:
                 detected = [
                     {

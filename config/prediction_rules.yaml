@@ -1,6 +1,6 @@
 prediction_version: "predict-v3"
 horizon_days: 21
-lookback_years: 5
+lookback_years: 20
 sample_stride_sessions: 2
 walk_forward_folds: 5
 l2_lambda: 0.01

@@ -6,8 +6,21 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
 
 
-def validate_price_record(record: Mapping[str, Any], previous_close: float | None = None, now_date: date | None = None) -> list[dict[str, Any]]:
-    """Validate a single price row and return any quality issues found."""
+def validate_price_record(
+    record: Mapping[str, Any],
+    previous_close: float | None = None,
+    now_date: date | None = None,
+    max_age_days: int = 3650,
+) -> list[dict[str, Any]]:
+    """Validate a single price row and return any quality issues found.
+
+    ``max_age_days`` is a sanity-check threshold for catching a genuinely bad trade
+    date (e.g. a parsing bug), not a judgment about how much history is useful — it
+    must stay at least as large as the configured ``historical_lookback_years`` or
+    every row collected under a longer lookback would be flagged as a false-positive
+    "stale_record" warning. Callers with access to config should derive it from
+    ``historical_lookback_years`` rather than relying on the conservative default.
+    """
     issues: list[dict[str, Any]] = []
     now = now_date or date.today()
 
@@ -27,7 +40,7 @@ def validate_price_record(record: Mapping[str, Any], previous_close: float | Non
     if trade_date is not None:
         if trade_date > now:
             issues.append(_build_issue(record, "future_trade_date", "warning", "Trading date is in the future"))
-        if trade_date < now - timedelta(days=3650):
+        if trade_date < now - timedelta(days=max_age_days):
             issues.append(_build_issue(record, "stale_record", "warning", "Trading date is unexpectedly stale"))
 
     # Basic sanity checks protect the database from obviously bad or inconsistent rows.
@@ -73,7 +86,12 @@ def validate_price_record(record: Mapping[str, Any], previous_close: float | Non
     return issues
 
 
-def validate_price_records(records: list[Mapping[str, Any]], symbol: str | None = None, now_date: date | None = None) -> list[dict[str, Any]]:
+def validate_price_records(
+    records: list[Mapping[str, Any]],
+    symbol: str | None = None,
+    now_date: date | None = None,
+    max_age_days: int = 3650,
+) -> list[dict[str, Any]]:
     """Validate a list of records for one symbol."""
     issues: list[dict[str, Any]] = []
     if symbol is None:
@@ -85,7 +103,11 @@ def validate_price_records(records: list[Mapping[str, Any]], symbol: str | None 
         record_with_symbol = dict(record)
         if not record_with_symbol.get("symbol"):
             record_with_symbol["symbol"] = symbol
-        issues.extend(validate_price_record(record_with_symbol, previous_close=previous_close, now_date=now_date))
+        issues.extend(
+            validate_price_record(
+                record_with_symbol, previous_close=previous_close, now_date=now_date, max_age_days=max_age_days
+            )
+        )
         close_price = record_with_symbol.get("close")
         if close_price is not None:
             try:

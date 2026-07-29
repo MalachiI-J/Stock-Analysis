@@ -1,4 +1,24 @@
+from datetime import date
+
 from stock_scrapper.processing.validation import validate_price_record
+
+
+def test_validation_flags_stale_record_beyond_default_threshold() -> None:
+    record = {"symbol": "AAPL", "trade_date": "2000-01-03", "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0}
+
+    issues = validate_price_record(record, now_date=date(2026, 1, 1))
+
+    assert "stale_record" in {issue["issue_type"] for issue in issues}
+
+
+def test_validation_max_age_days_permits_older_history_without_a_false_positive() -> None:
+    # 20 years old, well beyond the default 3650-day (10-year) threshold, but exactly
+    # the kind of row a 20-year historical_lookback_years config legitimately collects.
+    record = {"symbol": "AAPL", "trade_date": "2006-01-03", "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0}
+
+    issues = validate_price_record(record, now_date=date(2026, 1, 1), max_age_days=20 * 366 + 30)
+
+    assert "stale_record" not in {issue["issue_type"] for issue in issues}
 
 
 def test_validation_reports_missing_and_invalid_values() -> None:

@@ -5,7 +5,7 @@ raw_data_dir: data/raw
 processed_data_dir: data/processed
 reports_dir: reports
 logs_dir: logs
-historical_lookback_years: 5
+historical_lookback_years: 20
 data_source: yfinance
 retry_count: 3
 retry_delay_seconds: 2
