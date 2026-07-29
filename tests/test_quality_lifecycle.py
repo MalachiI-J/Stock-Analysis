@@ -362,7 +362,7 @@ def test_migrations_are_idempotent_and_preserve_legacy_price_values(
             for value in conn.execute(
                 "SELECT schema_version FROM schema_metadata ORDER BY schema_version"
             )
-        ] == [1, 2, 3, 4, 5, 6, 7]
+        ] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
         quality_columns = {
             value[1] for value in conn.execute("PRAGMA table_info(data_quality_issues)")
         }
@@ -422,6 +422,39 @@ def test_migration_failure_rolls_back_schema_and_data_changes(
         ).fetchone()[0] == 0
         assert conn.execute(
             "SELECT MAX(schema_version) FROM schema_metadata"
-        ).fetchone()[0] == 7
+        ).fetchone()[0] == 9
+    finally:
+        conn.close()
+
+
+def test_prediction_provenance_migration_rolls_back_atomically_on_failure(
+    workspace_tmp_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = workspace_tmp_dir / "prediction-rollback.db"
+    initialize_database(db_path)  # fully migrated, including v9, before the injected failure below
+
+    def fail_provenance_columns(conn: sqlite3.Connection) -> None:
+        conn.execute("CREATE TABLE prediction_rollback_probe (id INTEGER PRIMARY KEY)")
+        conn.execute("ALTER TABLE prediction_runs ADD COLUMN partial_column TEXT")
+        raise RuntimeError("forced provenance migration failure")
+
+    monkeypatch.setattr(migration_manager, "_ensure_prediction_provenance_columns", fail_provenance_columns)
+    with pytest.raises(RuntimeError, match="forced provenance migration failure"):
+        apply_migrations(db_path)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='prediction_rollback_probe'"
+        ).fetchone()[0] == 0
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(prediction_runs)")}
+        assert "partial_column" not in columns
+        # The original, already-successful v9 migration (from initialize_database above)
+        # must survive untouched -- only the failed *re-run*'s changes are rolled back.
+        assert "dataset_fingerprint" in columns
+        assert conn.execute(
+            "SELECT MAX(schema_version) FROM schema_metadata"
+        ).fetchone()[0] == 9
     finally:
         conn.close()

@@ -6,6 +6,7 @@ import argparse
 import json
 import sqlite3
 import sys
+from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -16,6 +17,7 @@ import yaml
 
 from stock_scrapper.analysis.repository import results_from_saved_run
 from stock_scrapper.analysis.scoring_config import validate_scoring_config
+from stock_scrapper.analysis.signal_validation import render_signal_validation_text, validate_signals
 from stock_scrapper.analysis.service import AnalysisBatch, AnalysisService
 from stock_scrapper.backtesting.config import BacktestConfig, load_backtesting_config
 from stock_scrapper.backtesting.engine import PortfolioBacktestResult, run_portfolio_backtest
@@ -72,6 +74,7 @@ from stock_scrapper.portfolio import (
     evaluate_portfolio_performance,
 )
 from stock_scrapper.prediction.config import validate_prediction_config
+from stock_scrapper.prediction.persistence import persist_prediction_run
 from stock_scrapper.prediction.service import run_prediction
 from stock_scrapper.processing.validation import validate_price_records
 from stock_scrapper.trading.config import validate_trading_rules
@@ -85,7 +88,7 @@ from stock_scrapper.reporting.digest import (
     format_holding_line,
     render_digest_text,
 )
-from stock_scrapper.utilities.hashing import canonical_json
+from stock_scrapper.utilities.hashing import canonical_json, stable_sha256
 from stock_scrapper.utilities.logging_setup import setup_logging
 from stock_scrapper.utilities.provenance import collect_provenance
 from stock_scrapper.universes import resolve_universe
@@ -289,6 +292,19 @@ def build_parser() -> argparse.ArgumentParser:
     walk.add_argument("--symbols", nargs="+", help="Optional candidate universe")
     walk.add_argument("--start", help="First development date (YYYY-MM-DD)")
     walk.add_argument("--end", help="Final holdout end date (YYYY-MM-DD)")
+
+    validate_signals_parser = subparsers.add_parser(
+        "validate-signals",
+        help="Does score_v1's classification beat the benchmark forward, independent of backtest sizing/timing?",
+    )
+    validate_signals_parser.add_argument("--strategy", choices=("score_v1",), default="score_v1")
+    validate_signals_parser.add_argument("--symbols", nargs="+", help="Optional candidate universe")
+    validate_signals_parser.add_argument("--start", help="Inclusive start date (YYYY-MM-DD)")
+    validate_signals_parser.add_argument("--end", help="Inclusive end date (YYYY-MM-DD)")
+    validate_signals_parser.add_argument(
+        "--horizon-days", type=int,
+        help="Override config/prediction_rules.yaml's horizon_days, so this stays comparable to `predict`",
+    )
 
     subparsers.add_parser("validate", help="Run complete database validation")
     subparsers.add_parser("status", help="Show local database status")
@@ -1103,33 +1119,76 @@ def main(argv: Sequence[str] | None = None) -> int:
                     service, symbols, histories, trading_dates,
                     as_of_date=effective.isoformat(), rules=prediction_rules, benchmark_symbol=benchmark,
                 )
+                prediction_run_id = f"predict-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
+                run_provenance = collect_provenance(
+                    base_dir,
+                    strategy_name=prediction_rules["prediction_version"],
+                    strategy_version=prediction_rules["prediction_version"],
+                )
+                conn.execute("BEGIN")
+                try:
+                    persist_prediction_run(
+                        conn, prediction_run_id, result,
+                        prediction_version=prediction_rules["prediction_version"],
+                        benchmark_symbol=benchmark,
+                        configuration_snapshot=prediction_rules,
+                        configuration_hash=stable_sha256(prediction_rules),
+                        git_commit_hash=run_provenance.get("git_commit_hash"),
+                        git_dirty=run_provenance.get("git_dirty"),
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
             finally:
                 conn.close()
             if result.status == "insufficient_data":
+                print(f"prediction run: {prediction_run_id}", file=sys.stderr)
                 print(f"Missing data: {result.message}", file=sys.stderr)
                 return int(ExitCode.MISSING_DATA)
+            print(f"prediction run: {prediction_run_id}")
             print(f"Prediction as of {result.as_of_date} | horizon={result.horizon_days} session(s) | model={prediction_rules['prediction_version']}")
+            dataset_rate_text = "n/a" if result.positive_label_rate is None else f"{result.positive_label_rate:.1%}"
             print(
                 f"Trained on {result.training_samples} sample(s) ({result.training_start_date} to "
-                f"{result.training_end_date})"
+                f"{result.training_end_date}); dataset-wide positive rate {dataset_rate_text} "
+                "(context only — each fold below is judged against its own test-period rate, not this one)"
             )
             if result.message:
                 print(f"Note: {result.message}", file=sys.stderr)
-            base_rate_text = "n/a" if result.positive_label_rate is None else f"{result.positive_label_rate:.1%}"
             accuracy_text = "n/a" if result.holdout_accuracy is None else f"{result.holdout_accuracy:.1%}"
+            baseline_accuracy_text = "n/a" if result.baseline_accuracy is None else f"{result.baseline_accuracy:.1%}"
             brier_text = "n/a" if result.holdout_brier_score is None else f"{result.holdout_brier_score:.4f}"
+            baseline_brier_text = "n/a" if result.baseline_brier_score is None else f"{result.baseline_brier_score:.4f}"
             print(
-                f"Walk-forward holdout accuracy: {accuracy_text} (base rate {base_rate_text} — "
-                f"compare the two, since a lopsided base rate alone can inflate accuracy) over "
+                f"Walk-forward holdout accuracy: {accuracy_text} (sample-weighted majority-class baseline "
+                f"{baseline_accuracy_text}, built from each fold's own test-period rate) over "
                 f"{result.holdout_samples} held-out sample(s) across {len(result.walk_forward_folds)} fold(s)"
             )
-            print(f"Holdout Brier score (lower is better, 0.25 = coin flip): {brier_text}")
+            print(
+                f"Holdout Brier score: {brier_text} (sample-weighted constant-probability baseline "
+                f"{baseline_brier_text} — the true minimum achievable Brier for always predicting the "
+                "base rate; this equals 0.25 only when that rate happens to be 50/50)"
+            )
             for fold in result.walk_forward_folds:
                 fold_accuracy = "n/a" if fold.accuracy is None else f"{fold.accuracy:.1%}"
                 fold_brier = "n/a" if fold.brier_score is None else f"{fold.brier_score:.4f}"
+                fold_baseline_accuracy = "n/a" if fold.baseline_accuracy is None else f"{fold.baseline_accuracy:.1%}"
+                fold_baseline_brier = "n/a" if fold.baseline_brier_score is None else f"{fold.baseline_brier_score:.4f}"
+                fold_test_rate = "n/a" if fold.test_positive_rate is None else f"{fold.test_positive_rate:.1%}"
                 print(
-                    f"  fold {fold.fold}: trained on {fold.training_samples}, tested on "
-                    f"{fold.test_samples} -> accuracy {fold_accuracy}, brier {fold_brier}"
+                    f"  fold {fold.fold}: train [{fold.training_start_date}..{fold.training_end_date}] "
+                    f"({fold.training_samples} samples, {fold.training_symbol_count} symbols, "
+                    f"{fold.purged_samples} purged for label/test-period overlap)"
+                )
+                print(
+                    f"    -> test [{fold.test_start_date}..{fold.test_end_date}] "
+                    f"({fold.test_samples} samples, {fold.test_symbol_count} symbols, "
+                    f"test-period positive rate {fold_test_rate})"
+                )
+                print(
+                    f"    accuracy {fold_accuracy} vs. fold baseline {fold_baseline_accuracy} | "
+                    f"brier {fold_brier} vs. fold baseline {fold_baseline_brier}"
                 )
             print("Model coefficients (standardized; positive pushes probability up):")
             weak_features: list[str] = []
@@ -1802,11 +1861,71 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"  {window.window_type}: {window.evaluation_start_date}.."
                     f"{window.evaluation_end_date} status={window.status} backtest={window.backtest_run_id}"
                 )
+            print()
+            print("Per-window performance vs benchmark (validation and holdout kept separate — never averaged together):")
+            validation_windows = [window for window in walk_result.windows if window.window_type == "validation"]
+            holdout_windows = [window for window in walk_result.windows if window.window_type == "holdout"]
+            for label, windows in (("validation", validation_windows), ("holdout", holdout_windows)):
+                for window in windows:
+                    metrics = getattr(window, "metrics", None)
+                    span = f"{window.evaluation_start_date}..{window.evaluation_end_date}"
+                    if metrics is None:
+                        print(f"  {label} [{span}]: no metrics recorded (status={window.status})")
+                        continue
+                    active_text = "n/a" if metrics.active_return is None else f"{metrics.active_return:+.2%}"
+                    sharpe_text = "n/a" if metrics.sharpe_ratio is None else f"{metrics.sharpe_ratio:.2f}"
+                    benchmark_sharpe_text = (
+                        "n/a" if metrics.benchmark_sharpe_ratio is None else f"{metrics.benchmark_sharpe_ratio:.2f}"
+                    )
+                    verdict = (
+                        "n/a" if metrics.active_return is None
+                        else ("beat benchmark" if metrics.active_return > 0 else "trailed benchmark")
+                    )
+                    print(
+                        f"  {label} [{span}]: active_return={active_text} sharpe={sharpe_text} "
+                        f"(benchmark sharpe={benchmark_sharpe_text}) -> {verdict}"
+                    )
+            if len(validation_windows) <= 1 and len(holdout_windows) <= 1:
+                print(
+                    "  Only one validation window and one holdout exist with current stored history — "
+                    "each of the above is a single data point, not a statistically powered walk-forward "
+                    "verdict. Treat the direction as informative, not as proof of an edge."
+                )
             failed_windows = sum(window.status == "failed" for window in walk_result.windows)
             if failed_windows == len(walk_result.windows):
                 return int(ExitCode.OPERATION_FAILED)
             if failed_windows:
                 return int(ExitCode.PARTIAL_FAILURE)
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "validate-signals":
+            typed = _backtest_config(base_dir, args)
+            # A fresh run, not the existing backtest_signals rows already on disk: the
+            # most recent full-history run has git_dirty=1 recorded against it, so its
+            # scoring config isn't airtight-pinned to what's on disk right now. Rerunning
+            # is cheap at this data size and removes that ambiguity entirely.
+            result = run_backtests(config, logger, symbols, base_dir=base_dir, backtest_config=typed)
+            rules = load_scoring_rules(base_dir)
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                histories, _ = _load_backtest_inputs(conn, config, rules, symbols, typed)
+            finally:
+                conn.close()
+            horizon_days = args.horizon_days or int(load_prediction_rules(base_dir).get("horizon_days", 21))
+            validation = validate_signals(
+                result.signals, histories,
+                benchmark_symbol=typed.benchmark, horizon_days=horizon_days,
+            )
+            print(f"backtest run: {result.run.run_id}")
+            print(render_signal_validation_text(validation))
+            report_path = Path(config["reports_dir"]) / f"signal_validation_{result.run.run_id}.json"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
+                json.dumps({"backtest_run_id": result.run.run_id, **asdict(validation)}, indent=2),
+                encoding="utf-8",
+            )
+            print(f"report: {report_path}")
             return int(ExitCode.SUCCESS)
 
         if args.command == "run":

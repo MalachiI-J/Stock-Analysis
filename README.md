@@ -93,19 +93,108 @@ at or before the requested as-of date (see
 visible during training, matching the no-lookahead guarantee the rest of the
 project depends on.
 
-Performance is estimated via expanding-window walk-forward cross-validation
-(fit on everything before a chronological cut, test on the chunk right after
-it, repeated over `walk_forward_folds` cuts) rather than one lucky/unlucky
-train/holdout split, and the report always shows accuracy next to the
-positive-label base rate side by side — a model that's "60% accurate" during
-a period where 60% of samples were positive anyway has learned nothing, and
-this is reported honestly rather than hidden. The model actually used for
-today's predictions is then re-fit on the entire embargoed dataset, since a
-deployed model should use all the history available to it. Fitting is
-deterministic (zero initialization, full-batch gradient descent, no
-randomness), so the same stored data always produces the same coefficients
-and predictions. Configure via `config/prediction_rules.yaml` (horizon,
-lookback, feature list, fold count, regularization, minimum sample count).
+Performance is estimated via expanding-window walk-forward cross-validation,
+split by **unique calendar date rather than row count**: rows are assembled
+date-major (every eligible symbol for one sample date, then the next), so a
+row-count boundary can and does land in the middle of one date's block,
+silently putting some of that date's symbols in training and others in
+testing for the same fold. Splitting by date first, then mapping back to
+rows, guarantees no two rows sharing a date ever end up on opposite sides of
+a fold boundary. Each fold additionally **purges** any training row whose
+forward-return label resolves on or after the following test period's first
+date — that row's *features* never see test-period data, but a label window
+reaching into the test period is still informationally entangled with it,
+and training on it would leak information about test-period outcomes.
+
+Every fold reports its own training/test date ranges, distinct training/test
+symbol counts, purged-row count, and its own **fold-specific baselines**: a
+majority-class accuracy baseline and a constant-probability Brier baseline,
+both computed from that fold's own test-period positive rate — not a fixed
+50/50 assumption, and not the whole dataset's rate, which can differ
+substantially from any one fold's (the CLI output shows each fold's own test
+positive rate next to its accuracy for exactly this reason, rather than one
+dataset-wide rate presented as if it applied to every fold). `holdout_accuracy`
+and `holdout_brier_score` (and their baseline counterparts) are aggregated by
+weighting each fold by its own test-sample count, not by naively averaging
+fold-level numbers regardless of size. The model actually used for today's
+predictions is then re-fit on the entire embargoed dataset, since a deployed
+model should use all the history available to it. Fitting is deterministic
+(zero initialization, full-batch gradient descent, no randomness), so the
+same stored data always produces the same coefficients and predictions.
+Configure via `config/prediction_rules.yaml` (horizon, lookback, feature
+list, fold count, regularization, minimum sample count).
+
+Every run is persisted to `prediction_runs`/`prediction_folds` (see
+Persistence and reports) along with **evaluation provenance**: a fingerprint
+of the assembled feature/label arrays, a hash of the symbol universe, a hash
+of the configured feature list, a hash of the run configuration, and the
+code's Git revision. This is what lets two runs be told apart honestly — a
+rerun over identical data/symbols/features/config fingerprints identically
+and is recognizable as a rerun, not a second independent piece of evidence;
+only a run over genuinely new data (more history collected, a changed
+universe, a changed feature set) produces a new fingerprint. See "Evaluation
+honesty" below.
+
+`validate-signals` asks a complementary, higher-power question about
+`score_v1` itself: across every day a symbol was ever classified —
+independent of whether the portfolio backtester had room to act on it, which
+makes this a different and more statistically powerful check than the
+backtest's own trade-level diagnostics — did that classification's forward
+performance actually differ from the rest? It re-runs a fresh full-history
+backtest (so classifications reflect the current scoring code, not a
+possibly-stale prior run), buckets every classified instance by
+classification, and reports each bucket's hit-rate, mean/median forward
+excess return against the benchmark, distinct-symbol count, a naive and a
+Bonferroni-corrected p-value, and a symbol-weighted mean with a 95%
+confidence interval. The p-values are explicitly labeled naive/descriptive,
+not validated inferential statistics: with `horizon_days`-long overlapping
+lookaheads and rows clustered by symbol, a bucket's row-count is not a count
+of independent trials, and the Bonferroni correction only accounts for
+testing all five buckets rather than one, not for that deeper
+non-independence. Buckets backed by fewer than four distinct symbols are
+flagged as concentration-prone — their apparent effect can be one or two
+stocks' history repeated many times across overlapping daily windows, not a
+population-level pattern. This caught a real instance in this project's own
+history: an apparently significant "High Risk" outperformance turned out to
+be exactly two symbols (out of seventeen) mid-rally, not a broad effect.
+A monotonicity check (does mean excess return actually rank Strong Candidate
+> Candidate > Watch > Avoid > High Risk) is reported both day-weighted and
+symbol-weighted, since the two can diverge when a bucket is concentrated.
+
+### Evaluation honesty: what counts as evidence
+
+Both `predict` and `validate-signals` are built around one recurring
+distinction that is easy to blur and important to keep straight:
+
+- **A raw row** is one (symbol, date) observation. Thousands of rows sound
+  like a lot of evidence, but rows are not automatically independent.
+- **A distinct symbol** is the more defensible unit of independence when
+  rows overlap in time or share a company — a bucket or fold backed by two
+  stocks is two data points, not hundreds, no matter how many daily rows
+  those two stocks contributed.
+- **An independent evaluation block** (a walk-forward fold, a validation
+  window) is a chronological slice evaluated once, without being used to
+  tune anything. More non-overlapping blocks that agree is real evidence;
+  one block, however large, is one data point.
+- **A rerun over identical data** — same dataset fingerprint, same symbol
+  universe, same feature set, same configuration — is not new evidence,
+  even if it is run again next week. It confirms determinism, nothing more.
+- **Genuinely new out-of-sample evidence** requires new data: more history
+  collected since the last run, so the fingerprint changes and a fold or
+  window covers dates never evaluated before.
+
+As of this project's current data (roughly five years across seventeen
+symbols), neither signal has demonstrated a validated edge, and this is
+stated plainly rather than glossed over: `predict`'s sample-weighted
+walk-forward holdout accuracy has run below its own sample-weighted
+majority-class baseline, and its Brier score worse than its own
+constant-probability baseline; `score_v1`'s classification is not reliably
+monotonic even after concentration bias is corrected for, and apparent
+inversions found so far are better explained by this project's narrow,
+single-bull-market data window than by real risk-identification. A future
+claim of validated edge would require the purged/baseline-compared model to
+beat its fold-specific baselines consistently across multiple non-overlapping
+periods — not once, and not on a rerun of the same data. See Limitations.
 
 ## Phase 4 real-portfolio tracking
 
@@ -279,10 +368,14 @@ in that order, logging combined output to `logs/daily_run_<timestamp>.log`.
 The Windows toast notification combines the digest and recommendation
 summaries into one message, with the recommendation line explicitly marked
 "advisory, unproven model" so it never reads as a stronger signal than it
-is. It uses `cmd.exe` for output redirection rather than PowerShell's native
-`2>&1`/`*>>`, which otherwise wraps every stderr line from a Python process
-(the app logger writes `INFO` to stderr) in a spurious `NativeCommandError`
-and can emit UTF-16 log files.
+is. After the notification, the script opens that day's canonical Phase 2
+HTML report (`stock_summary_<date>_candidates_<hash>.html`, located by its
+documented filename pattern) in the default browser; if no report was
+produced for today, this is skipped and noted in the log rather than
+treated as a failure. It uses `cmd.exe` for output redirection rather than
+PowerShell's native `2>&1`/`*>>`, which otherwise wraps every stderr line
+from a Python process (the app logger writes `INFO` to stderr) in a
+spurious `NativeCommandError` and can emit UTF-16 log files.
 
 A Windows Task Scheduler task (`\StockScrapper\DailyRun`) runs this script
 Monday–Friday. Inspect or change it with:
@@ -384,6 +477,11 @@ python main.py screen --universe-path config/screening_universe.csv
 # EXPERIMENTAL: statistical forward-return prediction, separate from score_v1
 python main.py predict
 python main.py predict --symbols AAPL MSFT --as-of-date 2026-06-30
+
+# Does score_v1's classification beat the benchmark forward, independent of
+# the portfolio backtester's own sizing/timing? See "Evaluation honesty" above.
+python main.py validate-signals
+python main.py validate-signals --start 2022-07-20 --end 2026-06-30 --horizon-days 21
 ```
 
 `digest` reads the same saved classifications as `scores`/`explain` and groups
@@ -579,7 +677,7 @@ Walk-forward validation uses fixed warm-up and development periods as preceding 
 
 ## Persistence and reports
 
-SQLite is the system of record. Safe migrations preserve existing prices and add analysis, regime, backtest, trade, fill, equity, metric, and walk-forward tables with run identifiers, foreign keys, indexes, uniqueness rules, and transactional writes.
+SQLite is the system of record. Safe migrations preserve existing prices and add analysis, regime, backtest, trade, fill, equity, metric, walk-forward, and experimental-prediction (`prediction_runs`/`prediction_folds`, with per-fold date ranges, symbol counts, purge counts, baselines, and evaluation provenance) tables with run identifiers, foreign keys, indexes, uniqueness rules, and transactional writes.
 
 Phase 2 reports contain run metadata, as-of/data-through dates, score version/hash, regime evidence, candidate/risk rankings, components, factors, limitations, quality issues, prior-run changes, methodology, and inline adjusted-price/SMA20/SMA50/SMA200 charts.
 
@@ -597,7 +695,7 @@ stock_scrapper/migrations/      Safe SQLite schema migrations
 stock_scrapper/processing/      Validation, indicators, relative strength
 stock_scrapper/reporting/       Phase 2 offline reporting and the daily digest
 stock_scrapper/portfolio.py     Real-holdings aggregation and hold/sell assessment
-stock_scrapper/prediction/      Experimental forward-return prediction (config, dataset, model, service)
+stock_scrapper/prediction/      Experimental forward-return prediction (config, dataset, model, service, persistence)
 stock_scrapper/trading/         Advisory trade recommendations, sizing, and hindsight review (config, recommendations, review)
 scripts/                        Daily automation wrapper, toast notification (Task Scheduler entry point)
 tools/                          Clean source-archive tooling
@@ -624,7 +722,8 @@ python -m pytest -q
 - **Historical simulation:** fills are modeled from stored bars and configured assumptions, not an exchange order book.
 - **Research scope:** technical evidence omits fundamentals, macroeconomic releases, news, taxes, borrowing constraints, and individual circumstances.
 - **Screening universe:** `config/screening_universe.csv` is a hand-maintained illustrative list, not a live feed of any official index's constituents, and is not automatically kept current.
-- **Experimental prediction:** `predict` fits a small linear model on freely available technical indicators; its walk-forward holdout accuracy/Brier score may show no real edge over the base rate (both are reported side by side precisely so this is visible), and past accuracy does not indicate future accuracy. It is not part of `score_v1`.
+- **Experimental prediction:** `predict` fits a small linear model on freely available technical indicators; its date-grouped, purged, sample-weighted walk-forward holdout accuracy/Brier score are reported next to their own fold-specific baselines precisely so a lack of real edge is visible rather than hidden — and, as of this project's current data, that is exactly what they show (see "Evaluation honesty" above). Past accuracy does not indicate future accuracy. It is not part of `score_v1`.
+- **Signal validation is descriptive, not inferential:** `validate-signals`' p-values are naive (they assume independent daily trials, which overlapping-horizon, symbol-clustered rows are not) and are labeled as such; the symbol-weighted mean and its confidence interval are the more defensible read, and buckets backed by fewer than four distinct symbols are flagged as concentration-prone rather than presented as population-level evidence.
 - **Advisory recommendations only:** `recommend` sizes suggestions but never places an order — there is no broker integration, and `auto_execute` in `config/trading_rules.yaml` is rejected if set to `true`. Sizing assumes a single account with no existing outside positions, ignores taxes/fees, and derives available cash from `starting_capital` plus recorded lots/sales rather than a real brokerage balance.
 
 ## Financial and historical-results disclaimer

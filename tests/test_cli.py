@@ -32,7 +32,7 @@ class _Connection:
         self.rollbacks = 0
         self.executed: list[str] = []
 
-    def execute(self, sql: str) -> None:
+    def execute(self, sql: str, params: Any = ()) -> None:
         self.executed.append(sql)
 
     def commit(self) -> None:
@@ -283,6 +283,53 @@ def test_walk_forward_parent_persistence_failure_rolls_back_children(
     assert connections[0].commits == 0
     assert connections[0].rollbacks == 1
     assert connections[0].closed is True
+
+
+def test_walk_forward_reports_per_window_active_return_and_flags_single_window_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "initialize_database", lambda _path: None)
+    monkeypatch.setattr(cli, "create_connection", lambda _path: _Connection())
+    monkeypatch.setattr(cli, "_backtest_config", lambda _base_dir, _args: _BacktestConfigStub())
+    monkeypatch.setattr(cli, "load_scoring_rules", lambda _base_dir: {})
+    monkeypatch.setattr(
+        cli, "_load_backtest_inputs", lambda *_args: ({"SPY": [{"trade_date": "2024-01-02"}]}, {})
+    )
+    monkeypatch.setattr(cli, "persist_walk_forward", lambda _conn, _result: None)
+
+    validation_metrics = SimpleNamespace(active_return=0.05, sharpe_ratio=1.2, benchmark_sharpe_ratio=0.9)
+    holdout_metrics = SimpleNamespace(active_return=-0.02, sharpe_ratio=0.5, benchmark_sharpe_ratio=1.1)
+
+    def fake_run_walk_forward(
+        _config: Any, _trading_dates: list[str], _executor: Any, *, symbols: list[str], walk_forward_run_id: str
+    ) -> SimpleNamespace:
+        del symbols
+        windows = [
+            SimpleNamespace(
+                window_type="validation", evaluation_start_date="2024-01-02", evaluation_end_date="2024-06-01",
+                status="completed", backtest_run_id="bt-1", metrics=validation_metrics,
+            ),
+            SimpleNamespace(
+                window_type="holdout", evaluation_start_date="2024-06-02", evaluation_end_date="2024-12-01",
+                status="completed", backtest_run_id="bt-2", metrics=holdout_metrics,
+            ),
+        ]
+        return SimpleNamespace(
+            walk_forward_run_id=walk_forward_run_id, status="completed", windows=windows,
+            benchmark_symbol=None, symbols=[], configuration_snapshot={},
+        )
+
+    monkeypatch.setattr(cli, "run_walk_forward", fake_run_walk_forward)
+
+    assert cli.main(["walk-forward", "--symbols", "AAA"]) == int(ExitCode.SUCCESS)
+
+    output = capsys.readouterr().out
+    assert "validation [2024-01-02..2024-06-01]: active_return=+5.00% sharpe=1.20 (benchmark sharpe=0.90) -> beat benchmark" in output
+    assert "holdout [2024-06-02..2024-12-01]: active_return=-2.00% sharpe=0.50 (benchmark sharpe=1.10) -> trailed benchmark" in output
+    assert "not a statistically powered walk-forward" in output
 
 
 def test_insufficient_walk_forward_history_uses_missing_data_exit_code(
@@ -1138,8 +1185,8 @@ def test_predict_command_reports_coefficients_and_ranked_predictions(
     captured = capsys.readouterr()
     assert "EXPERIMENTAL STATISTICAL FORECAST" in captured.err
     assert "Walk-forward holdout accuracy: 55.0%" in captured.out
-    assert "base rate 52.0%" in captured.out
-    assert "fold 1: trained on 200, tested on 50" in captured.out
+    assert "dataset-wide positive rate 52.0%" in captured.out
+    assert "fold 1: train" in captured.out and "(200 samples, 0 symbols, 0 purged" in captured.out
     assert "rsi_14" in captured.out and "+0.4200" in captured.out
     assert "Near-zero influence" in captured.out and "atr_percentage" in captured.out
     lines = captured.out.splitlines()

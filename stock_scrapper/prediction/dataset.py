@@ -164,7 +164,17 @@ def build_training_dataset(
             benchmark_return = (benchmark_future_close - benchmark_entry_close) / benchmark_entry_close
             feature_rows.append(values)  # type: ignore[arg-type]
             labels.append(1.0 if symbol_return > benchmark_return else 0.0)
-            meta.append({"symbol": result.symbol, "date": sample_date.isoformat()})
+            meta.append(
+                {
+                    "symbol": result.symbol,
+                    "date": sample_date.isoformat(),
+                    # Where this row's label actually resolves — a training row whose label
+                    # depends on prices at or after a later fold's test period start is still
+                    # informationally entangled with that test period, even though the row's
+                    # *features* only use data up to "date". See _run_walk_forward's purge step.
+                    "label_end_date": str(future_row.get("trade_date"))[:10],
+                }
+            )
 
     features = np.array(feature_rows, dtype=float) if feature_rows else np.empty((0, len(feature_keys)))
     return features, np.array(labels, dtype=float), meta

@@ -130,7 +130,7 @@ def test_build_training_dataset_drops_rows_missing_features_or_ineligible() -> N
     )
 
     assert features.shape[0] == 1
-    assert meta == [{"symbol": "AAA", "date": trading_dates[2]}]
+    assert meta == [{"symbol": "AAA", "date": trading_dates[2], "label_end_date": trading_dates[2 + 5]}]
 
 
 def test_build_training_dataset_excludes_dates_without_enough_forward_history() -> None:
@@ -216,4 +216,4 @@ def test_build_training_dataset_drops_rows_with_unmapped_market_regime() -> None
     )
 
     assert features.shape[0] == 1
-    assert meta == [{"symbol": "AAA", "date": trading_dates[1]}]
+    assert meta == [{"symbol": "AAA", "date": trading_dates[1], "label_end_date": trading_dates[1 + 5]}]
