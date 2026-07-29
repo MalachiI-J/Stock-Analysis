@@ -183,18 +183,30 @@ distinction that is easy to blur and important to keep straight:
   collected since the last run, so the fingerprint changes and a fold or
   window covers dates never evaluated before.
 
-As of this project's current data (roughly five years across seventeen
-symbols), neither signal has demonstrated a validated edge, and this is
-stated plainly rather than glossed over: `predict`'s sample-weighted
-walk-forward holdout accuracy has run below its own sample-weighted
-majority-class baseline, and its Brier score worse than its own
-constant-probability baseline; `score_v1`'s classification is not reliably
-monotonic even after concentration bias is corrected for, and apparent
-inversions found so far are better explained by this project's narrow,
-single-bull-market data window than by real risk-identification. A future
-claim of validated edge would require the purged/baseline-compared model to
-beat its fold-specific baselines consistently across multiple non-overlapping
-periods — not once, and not on a rerun of the same data. See Limitations.
+The candidate universe was deliberately widened from an original 10 mega-cap,
+mostly tech-weighted names to 25 spanning healthcare, staples, media,
+telecom, industrials, auto, financials, energy, and utilities — including
+several names with genuine multi-year drawdowns (INTC, PYPL, BA, T, VZ)
+rather than only names that happened to ride a single tech/AI bull market.
+That mattered: with the narrower 17-symbol universe, `predict`'s holdout
+accuracy trailed its own baseline in 4 of 5 folds; with the wider,
+25-symbol universe (roughly five years of history), it now beats its own
+fold-specific baseline in 4 of 5 folds on accuracy (one fold clearly
+misses), while its Brier score remains close to and mixed against its own
+baseline — a meaningfully different and more encouraging picture than the
+narrower sample gave, but four folds over one overlapping historical window
+is still not multiple independent periods of confirmation. `score_v1`'s
+classification, meanwhile, looks *less* convincing with the wider sample:
+"Watch" (now dominated by defensive/staples/utility/telecom names) posted a
+clearly negative mean excess return, and "Strong Candidate"'s symbol-weighted
+mean excess return is now slightly negative — both are as consistent with
+"the benchmark was itself increasingly driven by a handful of mega-cap/AI
+names over this window" as with anything score_v1 is measuring. Neither
+signal has demonstrated a validated edge yet, and this is stated plainly
+rather than glossed over. A future claim of validated edge would require the
+purged/baseline-compared model to beat its fold-specific baselines
+consistently across multiple non-overlapping periods — not four folds over
+one window, and not on a rerun of the same data. See Limitations.
 
 ## Phase 4 real-portfolio tracking
 
@@ -370,9 +382,10 @@ summaries into one message, with the recommendation line explicitly marked
 "advisory, unproven model" so it never reads as a stronger signal than it
 is. After the notification, the script opens that day's canonical Phase 2
 HTML report (`stock_summary_<date>_candidates_<hash>.html`, located by its
-documented filename pattern) in the default browser; if no report was
-produced for today, this is skipped and noted in the log rather than
-treated as a failure. It uses `cmd.exe` for output redirection rather than
+documented filename pattern) in the default browser, gated by
+`open_reports_automatically` in `config/settings.yaml` (default `true`); if
+no report was produced for today, this is skipped and noted in the log
+rather than treated as a failure. It uses `cmd.exe` for output redirection rather than
 PowerShell's native `2>&1`/`*>>`, which otherwise wraps every stderr line
 from a Python process (the app logger writes `INFO` to stderr) in a
 spurious `NativeCommandError` and can emit UTF-16 log files.
@@ -495,7 +508,7 @@ same research-only disclaimer as every other report.
 
 ### Universe-aware analyses and canonical runs
 
-The configured **candidate universe** is the 10 stocks eligible for analysis and trading. The **data universe** is the ordered union of candidates, SPY, market context (SPY/QQQ/IWM), and defensive context (TLT/GLD). Data collection, reconciliation, validation, and health commands default to all 15 data symbols. Analysis, reporting, backtesting, and walk-forward commands default to the 10 candidates; context assets are still loaded internally for relative strength, beta, breadth, correlation, and regime calculations.
+The configured **candidate universe** is the 25 stocks eligible for analysis and trading — deliberately spanning multiple sectors and market histories rather than a single mega-cap/tech cohort (see "Evaluation honesty" above). The **data universe** is the ordered union of candidates, SPY, market context (SPY/QQQ/IWM), and defensive context (TLT/GLD), 30 symbols in total. Data collection, reconciliation, validation, and health commands default to all 30 data symbols. Analysis, reporting, backtesting, and walk-forward commands default to the 25 candidates; context assets are still loaded internally for relative strength, beta, breadth, correlation, and regime calculations.
 
 ```powershell
 # Analyze and save the configured candidates as the canonical daily run

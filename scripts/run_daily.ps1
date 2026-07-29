@@ -16,7 +16,9 @@ session, which is why this task is registered with LogonType=Interactive rather
 than running detached. The report is located by its documented canonical filename
 pattern (`stock_summary_<date>_candidates_<hash>.html`) rather than by parsing
 `main.py run`'s output; if `run` failed to produce a report for today, opening is
-skipped and noted in the log rather than treated as a fatal error.
+skipped and noted in the log rather than treated as a fatal error. Auto-open is
+gated by `open_reports_automatically` in config/settings.yaml, so it can be
+turned off without editing this script.
 
 Uses cmd.exe for output redirection rather than PowerShell's native `*>>`/`2>&1`,
 which wraps every stderr line from a native exe (Python's logger writes INFO to
@@ -78,17 +80,22 @@ if (Test-Path $summaryPath) {
     Add-Content -Path $logFile -Value "Toast notification skipped: summary file not found at $summaryPath"
 }
 
-$reportFile = Get-ChildItem -Path (Join-Path $RepoRoot "reports") -Filter "stock_summary_${today}_candidates_*.html" -ErrorAction SilentlyContinue |
-    Sort-Object LastWriteTime -Descending | Select-Object -First 1
-if ($reportFile) {
-    try {
-        Start-Process $reportFile.FullName
-        Add-Content -Path $logFile -Value "Opened report: $($reportFile.FullName)"
-    } catch {
-        Add-Content -Path $logFile -Value "Report auto-open skipped: $_"
+$openReportsSetting = (& $pythonExe -c "from stock_scrapper.config import load_config; print(bool(load_config().get('open_reports_automatically', False)))").Trim()
+if ($openReportsSetting -eq "True") {
+    $reportFile = Get-ChildItem -Path (Join-Path $RepoRoot "reports") -Filter "stock_summary_${today}_candidates_*.html" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($reportFile) {
+        try {
+            Start-Process $reportFile.FullName
+            Add-Content -Path $logFile -Value "Opened report: $($reportFile.FullName)"
+        } catch {
+            Add-Content -Path $logFile -Value "Report auto-open skipped: $_"
+        }
+    } else {
+        Add-Content -Path $logFile -Value "Report auto-open skipped: no report file found matching stock_summary_${today}_candidates_*.html"
     }
 } else {
-    Add-Content -Path $logFile -Value "Report auto-open skipped: no report file found matching stock_summary_${today}_candidates_*.html"
+    Add-Content -Path $logFile -Value "Report auto-open disabled (open_reports_automatically is false in config/settings.yaml)"
 }
 
 cmd.exe /c "`"$pythonExe`" main.py cleanup-logs --include-reports >> `"$logFile`" 2>&1"
