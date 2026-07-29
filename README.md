@@ -183,18 +183,55 @@ distinction that is easy to blur and important to keep straight:
   collected since the last run, so the fingerprint changes and a fold or
   window covers dates never evaluated before.
 
-As of this project's current data (roughly five years across seventeen
-symbols), neither signal has demonstrated a validated edge, and this is
-stated plainly rather than glossed over: `predict`'s sample-weighted
-walk-forward holdout accuracy has run below its own sample-weighted
-majority-class baseline, and its Brier score worse than its own
-constant-probability baseline; `score_v1`'s classification is not reliably
-monotonic even after concentration bias is corrected for, and apparent
-inversions found so far are better explained by this project's narrow,
-single-bull-market data window than by real risk-identification. A future
-claim of validated edge would require the purged/baseline-compared model to
-beat its fold-specific baselines consistently across multiple non-overlapping
-periods — not once, and not on a rerun of the same data. See Limitations.
+The candidate universe was deliberately widened from an original 10 mega-cap,
+mostly tech-weighted names to 25 spanning healthcare, staples, media,
+telecom, industrials, auto, financials, energy, and utilities — including
+several names with genuine multi-year drawdowns (INTC, PYPL, BA, T, VZ)
+rather than only names that happened to ride a single tech/AI bull market.
+`historical_lookback_years` was then extended from 5 to 20, which matters
+independently of universe width: with ~5 years of history the portfolio
+`walk-forward` command could only fit one validation window plus one
+holdout, so a single window's outcome — good or bad — was never enough to
+trust on its own. With 20 years it fits 15 validation windows plus one
+holdout, a roughly 15x increase in independent evaluation blocks (see the
+distinction above between one block and many).
+
+The wider, deeper evidence base now gives a consistent, and mostly negative,
+answer for both signals:
+
+- **`score_v1` portfolio walk-forward** (15 validation windows + 1 holdout,
+  2009–2026): the strategy beat SPY in only 5 of 15 validation windows
+  (33%) and lost the holdout outright (most recent 12 months: active return
+  −11.95%, Sharpe 0.47 vs. benchmark Sharpe 1.35). No consistent edge across
+  independent periods.
+- **`score_v1` classification hit-rate** (`validate-signals`, 109,706
+  classified rows, 20–25 distinct symbols per bucket — resolving the
+  concentration problem described above): "Strong Candidate" shows a real
+  but thin edge (mean excess return +0.99%; symbol-weighted 95% CI
+  [+0.01%, +1.42%], barely excluding zero). Monotonicity still fails, and
+  now more seriously than before — "High Risk" posts the *largest* excess
+  return of any bucket (mean +3.24%; symbol-weighted CI [+1.82%, +4.48%],
+  clearly excluding zero, backed by 20 distinct symbols), so this is no
+  longer a two-symbol concentration artifact but a genuine, well-supported
+  inversion in the risk classification. It is reported here as an honest
+  anomaly, not evidence of a usable signal — it could reflect a real risk
+  premium (riskier names carry higher expected return) or a miscalibration
+  in how risk is scored; distinguishing those would require dedicated
+  investigation, not a reinterpretation of this data.
+- **`predict-v3`** (54,627 samples, 2008–2026, 5 purged walk-forward folds):
+  holdout accuracy 50.6% against a sample-weighted baseline of 51.6%, and
+  Brier score 0.2504 against a baseline of 0.2497 — below baseline on both
+  metrics overall. Only 1 of 5 folds beats its own fold-specific baseline on
+  accuracy; the most recent fold (2023–2026) is the worst of all five.
+
+Taken together, neither signal has demonstrated a validated edge, and the
+deeper, wider sample makes that conclusion more solid than the earlier
+narrower one did — this is not a case where more data revealed a hidden
+edge; if anything it removed ambiguity in the negative direction. This is
+stated plainly rather than glossed over. A future claim of validated edge
+would require a model or ranking to beat its own fold/window-specific
+baseline consistently across multiple non-overlapping periods, not on a
+rerun of the same data. See Limitations.
 
 ## Phase 4 real-portfolio tracking
 
@@ -370,9 +407,10 @@ summaries into one message, with the recommendation line explicitly marked
 "advisory, unproven model" so it never reads as a stronger signal than it
 is. After the notification, the script opens that day's canonical Phase 2
 HTML report (`stock_summary_<date>_candidates_<hash>.html`, located by its
-documented filename pattern) in the default browser; if no report was
-produced for today, this is skipped and noted in the log rather than
-treated as a failure. It uses `cmd.exe` for output redirection rather than
+documented filename pattern) in the default browser, gated by
+`open_reports_automatically` in `config/settings.yaml` (default `true`); if
+no report was produced for today, this is skipped and noted in the log
+rather than treated as a failure. It uses `cmd.exe` for output redirection rather than
 PowerShell's native `2>&1`/`*>>`, which otherwise wraps every stderr line
 from a Python process (the app logger writes `INFO` to stderr) in a
 spurious `NativeCommandError` and can emit UTF-16 log files.
@@ -495,7 +533,7 @@ same research-only disclaimer as every other report.
 
 ### Universe-aware analyses and canonical runs
 
-The configured **candidate universe** is the 10 stocks eligible for analysis and trading. The **data universe** is the ordered union of candidates, SPY, market context (SPY/QQQ/IWM), and defensive context (TLT/GLD). Data collection, reconciliation, validation, and health commands default to all 15 data symbols. Analysis, reporting, backtesting, and walk-forward commands default to the 10 candidates; context assets are still loaded internally for relative strength, beta, breadth, correlation, and regime calculations.
+The configured **candidate universe** is the 25 stocks eligible for analysis and trading — deliberately spanning multiple sectors and market histories rather than a single mega-cap/tech cohort (see "Evaluation honesty" above). The **data universe** is the ordered union of candidates, SPY, market context (SPY/QQQ/IWM), and defensive context (TLT/GLD), 30 symbols in total. Data collection, reconciliation, validation, and health commands default to all 30 data symbols. Analysis, reporting, backtesting, and walk-forward commands default to the 25 candidates; context assets are still loaded internally for relative strength, beta, breadth, correlation, and regime calculations.
 
 ```powershell
 # Analyze and save the configured candidates as the canonical daily run

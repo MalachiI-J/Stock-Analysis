@@ -4,8 +4,8 @@ benchmark: SPY
 initial_cash: 100000.0
 warm_up_days: 252
 warmup_policy: shift_start
-start_date: 2022-07-20
-end_date: 2026-06-30
+start_date: 2008-01-02
+end_date: 2026-07-28
 signal_frequency: daily
 rebalancing_frequency: daily
 

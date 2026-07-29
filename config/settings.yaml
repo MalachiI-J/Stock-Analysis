@@ -5,13 +5,13 @@ raw_data_dir: data/raw
 processed_data_dir: data/processed
 reports_dir: reports
 logs_dir: logs
-historical_lookback_years: 5
+historical_lookback_years: 20
 data_source: yfinance
 retry_count: 3
 retry_delay_seconds: 2
 logging_level: INFO
 archive_raw_downloads: false
-open_reports_automatically: false
+open_reports_automatically: true
 logs_retention_days: 30
 market_data:
   exchange: XNYS
@@ -22,7 +22,14 @@ market_data:
   corporate_action_refresh_sessions: 90
   scheduled_full_refresh_days: 7
 universes:
-  candidates: [AAPL, MSFT, AMZN, GOOGL, META, NVDA, TSLA, JPM, WMT, XOM]
+  # Deliberately diversified beyond the original 10 mega-cap names: added healthcare
+  # (UNH, JNJ), staples (PG, KO), media (DIS), telecom (T, VZ), industrials (BA, CAT),
+  # auto (F), financials (BAC), energy (CVX), utilities (NEE), and semiconductors/
+  # fintech names with genuine multi-year drawdowns (INTC, PYPL) rather than only
+  # names that happened to be in a single tech/AI bull market — see "Evaluation
+  # honesty" in README.md for why symbol/sector concentration was limiting how much
+  # validate-signals/predict could actually tell us.
+  candidates: [AAPL, MSFT, AMZN, GOOGL, META, NVDA, TSLA, JPM, WMT, XOM, UNH, JNJ, PG, KO, DIS, INTC, PYPL, BA, T, F, BAC, CAT, CVX, NEE, VZ]
   benchmark:
     symbol: SPY
   market_context: [SPY, QQQ, IWM]
