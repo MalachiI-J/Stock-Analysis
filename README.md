@@ -368,10 +368,14 @@ in that order, logging combined output to `logs/daily_run_<timestamp>.log`.
 The Windows toast notification combines the digest and recommendation
 summaries into one message, with the recommendation line explicitly marked
 "advisory, unproven model" so it never reads as a stronger signal than it
-is. It uses `cmd.exe` for output redirection rather than PowerShell's native
-`2>&1`/`*>>`, which otherwise wraps every stderr line from a Python process
-(the app logger writes `INFO` to stderr) in a spurious `NativeCommandError`
-and can emit UTF-16 log files.
+is. After the notification, the script opens that day's canonical Phase 2
+HTML report (`stock_summary_<date>_candidates_<hash>.html`, located by its
+documented filename pattern) in the default browser; if no report was
+produced for today, this is skipped and noted in the log rather than
+treated as a failure. It uses `cmd.exe` for output redirection rather than
+PowerShell's native `2>&1`/`*>>`, which otherwise wraps every stderr line
+from a Python process (the app logger writes `INFO` to stderr) in a
+spurious `NativeCommandError` and can emit UTF-16 log files.
 
 A Windows Task Scheduler task (`\StockScrapper\DailyRun`) runs this script
 Monday–Friday. Inspect or change it with:

@@ -3,15 +3,20 @@ Runs the daily Stock Scrapper pipeline unattended: collects/validates/analyzes/r
 (`main.py run`), writes a plain-language buy/watch/sell digest (`main.py digest`),
 computes sized advisory trade recommendations (`main.py recommend` — suggestions
 only, nothing is ever bought or sold automatically), shows a combined summary as a
-Windows toast notification, then deletes log files and unreferenced report artifacts
-(old digest/recommendations/data-health/screener files; never analysis/backtest
-reports tied to a saved run) older than the configured retention window
+Windows toast notification, opens that day's canonical Phase 2 HTML report in the
+default browser, then deletes log files and unreferenced report artifacts (old
+digest/recommendations/data-health/screener files; never analysis/backtest reports
+tied to a saved run) older than the configured retention window
 (`main.py cleanup-logs --include-reports`). Intended to be invoked by Windows Task
 Scheduler once per day, after the market close plus the configured provider delay
 (see market_data.provider_delay_minutes in config/settings.yaml).
 
-The toast notification requires an interactive logon session, which is why this
-task is registered with LogonType=Interactive rather than running detached.
+The toast notification and report auto-open both require an interactive logon
+session, which is why this task is registered with LogonType=Interactive rather
+than running detached. The report is located by its documented canonical filename
+pattern (`stock_summary_<date>_candidates_<hash>.html`) rather than by parsing
+`main.py run`'s output; if `run` failed to produce a report for today, opening is
+skipped and noted in the log rather than treated as a fatal error.
 
 Uses cmd.exe for output redirection rather than PowerShell's native `*>>`/`2>&1`,
 which wraps every stderr line from a native exe (Python's logger writes INFO to
@@ -71,6 +76,19 @@ if (Test-Path $summaryPath) {
     }
 } else {
     Add-Content -Path $logFile -Value "Toast notification skipped: summary file not found at $summaryPath"
+}
+
+$reportFile = Get-ChildItem -Path (Join-Path $RepoRoot "reports") -Filter "stock_summary_${today}_candidates_*.html" -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if ($reportFile) {
+    try {
+        Start-Process $reportFile.FullName
+        Add-Content -Path $logFile -Value "Opened report: $($reportFile.FullName)"
+    } catch {
+        Add-Content -Path $logFile -Value "Report auto-open skipped: $_"
+    }
+} else {
+    Add-Content -Path $logFile -Value "Report auto-open skipped: no report file found matching stock_summary_${today}_candidates_*.html"
 }
 
 cmd.exe /c "`"$pythonExe`" main.py cleanup-logs --include-reports >> `"$logFile`" 2>&1"
