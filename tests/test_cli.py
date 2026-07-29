@@ -1185,8 +1185,8 @@ def test_predict_command_reports_coefficients_and_ranked_predictions(
     captured = capsys.readouterr()
     assert "EXPERIMENTAL STATISTICAL FORECAST" in captured.err
     assert "Walk-forward holdout accuracy: 55.0%" in captured.out
-    assert "base rate 52.0%" in captured.out
-    assert "fold 1: trained on 200, tested on 50" in captured.out
+    assert "dataset-wide positive rate 52.0%" in captured.out
+    assert "fold 1: train" in captured.out and "(200 samples, 0 symbols, 0 purged" in captured.out
     assert "rsi_14" in captured.out and "+0.4200" in captured.out
     assert "Near-zero influence" in captured.out and "atr_percentage" in captured.out
     lines = captured.out.splitlines()

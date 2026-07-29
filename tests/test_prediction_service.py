@@ -3,8 +3,11 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Any
 
+import numpy as np
+import pytest
+
 from stock_scrapper.models.analysis_models import AnalysisResult
-from stock_scrapper.prediction.service import run_prediction
+from stock_scrapper.prediction.service import _run_walk_forward, _weighted_average, run_prediction
 
 
 def _dates(start: str, count: int) -> list[str]:
@@ -185,3 +188,179 @@ def test_run_prediction_is_deterministic_given_same_inputs() -> None:
     assert (
         result_a.predictions[0].probability_positive == result_b.predictions[0].probability_positive
     )
+
+
+def _meta_row(symbol: str, sample_date: str, label_end_date: str) -> dict[str, str]:
+    return {"symbol": symbol, "date": sample_date, "label_end_date": label_end_date}
+
+
+def test_run_walk_forward_never_splits_rows_from_the_same_date_across_a_fold_boundary() -> None:
+    # 3 unique dates with different row counts (3, 3, 2) -- a row-count-based boundary
+    # would land inside the second date's block; a date-count boundary must not.
+    dates = ["2024-01-01", "2024-01-02", "2024-01-03"]
+    symbols_by_date = {dates[0]: ["A", "B", "C"], dates[1]: ["A", "B", "C"], dates[2]: ["A", "B"]}
+    meta = [
+        _meta_row(symbol, d, "2000-01-01")  # far in the past -> never purged
+        for d in dates
+        for symbol in symbols_by_date[d]
+    ]
+    features = np.array([[float(index)] for index in range(len(meta))])
+    labels = np.array([1.0 if index % 2 == 0 else 0.0 for index in range(len(meta))])
+
+    folds = _run_walk_forward(
+        ["x"], features, labels, meta,
+        requested_folds=1, l2_lambda=0.0, learning_rate=0.1, iterations=5,
+    )
+
+    assert len(folds) == 1
+    fold = folds[0]
+    assert fold.training_start_date == dates[0]
+    assert fold.training_end_date == dates[1]
+    assert fold.test_start_date == dates[2]
+    assert fold.test_end_date == dates[2]
+    assert fold.training_samples == 6  # all of d1 + d2, none split out
+    assert fold.test_samples == 2
+    assert fold.purged_samples == 0
+
+
+def test_run_walk_forward_purges_training_rows_whose_label_overlaps_the_test_period() -> None:
+    dates = ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]
+    meta = [
+        _meta_row("A", dates[0], dates[0]),  # label resolves before the test period -> kept
+        _meta_row("A", dates[1], dates[3]),  # label resolves inside the test period -> purged
+        _meta_row("A", dates[2], dates[2]),
+        _meta_row("A", dates[3], dates[3]),
+    ]
+    features = np.array([[1.0], [2.0], [3.0], [4.0]])
+    labels = np.array([1.0, 0.0, 1.0, 0.0])
+
+    folds = _run_walk_forward(
+        ["x"], features, labels, meta,
+        requested_folds=1, l2_lambda=0.0, learning_rate=0.1, iterations=5,
+    )
+
+    assert len(folds) == 1
+    fold = folds[0]
+    assert fold.training_samples == 1
+    assert fold.purged_samples == 1
+    assert fold.test_samples == 2
+    assert fold.training_start_date == dates[0]
+    assert fold.training_end_date == dates[0]
+
+
+def test_run_walk_forward_computes_fold_specific_baselines_from_that_folds_own_test_labels() -> None:
+    dates = ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]
+    # Two symbols per date; labels chosen so each fold's test-period positive rate is
+    # distinct from both the other fold's and the whole dataset's rate (3/8 = 0.375).
+    labels_by_date = {dates[0]: [0.0, 0.0], dates[1]: [0.0, 0.0], dates[2]: [1.0, 0.0], dates[3]: [1.0, 1.0]}
+    meta: list[dict[str, str]] = []
+    label_values: list[float] = []
+    for d in dates:
+        for symbol, label in zip(("X", "Y"), labels_by_date[d]):
+            meta.append(_meta_row(symbol, d, "2000-01-01"))
+            label_values.append(label)
+    features = np.array([[float(index)] for index in range(len(meta))])
+    labels = np.array(label_values)
+
+    folds = _run_walk_forward(
+        ["x"], features, labels, meta,
+        requested_folds=2, l2_lambda=0.0, learning_rate=0.1, iterations=5,
+    )
+
+    assert len(folds) == 2
+    first, second = folds
+    # Fold 1's test period is d3 alone (labels [1, 0]) -> a 50/50 split.
+    assert first.test_positive_rate == pytest.approx(0.5)
+    assert first.baseline_accuracy == pytest.approx(0.5)
+    assert first.baseline_brier_score == pytest.approx(0.25)
+    # Fold 2's test period is d4 alone (labels [1, 1]) -> unanimous.
+    assert second.test_positive_rate == pytest.approx(1.0)
+    assert second.baseline_accuracy == pytest.approx(1.0)
+    assert second.baseline_brier_score == pytest.approx(0.0)
+
+
+def test_weighted_average_differs_from_unweighted_mean_when_fold_sizes_differ() -> None:
+    values = [(1.0, 10), (0.0, 90)]  # a small fold that went well, a large one that didn't
+
+    weighted = _weighted_average(values)
+    naive = sum(value for value, _ in values) / len(values)
+
+    assert weighted == pytest.approx(0.1)
+    assert naive == pytest.approx(0.5)
+    assert weighted != pytest.approx(naive)
+
+
+def test_weighted_average_returns_none_for_empty_or_zero_weight_input() -> None:
+    assert _weighted_average([]) is None
+    assert _weighted_average([(1.0, 0), (0.5, 0)]) is None
+
+
+def test_run_prediction_aggregates_holdout_accuracy_by_sample_weight_not_fold_count() -> None:
+    trading_dates = _dates("2024-01-01", 30)
+    prices = [100.0 + (5 if index % 2 == 0 else -5) for index in range(30)]
+    history = {"AAA": [{"trade_date": d, "adjusted_close": p} for d, p in zip(trading_dates, prices)]}
+    history.update(_flat_benchmark(trading_dates))
+    as_of = trading_dates[-1]
+    results_by_date = {d: {"AAA": _result("AAA", d, rsi=40.0 + index)} for index, d in enumerate(trading_dates)}
+    service = _FakeService(results_by_date)
+    rules = dict(_RULES, walk_forward_folds=3)
+
+    result = run_prediction(
+        service, ["AAA"], history, trading_dates,
+        as_of_date=as_of, rules=rules, benchmark_symbol="SPY",
+    )
+
+    scored_folds = [fold for fold in result.walk_forward_folds if fold.accuracy is not None]
+    assert len(scored_folds) >= 2
+    # The fold split's remainder distribution (see _fold_boundaries) should leave at
+    # least one fold a different size from the others -- otherwise this test wouldn't
+    # distinguish weighted from unweighted aggregation at all.
+    assert len({fold.test_samples for fold in scored_folds}) > 1
+
+    total_weight = sum(fold.test_samples for fold in scored_folds)
+    expected_accuracy = sum(fold.accuracy * fold.test_samples for fold in scored_folds) / total_weight
+    expected_brier = sum(fold.brier_score * fold.test_samples for fold in scored_folds) / total_weight
+    assert result.holdout_accuracy == pytest.approx(expected_accuracy)
+    assert result.holdout_brier_score == pytest.approx(expected_brier)
+
+    baseline_folds = [fold for fold in scored_folds if fold.baseline_accuracy is not None]
+    baseline_weight = sum(fold.test_samples for fold in baseline_folds)
+    expected_baseline_accuracy = sum(
+        fold.baseline_accuracy * fold.test_samples for fold in baseline_folds
+    ) / baseline_weight
+    assert result.baseline_accuracy == pytest.approx(expected_baseline_accuracy)
+
+
+def test_run_prediction_exposes_provenance_hashes_and_reruns_match() -> None:
+    trading_dates = _dates("2024-01-01", 20)
+    prices = [100.0 + index for index in range(20)]
+    history = {"AAA": [{"trade_date": d, "adjusted_close": p} for d, p in zip(trading_dates, prices)]}
+    history.update(_flat_benchmark(trading_dates))
+    as_of = trading_dates[-1]
+    results_by_date = {d: {"AAA": _result("AAA", d, rsi=40.0 + index)} for index, d in enumerate(trading_dates)}
+
+    result_a = run_prediction(
+        _FakeService(results_by_date), ["AAA"], history, trading_dates,
+        as_of_date=as_of, rules=_RULES, benchmark_symbol="SPY",
+    )
+    result_b = run_prediction(
+        _FakeService(results_by_date), ["AAA"], history, trading_dates,
+        as_of_date=as_of, rules=_RULES, benchmark_symbol="SPY",
+    )
+
+    assert result_a.dataset_fingerprint is not None
+    assert result_a.symbol_universe_hash is not None
+    assert result_a.feature_set_hash is not None
+    # A rerun over identical data/symbols/features must fingerprint identically, so it
+    # is identifiable as a rerun rather than independent new evidence.
+    assert result_a.dataset_fingerprint == result_b.dataset_fingerprint
+    assert result_a.symbol_universe_hash == result_b.symbol_universe_hash
+    assert result_a.feature_set_hash == result_b.feature_set_hash
+
+    # A different symbol universe must change the symbol hash but not the feature hash.
+    result_c = run_prediction(
+        _FakeService(results_by_date), ["AAA", "ZZZ"], history, trading_dates,
+        as_of_date=as_of, rules=_RULES, benchmark_symbol="SPY",
+    )
+    assert result_c.symbol_universe_hash != result_a.symbol_universe_hash
+    assert result_c.feature_set_hash == result_a.feature_set_hash

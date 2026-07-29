@@ -88,7 +88,7 @@ from stock_scrapper.reporting.digest import (
     format_holding_line,
     render_digest_text,
 )
-from stock_scrapper.utilities.hashing import canonical_json
+from stock_scrapper.utilities.hashing import canonical_json, stable_sha256
 from stock_scrapper.utilities.logging_setup import setup_logging
 from stock_scrapper.utilities.provenance import collect_provenance
 from stock_scrapper.universes import resolve_universe
@@ -1120,6 +1120,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     as_of_date=effective.isoformat(), rules=prediction_rules, benchmark_symbol=benchmark,
                 )
                 prediction_run_id = f"predict-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
+                run_provenance = collect_provenance(
+                    base_dir,
+                    strategy_name=prediction_rules["prediction_version"],
+                    strategy_version=prediction_rules["prediction_version"],
+                )
                 conn.execute("BEGIN")
                 try:
                     persist_prediction_run(
@@ -1127,6 +1132,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         prediction_version=prediction_rules["prediction_version"],
                         benchmark_symbol=benchmark,
                         configuration_snapshot=prediction_rules,
+                        configuration_hash=stable_sha256(prediction_rules),
+                        git_commit_hash=run_provenance.get("git_commit_hash"),
+                        git_dirty=run_provenance.get("git_dirty"),
                     )
                     conn.commit()
                 except Exception:
@@ -1140,27 +1148,47 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return int(ExitCode.MISSING_DATA)
             print(f"prediction run: {prediction_run_id}")
             print(f"Prediction as of {result.as_of_date} | horizon={result.horizon_days} session(s) | model={prediction_rules['prediction_version']}")
+            dataset_rate_text = "n/a" if result.positive_label_rate is None else f"{result.positive_label_rate:.1%}"
             print(
                 f"Trained on {result.training_samples} sample(s) ({result.training_start_date} to "
-                f"{result.training_end_date})"
+                f"{result.training_end_date}); dataset-wide positive rate {dataset_rate_text} "
+                "(context only — each fold below is judged against its own test-period rate, not this one)"
             )
             if result.message:
                 print(f"Note: {result.message}", file=sys.stderr)
-            base_rate_text = "n/a" if result.positive_label_rate is None else f"{result.positive_label_rate:.1%}"
             accuracy_text = "n/a" if result.holdout_accuracy is None else f"{result.holdout_accuracy:.1%}"
+            baseline_accuracy_text = "n/a" if result.baseline_accuracy is None else f"{result.baseline_accuracy:.1%}"
             brier_text = "n/a" if result.holdout_brier_score is None else f"{result.holdout_brier_score:.4f}"
+            baseline_brier_text = "n/a" if result.baseline_brier_score is None else f"{result.baseline_brier_score:.4f}"
             print(
-                f"Walk-forward holdout accuracy: {accuracy_text} (base rate {base_rate_text} — "
-                f"compare the two, since a lopsided base rate alone can inflate accuracy) over "
+                f"Walk-forward holdout accuracy: {accuracy_text} (sample-weighted majority-class baseline "
+                f"{baseline_accuracy_text}, built from each fold's own test-period rate) over "
                 f"{result.holdout_samples} held-out sample(s) across {len(result.walk_forward_folds)} fold(s)"
             )
-            print(f"Holdout Brier score (lower is better, 0.25 = coin flip): {brier_text}")
+            print(
+                f"Holdout Brier score: {brier_text} (sample-weighted constant-probability baseline "
+                f"{baseline_brier_text} — the true minimum achievable Brier for always predicting the "
+                "base rate; this equals 0.25 only when that rate happens to be 50/50)"
+            )
             for fold in result.walk_forward_folds:
                 fold_accuracy = "n/a" if fold.accuracy is None else f"{fold.accuracy:.1%}"
                 fold_brier = "n/a" if fold.brier_score is None else f"{fold.brier_score:.4f}"
+                fold_baseline_accuracy = "n/a" if fold.baseline_accuracy is None else f"{fold.baseline_accuracy:.1%}"
+                fold_baseline_brier = "n/a" if fold.baseline_brier_score is None else f"{fold.baseline_brier_score:.4f}"
+                fold_test_rate = "n/a" if fold.test_positive_rate is None else f"{fold.test_positive_rate:.1%}"
                 print(
-                    f"  fold {fold.fold}: trained on {fold.training_samples}, tested on "
-                    f"{fold.test_samples} -> accuracy {fold_accuracy}, brier {fold_brier}"
+                    f"  fold {fold.fold}: train [{fold.training_start_date}..{fold.training_end_date}] "
+                    f"({fold.training_samples} samples, {fold.training_symbol_count} symbols, "
+                    f"{fold.purged_samples} purged for label/test-period overlap)"
+                )
+                print(
+                    f"    -> test [{fold.test_start_date}..{fold.test_end_date}] "
+                    f"({fold.test_samples} samples, {fold.test_symbol_count} symbols, "
+                    f"test-period positive rate {fold_test_rate})"
+                )
+                print(
+                    f"    accuracy {fold_accuracy} vs. fold baseline {fold_baseline_accuracy} | "
+                    f"brier {fold_brier} vs. fold baseline {fold_baseline_brier}"
                 )
             print("Model coefficients (standardized; positive pushes probability up):")
             weak_features: list[str] = []

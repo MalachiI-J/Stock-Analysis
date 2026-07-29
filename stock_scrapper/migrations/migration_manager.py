@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-LATEST_SCHEMA_VERSION = 8
+LATEST_SCHEMA_VERSION = 9
 
 
 def _utc_now() -> str:
@@ -114,6 +114,10 @@ def apply_migrations(db_path: str | Path) -> None:
             _apply_v8(conn)
         else:
             _ensure_prediction_tracking_tables(conn)
+        if current_version < 9:
+            _apply_v9(conn)
+        else:
+            _ensure_prediction_provenance_columns(conn)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1028,3 +1032,46 @@ def _apply_v8(conn: sqlite3.Connection) -> None:
     _ensure_prediction_tracking_tables(conn)
     conn.execute("INSERT INTO schema_metadata(schema_version,applied_at,description) VALUES(?,?,?)",
                  (8,_utc_now(),"Add prediction_runs/prediction_folds to track predict-v3 accuracy over time"))
+
+
+def _ensure_prediction_provenance_columns(conn: sqlite3.Connection) -> None:
+    """Add evaluation-integrity provenance so two runs over identical data/symbols/
+    features/config are identifiable as reruns rather than independent evidence, plus
+    per-fold date ranges, symbol counts, purge counts, and fold-specific baselines
+    (date-grouped walk-forward with a leakage purge — see stock_scrapper/prediction/service.py)."""
+    for definition in (
+        "dataset_fingerprint TEXT",
+        "symbol_universe_hash TEXT",
+        "feature_set_hash TEXT",
+        "configuration_hash TEXT",
+        "git_commit_hash TEXT",
+        "git_dirty INTEGER",
+    ):
+        _add_column(conn, "prediction_runs", definition)
+    for definition in (
+        "training_start_date TEXT",
+        "training_end_date TEXT",
+        "test_start_date TEXT",
+        "test_end_date TEXT",
+        "training_symbol_count INTEGER",
+        "test_symbol_count INTEGER",
+        "purged_samples INTEGER",
+        "training_positive_rate REAL",
+        "test_positive_rate REAL",
+        "baseline_accuracy REAL",
+        "baseline_brier_score REAL",
+        "accuracy_vs_baseline REAL",
+        "brier_improvement_vs_baseline REAL",
+    ):
+        _add_column(conn, "prediction_folds", definition)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prediction_runs_dataset_fingerprint "
+        "ON prediction_runs(dataset_fingerprint)"
+    )
+
+
+def _apply_v9(conn: sqlite3.Connection) -> None:
+    _ensure_prediction_provenance_columns(conn)
+    conn.execute("INSERT INTO schema_metadata(schema_version,applied_at,description) VALUES(?,?,?)",
+                 (9,_utc_now(),"Add predict-v3 evaluation provenance (dataset/symbol/feature/config hashes, "
+                  "git revision) and per-fold date ranges, symbol counts, purge counts, and baselines"))

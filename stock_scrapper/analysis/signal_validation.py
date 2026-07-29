@@ -9,8 +9,20 @@ isn't enough evidence either way.
 This module asks a narrower, higher-power question instead: across every day a symbol
 was ever classified, regardless of whether the portfolio had room to act on it, did that
 classification's forward performance actually differ from the rest? Every classified
-instance is a data point (thousands of them, versus a couple of backtest windows), so
-this is the more statistically powerful check of whether the label itself means anything.
+instance is a *row* (thousands of them, versus a couple of backtest windows) — but rows
+are not independent trials. ``two_proportion_z_test``'s p-values assume every row is an
+independent draw, which two things violate here: (1) each row's forward-return window is
+``horizon_days`` sessions long and overlaps its neighbors, so adjacent daily rows for the
+same symbol mostly restate the same underlying move, and (2) rows cluster by symbol — a
+handful of stocks classified for a long stretch can dominate a bucket's day-count even
+after the ``MIN_DISTINCT_SYMBOLS_FOR_TRUST`` concentration check passes. The p-values this
+module reports are therefore **naive/descriptive, not validated inferential statistics**;
+they are surfaced (clearly labeled) alongside a symbol-weighted mean and its confidence
+interval — treating each *symbol* as the independent unit — which is the more defensible
+read of whether a bucket's apparent difference reflects a broad pattern versus a
+concentration-driven mirage. A Bonferroni correction is applied across the five
+classification-bucket comparisons so the naive p-values at least aren't treated as if
+only one test were run.
 
 Deliberately hand-rolled (``math.erf`` for the normal CDF) rather than adding scipy —
 consistent with the rest of this project's no-scipy/no-scikit-learn design.
@@ -104,10 +116,15 @@ def _normal_cdf(x: float) -> float:
 
 
 def two_proportion_z_test(hits_a: int, n_a: int, hits_b: int, n_b: int) -> tuple[float | None, float | None]:
-    """Two-sided z-test comparing two independent hit-rates (e.g. one classification
-    bucket against every other classified instance combined). Returns ``(z, p_value)``,
-    or ``(None, None)`` when either sample is empty or the pooled rate is degenerate
-    (0 or 1, where the normal approximation isn't meaningful).
+    """Two-sided z-test comparing two hit-rates (e.g. one classification bucket against
+    every other classified instance combined). Returns ``(z, p_value)``, or ``(None,
+    None)`` when either sample is empty or the pooled rate is degenerate (0 or 1, where
+    the normal approximation isn't meaningful).
+
+    This assumes ``n_a``/``n_b`` independent Bernoulli trials — true of a coin flip, not
+    true of overlapping-window, symbol-clustered daily rows (see the module docstring).
+    The returned p-value is naive/descriptive here, not a validated inferential statistic;
+    callers should present it as such (see ``ClassificationBucket.p_value``).
     """
     if n_a == 0 or n_b == 0:
         return None, None
@@ -123,11 +140,40 @@ def two_proportion_z_test(hits_a: int, n_a: int, hits_b: int, n_b: int) -> tuple
     return z, p_value
 
 
+def _symbol_mean_confidence_interval(
+    per_symbol_means: Sequence[float], *, z: float = 1.96
+) -> tuple[float | None, float | None]:
+    """A normal-approximation 95% CI around the (equal-weighted-by-symbol) mean of
+    ``per_symbol_means``, treating each symbol as one independent observation.
+
+    Hand-rolled and deliberately simple, consistent with the rest of this module — this
+    is a normal approximation, not a t-interval, so it understates uncertainty further
+    when ``len(per_symbol_means)`` is very small (as low as 2-3 stocks in some buckets).
+    Returns ``(None, None)`` when there are fewer than 2 symbols (no variance estimate
+    is possible from a single observation).
+    """
+    n = len(per_symbol_means)
+    if n < 2:
+        return None, None
+    mean = sum(per_symbol_means) / n
+    variance = sum((value - mean) ** 2 for value in per_symbol_means) / (n - 1)
+    if variance <= 0:
+        return mean, mean
+    standard_error = math.sqrt(variance / n)
+    return mean - z * standard_error, mean + z * standard_error
+
+
 @dataclass(slots=True)
 class ClassificationBucket:
     """One classification's forward-performance summary, measured against every other
     classified instance combined (not against a flat 50%, and not against a pooled rate
-    that includes this bucket's own samples — both would understate real differences)."""
+    that includes this bucket's own samples — both would understate real differences).
+
+    ``p_value``/``bonferroni_p_value`` are naive/descriptive (see the module docstring)
+    — the symbol-weighted mean and its confidence interval are the more defensible
+    read of whether this bucket's apparent difference is a broad pattern or a
+    concentration-driven mirage.
+    """
 
     classification: str
     sample_size: int
@@ -136,8 +182,14 @@ class ClassificationBucket:
     median_excess_return: float | None = None
     z_score: float | None = None
     p_value: float | None = None
+    # Bonferroni-corrected across the five classification buckets actually tested
+    # (min(1.0, p_value * comparisons_tested)) — still naive/descriptive, just no
+    # longer implying only one comparison was run.
+    bonferroni_p_value: float | None = None
     distinct_symbols: int = 0
     symbol_mean_excess_return: float | None = None
+    symbol_mean_excess_return_ci_low: float | None = None
+    symbol_mean_excess_return_ci_high: float | None = None
     concentration_warning: bool = False
 
 
@@ -206,6 +258,11 @@ def validate_signals(
     total_hits = sum(1 for value in all_excess if value > 0)
     pooled_hit_rate = (total_hits / total_samples) if total_samples else None
 
+    # Bonferroni correction denominator: how many of the five buckets actually have a
+    # naive p-value computed at all (empty buckets never get one, so they shouldn't
+    # inflate the correction).
+    comparisons_tested = sum(1 for classification in CLASSIFICATION_ORDER if excess_by_classification[classification])
+
     buckets: list[ClassificationBucket] = []
     mean_by_classification: dict[str, float] = {}
     for classification in CLASSIFICATION_ORDER:
@@ -225,11 +282,13 @@ def validate_signals(
         )
         rest_hits, rest_n = total_hits - hits, total_samples - n
         z_score, p_value = two_proportion_z_test(hits, n, rest_hits, rest_n)
+        bonferroni_p_value = None if p_value is None else min(1.0, p_value * comparisons_tested)
         mean_by_classification[classification] = mean_excess
 
         per_symbol_means = [sum(values) / len(values) for values in excess_by_symbol[classification].values()]
         distinct_symbols = len(per_symbol_means)
         symbol_mean_excess = sum(per_symbol_means) / distinct_symbols if distinct_symbols else None
+        ci_low, ci_high = _symbol_mean_confidence_interval(per_symbol_means)
 
         buckets.append(
             ClassificationBucket(
@@ -240,8 +299,11 @@ def validate_signals(
                 median_excess_return=median_excess,
                 z_score=z_score,
                 p_value=p_value,
+                bonferroni_p_value=bonferroni_p_value,
                 distinct_symbols=distinct_symbols,
                 symbol_mean_excess_return=symbol_mean_excess,
+                symbol_mean_excess_return_ci_low=ci_low,
+                symbol_mean_excess_return_ci_high=ci_high,
                 concentration_warning=distinct_symbols < MIN_DISTINCT_SYMBOLS_FOR_TRUST,
             )
         )
@@ -299,29 +361,54 @@ def render_signal_validation_text(result: SignalValidationResult) -> str:
     lines.append("")
     lines.append(
         f"  {'classification':<16}{'n':>7}{'symbols':>9}{'hit-rate':>10}"
-        f"{'mean xs ret':>13}{'median xs ret':>15}{'p-value':>10}"
+        f"{'mean xs ret':>13}{'median xs ret':>15}{'naive p':>10}{'bonf. p':>10}"
     )
     any_concentration_warning = False
     for bucket in result.buckets:
         if bucket.sample_size == 0:
-            lines.append(f"  {bucket.classification:<16}{0:>7}{'--':>9}{'--':>10}{'--':>13}{'--':>15}{'--':>10}")
+            lines.append(
+                f"  {bucket.classification:<16}{0:>7}{'--':>9}{'--':>10}{'--':>13}{'--':>15}{'--':>10}{'--':>10}"
+            )
             continue
         p_text = f"{bucket.p_value:.4f}" if bucket.p_value is not None else "--"
+        bonferroni_text = f"{bucket.bonferroni_p_value:.4f}" if bucket.bonferroni_p_value is not None else "--"
         symbols_text = f"{bucket.distinct_symbols}{'*' if bucket.concentration_warning else ' '}"
         any_concentration_warning = any_concentration_warning or bucket.concentration_warning
         lines.append(
             f"  {bucket.classification:<16}{bucket.sample_size:>7}{symbols_text:>9}"
             f"{bucket.hit_rate:>10.1%}{bucket.mean_excess_return:>+13.2%}"
-            f"{bucket.median_excess_return:>+15.2%}{p_text:>10}"
+            f"{bucket.median_excess_return:>+15.2%}{p_text:>10}{bonferroni_text:>10}"
         )
+    lines.append(
+        "  naive/bonf. p-values assume independent daily trials — overlapping "
+        f"{result.horizon_days}-session lookaheads and symbol clustering violate that, so treat"
+    )
+    lines.append(
+        "  these as descriptive, not validated inferential statistics. 'bonf.' corrects the naive "
+        "p-value for testing all 5 buckets, not just one."
+    )
     if any_concentration_warning:
         lines.append(
-            f"  * fewer than {MIN_DISTINCT_SYMBOLS_FOR_TRUST} distinct symbols back this bucket — its hit-rate/p-value"
+            f"  * fewer than {MIN_DISTINCT_SYMBOLS_FOR_TRUST} distinct symbols back this bucket — its row-count"
         )
         lines.append(
             "    reflects one or two stocks' overlapping-window history repeated many times, not an"
         )
         lines.append("    independently-sampled population effect. Treat it as anecdote, not evidence.")
+    lines.append("")
+    lines.append("  symbol-weighted mean excess return (95% CI, one vote per stock regardless of day-count):")
+    for bucket in result.buckets:
+        if bucket.sample_size == 0 or bucket.symbol_mean_excess_return is None:
+            continue
+        mean_text = f"{bucket.symbol_mean_excess_return:+.2%}"
+        if bucket.symbol_mean_excess_return_ci_low is None:
+            ci_text = "CI unavailable (fewer than 2 distinct symbols)"
+        else:
+            ci_text = (
+                f"95% CI [{bucket.symbol_mean_excess_return_ci_low:+.2%}, "
+                f"{bucket.symbol_mean_excess_return_ci_high:+.2%}]"
+            )
+        lines.append(f"    {bucket.classification:<16} mean {mean_text:>8}  {ci_text}")
     lines.append("")
     if result.monotonic is None:
         lines.append("  monotonic (Strong Candidate > ... > High Risk by mean excess return): not enough non-empty buckets to check")
@@ -333,5 +420,10 @@ def render_signal_validation_text(result: SignalValidationResult) -> str:
         lines.append(
             "  monotonic (symbol-weighted, one vote per stock): "
             f"{'yes' if result.monotonic_symbol_weighted else 'NO'}"
+        )
+        lines.append(
+            "  a symbol-weighted inversion is not fully explained by day-count concentration alone — "
+            "it remains a descriptive finding in this dataset, not a statistically validated one given "
+            "the overlapping/clustered observations above."
         )
     return "\n".join(lines)

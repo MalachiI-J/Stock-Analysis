@@ -5,6 +5,7 @@ from pathlib import Path
 
 from stock_scrapper.database import create_connection, initialize_database
 from stock_scrapper.prediction.persistence import (
+    find_prediction_runs_by_fingerprint,
     list_prediction_runs,
     load_prediction_run,
     persist_prediction_run,
@@ -32,7 +33,15 @@ def _result(**overrides: object) -> PredictionRunResult:
         holdout_accuracy=0.491,
         holdout_brier_score=0.2659,
         walk_forward_folds=[
-            WalkForwardFold(fold=1, training_samples=50, test_samples=20, accuracy=0.46, brier_score=0.31),
+            WalkForwardFold(
+                fold=1, training_samples=50, test_samples=20, accuracy=0.46, brier_score=0.31,
+                training_start_date="2023-01-03", training_end_date="2024-06-01",
+                test_start_date="2024-06-02", test_end_date="2024-12-01",
+                training_symbol_count=8, test_symbol_count=6, purged_samples=3,
+                training_positive_rate=0.5, test_positive_rate=0.55,
+                baseline_accuracy=0.55, baseline_brier_score=0.2475,
+                accuracy_vs_baseline=-0.09, brier_improvement_vs_baseline=-0.0625,
+            ),
             WalkForwardFold(fold=2, training_samples=70, test_samples=20, accuracy=0.50, brier_score=0.25),
         ],
         coefficients=[("rsi_14", 0.21), ("beta", -0.05)],
@@ -40,6 +49,9 @@ def _result(**overrides: object) -> PredictionRunResult:
             SymbolPrediction("AAPL", 0.535, None),
             SymbolPrediction("MISSING", None, "One or more required indicators are unavailable"),
         ],
+        dataset_fingerprint="fingerprint-abc123",
+        symbol_universe_hash="universe-abc123",
+        feature_set_hash="features-abc123",
     )
     defaults.update(overrides)
     return PredictionRunResult(**defaults)
@@ -156,5 +168,88 @@ def test_persist_prediction_run_handles_insufficient_data_status(tmp_path: Path)
         assert loaded["status"] == "insufficient_data"
         assert loaded["error_summary"] == result.message
         assert loaded["folds"] == []
+    finally:
+        conn.close()
+
+
+def test_persist_prediction_run_saves_provenance_and_per_fold_detail(tmp_path: Path) -> None:
+    conn = _database(tmp_path)
+    try:
+        persist_prediction_run(
+            conn, "predict-provenance-001", _result(),
+            prediction_version="predict-v3", benchmark_symbol="SPY",
+            configuration_snapshot={"horizon_days": 21},
+            configuration_hash="config-hash-abc",
+            git_commit_hash="deadbeef",
+            git_dirty=True,
+        )
+        conn.commit()
+
+        loaded = load_prediction_run(conn, "predict-provenance-001")
+        assert loaded is not None
+        assert loaded["dataset_fingerprint"] == "fingerprint-abc123"
+        assert loaded["symbol_universe_hash"] == "universe-abc123"
+        assert loaded["feature_set_hash"] == "features-abc123"
+        assert loaded["configuration_hash"] == "config-hash-abc"
+        assert loaded["git_commit_hash"] == "deadbeef"
+        assert loaded["git_dirty"] == 1
+
+        first_fold = loaded["folds"][0]
+        assert first_fold["training_start_date"] == "2023-01-03"
+        assert first_fold["test_start_date"] == "2024-06-02"
+        assert first_fold["training_symbol_count"] == 8
+        assert first_fold["test_symbol_count"] == 6
+        assert first_fold["purged_samples"] == 3
+        assert first_fold["test_positive_rate"] == 0.55
+        assert first_fold["baseline_accuracy"] == 0.55
+        assert first_fold["baseline_brier_score"] == 0.2475
+        assert first_fold["accuracy_vs_baseline"] == -0.09
+        assert first_fold["brier_improvement_vs_baseline"] == -0.0625
+    finally:
+        conn.close()
+
+
+def test_persist_prediction_run_stores_null_git_dirty_when_unknown(tmp_path: Path) -> None:
+    conn = _database(tmp_path)
+    try:
+        persist_prediction_run(
+            conn, "predict-no-git", _result(),
+            prediction_version="predict-v3", benchmark_symbol="SPY",
+        )
+        conn.commit()
+
+        loaded = load_prediction_run(conn, "predict-no-git")
+        assert loaded is not None
+        assert loaded["git_dirty"] is None
+        assert loaded["git_commit_hash"] is None
+        assert loaded["configuration_hash"] is None
+    finally:
+        conn.close()
+
+
+def test_find_prediction_runs_by_fingerprint_identifies_reruns_over_identical_data(tmp_path: Path) -> None:
+    conn = _database(tmp_path)
+    try:
+        persist_prediction_run(
+            conn, "predict-rerun-1", _result(as_of_date="2026-06-30"),
+            prediction_version="predict-v3", benchmark_symbol="SPY", started_at="2026-06-30T00:00:00+00:00",
+        )
+        conn.commit()
+        persist_prediction_run(
+            conn, "predict-rerun-2", _result(as_of_date="2026-06-30"),
+            prediction_version="predict-v3", benchmark_symbol="SPY", started_at="2026-06-30T01:00:00+00:00",
+        )
+        conn.commit()
+        # A run over genuinely different data gets a different fingerprint and must not
+        # be returned as a rerun of the first two.
+        persist_prediction_run(
+            conn, "predict-different-data", _result(dataset_fingerprint="fingerprint-xyz789"),
+            prediction_version="predict-v3", benchmark_symbol="SPY",
+        )
+        conn.commit()
+
+        reruns = find_prediction_runs_by_fingerprint(conn, "fingerprint-abc123")
+        assert {run["run_id"] for run in reruns} == {"predict-rerun-1", "predict-rerun-2"}
+        assert [run["run_id"] for run in reruns] == ["predict-rerun-2", "predict-rerun-1"]  # most recent first
     finally:
         conn.close()
