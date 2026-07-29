@@ -17,6 +17,7 @@ import yaml
 
 from stock_scrapper.analysis.repository import results_from_saved_run
 from stock_scrapper.analysis.scoring_config import validate_scoring_config
+from stock_scrapper.analysis.risk_diagnostics import investigate_classification, render_risk_diagnostics_text
 from stock_scrapper.analysis.signal_validation import render_signal_validation_text, validate_signals
 from stock_scrapper.analysis.service import AnalysisBatch, AnalysisService
 from stock_scrapper.backtesting.config import BacktestConfig, load_backtesting_config
@@ -81,6 +82,7 @@ from stock_scrapper.trading.config import validate_trading_rules
 from stock_scrapper.trading.recommendations import build_recommendations, render_recommendations_text
 from stock_scrapper.trading.review import evaluate_recommendation_outcomes, render_review_text
 from stock_scrapper.reporting.report_builder import write_phase2_reports
+from stock_scrapper.reporting.risk_diagnostics_report import write_risk_diagnostics_html_report
 from stock_scrapper.reporting.persistence import persist_report, report_identity
 from stock_scrapper.reporting.digest import (
     build_digest,
@@ -304,6 +306,23 @@ def build_parser() -> argparse.ArgumentParser:
     validate_signals_parser.add_argument(
         "--horizon-days", type=int,
         help="Override config/prediction_rules.yaml's horizon_days, so this stays comparable to `predict`",
+    )
+
+    risk_diagnostics_parser = subparsers.add_parser(
+        "investigate-risk-inversion",
+        help="Which technical indicators drive High Risk's (and Strong Candidate's) forward excess return?",
+    )
+    risk_diagnostics_parser.add_argument("--strategy", choices=("score_v1",), default="score_v1")
+    risk_diagnostics_parser.add_argument("--symbols", nargs="+", help="Optional candidate universe")
+    risk_diagnostics_parser.add_argument("--start", help="Inclusive start date (YYYY-MM-DD)")
+    risk_diagnostics_parser.add_argument("--end", help="Inclusive end date (YYYY-MM-DD)")
+    risk_diagnostics_parser.add_argument(
+        "--horizon-days", type=int,
+        help="Override config/prediction_rules.yaml's horizon_days, so this stays comparable to validate-signals/predict",
+    )
+    risk_diagnostics_parser.add_argument(
+        "--classifications", nargs="+", default=["High Risk", "Strong Candidate"],
+        help="Which classification buckets to study (default: High Risk, Strong Candidate)",
     )
 
     subparsers.add_parser("validate", help="Run complete database validation")
@@ -1938,6 +1957,47 @@ def main(argv: Sequence[str] | None = None) -> int:
                 encoding="utf-8",
             )
             print(f"report: {report_path}")
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "investigate-risk-inversion":
+            typed = _backtest_config(base_dir, args)
+            # Fresh run for the same reason validate-signals reruns rather than reusing a
+            # persisted backtest: this study needs each Signal's in-memory `indicators`
+            # dict, which backtest_signals never persists, so a prior run's rows on disk
+            # can't be reused here regardless of provenance.
+            result = run_backtests(config, logger, symbols, base_dir=base_dir, backtest_config=typed)
+            rules = load_scoring_rules(base_dir)
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                histories, _ = _load_backtest_inputs(conn, config, rules, symbols, typed)
+            finally:
+                conn.close()
+            horizon_days = args.horizon_days or int(load_prediction_rules(base_dir).get("horizon_days", 21))
+            print(f"backtest run: {result.run.run_id}")
+            studies = {}
+            for classification in args.classifications:
+                study = investigate_classification(
+                    result.signals, histories,
+                    classification=classification, benchmark_symbol=typed.benchmark, horizon_days=horizon_days,
+                )
+                studies[classification] = study
+                print(render_risk_diagnostics_text(study))
+                print()
+            report_path = Path(config["reports_dir"]) / f"risk_inversion_study_{result.run.run_id}.json"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
+                json.dumps(
+                    {"backtest_run_id": result.run.run_id, "studies": {name: asdict(study) for name, study in studies.items()}},
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            print(f"report: {report_path}")
+            html_path = write_risk_diagnostics_html_report(
+                Path(config["reports_dir"]), result.run.run_id, studies,
+            )
+            print(f"html report: {html_path}")
             return int(ExitCode.SUCCESS)
 
         if args.command == "run":
