@@ -233,6 +233,60 @@ would require a model or ranking to beat its own fold/window-specific
 baseline consistently across multiple non-overlapping periods, not on a
 rerun of the same data. See Limitations.
 
+### Investigating the High Risk inversion
+
+`validate-signals` describes the "High Risk" inversion honestly but does not explain
+it: why does the classification bucket meant to flag the riskiest names post the
+*largest* forward excess return, on a symbol-diverse sample that rules out the old
+concentration-artifact explanation? `python main.py investigate-risk-inversion` follows
+up with a narrower, exploratory question — within one classification bucket, does the
+forward excess return concentrate in a specific range of an already-computed technical
+indicator (no new feature engineering; the same fields `predict-v3` and
+`risk_score.py`'s components already use)? Rows are split into 5 equal-sized quintiles
+per indicator, and each quintile's mean forward excess return is reported alongside a
+Pearson correlation across the whole bucket, plus a self-contained HTML report
+(`reports/risk_inversion_study_<run_id>.html`) with a diverging bar chart per indicator.
+
+Two candidate explanations motivated the indicator list: **mean reversion** (a
+concentration in the most-negative quintile of trailing-return/drawdown fields would
+suggest a bounce-back effect) versus **risk premium** (a pattern that scales with
+volatility/beta magnitude regardless of trailing-return sign would suggest compensated
+risk-taking instead). This is exploratory hypothesis generation, not a validated
+result — the same overlapping-window, symbol-clustered non-independence documented
+under "Evaluation honesty" applies here too, and a quintile split across several
+correlated indicators can look suggestive by chance. It changes nothing about
+score_v1's scoring, thresholds, or classification logic.
+
+The first real run against the full 20-year/25-symbol history
+(`backtest-20260729182530-b6a3a71d`) found the "High Risk" effect is not spread evenly
+across its 4,685 classified rows (20 symbols) — it concentrates in two places. The
+bottom quintile of trailing `six_month_return` (-90% to -47%) posts a mean forward
+excess return of +8.33%, far above every other quintile of that feature (which cluster
+near 0-4%) — a pattern consistent with a sharp bounce back from a severe decline rather
+than a straight-line relationship (the whole-bucket Pearson correlation is near zero,
+-0.038, precisely because the effect sits in one tail, not along a line).
+`one_year_max_drawdown` is the strongest and most linear relationship found (r=+0.150):
+rows with the deepest trailing one-year drawdown (top quintile) posted +8.41% mean
+forward excess return versus +1.65% for the shallowest-drawdown quintile, and
+`atr_percentage` shows a similar, weaker version of the same shape (r=+0.119). Plain
+volatility and beta magnitude (`twenty_day_volatility` r=+0.002, `beta` r=-0.057) show
+essentially no relationship. Read together, this leans toward a
+mean-reversion-after-severe-decline story more than a clean compensated-risk-premium
+one — but it remains exploratory and descriptive, not a validated result, and does not
+by itself suggest anything score_v1 or predict-v3 currently exploits.
+
+"Strong Candidate"'s much thinner overall edge (see above) is not spread evenly either:
+every studied feature's top quintile (highest trailing momentum/return, volatility, or
+drawdown magnitude) posts roughly +2.3% to +2.6% mean forward excess return versus
++0.2% to +0.7% in the bottom quintile, with modest positive correlations throughout
+(+0.08 to +0.15) — the bucket's aggregate edge concentrates among its
+higher-momentum, higher-volatility members, not across every "Strong Candidate" row
+equally. Full quintile tables and correlations for every studied indicator, both
+buckets, are in `reports/risk_inversion_study_backtest-20260729182530-b6a3a71d.json`
+and its paired HTML report. Neither pattern changes score_v1 or predict-v3's current
+behavior; both are recorded as a starting point for a future, more targeted hypothesis
+or feature, not as anything actionable today.
+
 ## Phase 4 real-portfolio tracking
 
 `portfolio-buy` and `portfolio-sell` record real owned lots and closing sales
@@ -520,6 +574,11 @@ python main.py predict --symbols AAPL MSFT --as-of-date 2026-06-30
 # the portfolio backtester's own sizing/timing? See "Evaluation honesty" above.
 python main.py validate-signals
 python main.py validate-signals --start 2022-07-20 --end 2026-06-30 --horizon-days 21
+
+# EXPLORATORY: which already-computed technical indicators drive a classification
+# bucket's forward excess return? See "Investigating the High Risk inversion" below.
+python main.py investigate-risk-inversion
+python main.py investigate-risk-inversion --classifications "High Risk" "Strong Candidate"
 ```
 
 `digest` reads the same saved classifications as `scores`/`explain` and groups
@@ -762,6 +821,7 @@ python -m pytest -q
 - **Screening universe:** `config/screening_universe.csv` is a hand-maintained illustrative list, not a live feed of any official index's constituents, and is not automatically kept current.
 - **Experimental prediction:** `predict` fits a small linear model on freely available technical indicators; its date-grouped, purged, sample-weighted walk-forward holdout accuracy/Brier score are reported next to their own fold-specific baselines precisely so a lack of real edge is visible rather than hidden — and, as of this project's current data, that is exactly what they show (see "Evaluation honesty" above). Past accuracy does not indicate future accuracy. It is not part of `score_v1`.
 - **Signal validation is descriptive, not inferential:** `validate-signals`' p-values are naive (they assume independent daily trials, which overlapping-horizon, symbol-clustered rows are not) and are labeled as such; the symbol-weighted mean and its confidence interval are the more defensible read, and buckets backed by fewer than four distinct symbols are flagged as concentration-prone rather than presented as population-level evidence.
+- **Risk-inversion diagnostics are exploratory:** `investigate-risk-inversion`'s quintile splits and Pearson correlations share `validate-signals`' overlapping-window, symbol-clustered non-independence, and testing several correlated indicators at once can look suggestive by chance. Treat its output as hypothesis generation, not a validated explanation, and it changes nothing about score_v1's scoring, thresholds, or classification logic.
 - **Advisory recommendations only:** `recommend` sizes suggestions but never places an order — there is no broker integration, and `auto_execute` in `config/trading_rules.yaml` is rejected if set to `true`. Sizing assumes a single account with no existing outside positions, ignores taxes/fees, and derives available cash from `starting_capital` plus recorded lots/sales rather than a real brokerage balance.
 
 ## Financial and historical-results disclaimer
