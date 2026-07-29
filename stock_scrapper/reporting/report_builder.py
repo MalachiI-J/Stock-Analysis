@@ -568,17 +568,40 @@ _REPORT_STYLES = """\
        story, not a hard cut. Independently, the trend line "draws" toward its own
        arrowhead every 1.6s (motion concentrated at the tip, never the whole shape
        moving), and the bars/grid keep a fast ambient pulse/drift underneath it all. */
+    /* No background of its own — .market-hero is a direct sibling of .page-fade/
+       .page-glow in the body (see markup), appearing after both in DOM order, so it
+       already paints above them at the same z-index:auto/0 stacking level without any
+       explicit z-index needed. With no opaque background of its own, the shared page
+       background (body's dot-grid, plus .page-fade/.page-glow's denser near-the-top
+       overlay) shows straight through it. The two radial-gradient layers below are a
+       supplemental glow, not a replacement backdrop: both reuse the exact --page-glow
+       token the page-wide glow uses (so both themes are handled automatically, no
+       light-mode override needed), anchored asymmetrically toward the upper-left to
+       echo the old gradient's 15% 10% focal point, and stacked at two spreads so their
+       overlap near that point reads brighter/larger than the page-wide glow alone. */
     .market-hero { position:relative; overflow:hidden; height:240px;
-      background:radial-gradient(120% 130% at 15% 10%, #0d1613 0%, #060907 55%, #020302 100%);
-      border-bottom:1px solid rgba(255,255,255,0.06); }
+      background:
+        radial-gradient(70% 90% at 15% 10%, var(--page-glow), transparent 65%),
+        radial-gradient(130% 150% at 15% 10%, var(--page-glow), transparent 75%); }
     .market-hero .grid { position:absolute; inset:0;
+      /* Same dot texture as the body (var(--page-grid-a/-b), 28px pitch, two layers
+         offset by half a cell) rather than its own cross-hatch pattern, so the hero
+         reads as the same visual language as the rest of the page — the drift
+         animation and bottom mask-fade below are what still make it feel "alive". */
       background-image:
-        repeating-linear-gradient(0deg, rgba(150,180,200,0.16) 0 1px, transparent 1px 40px),
-        repeating-linear-gradient(100deg, rgba(150,180,200,0.14) 0 1px, transparent 1px 70px);
+        radial-gradient(circle, var(--page-grid-a) 1px, transparent 1.5px),
+        radial-gradient(circle, var(--page-grid-b) 1px, transparent 1.5px);
+      background-size:28px 28px, 28px 28px;
+      background-position:0 0, 14px 14px;
       -webkit-mask-image:linear-gradient(to bottom, black, transparent 82%);
       mask-image:linear-gradient(to bottom, black, transparent 82%);
       animation:hero-grid-drift 26s linear infinite; }
-    @keyframes hero-grid-drift { 0% { background-position:0 0, 0 0; } 100% { background-position:0 160px, 140px 0; } }
+    /* Drift distances are multiples of the 28px tile (168=6x28, 140=5x28) so each
+       layer loops seamlessly; the second layer keeps its 14px offset constant while
+       drifting horizontally, the first drifts vertically — same two-layer parallax
+       idea as before, just retuned for the dot tile size instead of the old
+       40px/70px cross-hatch repeat sizes. */
+    @keyframes hero-grid-drift { 0% { background-position:0 0, 14px 14px; } 100% { background-position:0 168px, 154px 14px; } }
     .market-hero .bars-layer { position:absolute; inset:0; display:flex; align-items:flex-end;
       gap:12px; padding:0 26px 26px 26px; }
     .market-hero .bar { flex:0 0 20px; width:20px; border-radius:3px 3px 0 0; transform-origin:bottom;
@@ -619,15 +642,6 @@ _REPORT_STYLES = """\
        out (bars) or garish (ticker text) on a light surface — light mode
        trades glow for saturation/depth instead. Colors only; the cycle,
        timing, and layout above are untouched. */
-    [data-theme="light"] .market-hero {
-      background:radial-gradient(120% 130% at 15% 10%, #ffffff 0%, #f2f0ea 55%, #e8e4d8 100%);
-      border-bottom:1px solid rgba(0,0,0,0.08);
-    }
-    [data-theme="light"] .market-hero .grid {
-      background-image:
-        repeating-linear-gradient(0deg, rgba(60,75,95,0.12) 0 1px, transparent 1px 40px),
-        repeating-linear-gradient(90deg, rgba(60,75,95,0.10) 0 1px, transparent 1px 70px);
-    }
     [data-theme="light"] .market-hero .bars-layer.bull .bar {
       background:linear-gradient(to top, rgba(20,90,40,0) 0%, rgba(29,122,58,.82) 100%);
       box-shadow:none;
