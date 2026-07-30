@@ -349,7 +349,7 @@ _REPORT_STYLES = """\
          opaque card color and no longer doubles for both roles. */
       --inset-surface:var(--page);
       --track-bg:rgba(255,255,255,0.10); --chip-bg:rgba(255,255,255,0.06);
-      --nav-bg:rgba(16,19,15,0.92); --hover-bg:rgba(255,255,255,0.06);
+      --hover-bg:rgba(255,255,255,0.06);
       --card-shadow:0 12px 28px rgba(0,0,0,0.35);
       /* Deliberately DARKER/recessed than --surface (used for the active
          circle below) — that contrast is what reads as "raised," not flat. */
@@ -379,7 +379,7 @@ _REPORT_STYLES = """\
       --page-glow:rgba(20,22,18,0.05);
       --inset-surface:var(--page);
       --track-bg:rgba(0,0,0,0.08); --chip-bg:rgba(0,0,0,0.045);
-      --nav-bg:rgba(247,246,242,0.92); --hover-bg:rgba(0,0,0,0.045);
+      --hover-bg:rgba(0,0,0,0.045);
       --card-shadow:0 10px 24px rgba(0,0,0,0.10);
       --toggle-track:rgba(0,0,0,0.06); --toggle-shadow:0 1px 2px rgba(0,0,0,.18);
       --good-fg:#27500A; --good-bg:#EAF3DE; --good-border:rgba(39,80,10,0.30);
@@ -540,14 +540,32 @@ _REPORT_STYLES = """\
     /* Sticky jump nav — CSS-only "current section" cue via :target on the
        headings themselves (see h2:target above); a real scroll-spy needs JS,
        which this report intentionally limits to the decorative hero only. */
+    /* Same elevated-surface language as .card (opaque --surface + hairline border +
+       --card-shadow) rather than the old translucent/blurred nav-bg — the bar now
+       reads as a distinct floating panel above both the hero and the scrolling body,
+       instead of a faint tint that barely separated from either. */
     .term-nav { position:sticky; top:0; z-index:5; display:flex; flex-wrap:wrap; align-items:center;
       justify-content:space-between; gap:8px;
-      background:var(--nav-bg); backdrop-filter:blur(6px); border-bottom:1px solid var(--border);
+      background:var(--surface); border-bottom:1px solid var(--border); box-shadow:var(--card-shadow);
       padding:8px 24px; }
     .term-nav .term-nav-links { display:flex; flex-wrap:wrap; gap:2px 4px; }
     .term-nav a { color:var(--ink-2); text-decoration:none; font-family:var(--mono); font-size:12px;
-      text-transform:uppercase; letter-spacing:.06em; padding:5px 10px; border-radius:6px; }
-    .term-nav a:hover { color:var(--ink); background:var(--hover-bg); }
+      text-transform:uppercase; letter-spacing:.06em; padding:6px 12px; border-radius:6px;
+      background:var(--inset-surface); border:1px solid var(--border); }
+    .term-nav a:hover { color:var(--ink); background:var(--hover-bg); border-color:var(--ink-2); }
+    /* Same-page :target cue as h2:target above, reflected onto the matching nav chip.
+       :has() lets the nav (which sits before the headings in the DOM) react to a
+       descendant's :target state anywhere in the document — a plain sibling
+       combinator can't reach backward like this. Progressive enhancement only: where
+       :has() isn't supported, the chips just behave as plain nav links. */
+    body:has(#top:target) .term-nav a[href="#top"],
+    body:has(#candidates:target) .term-nav a[href="#candidates"],
+    body:has(#highest-risk:target) .term-nav a[href="#highest-risk"],
+    body:has(#changes:target) .term-nav a[href="#changes"],
+    body:has(#symbols:target) .term-nav a[href="#symbols"],
+    body:has(#run-details:target) .term-nav a[href="#run-details"] {
+      color:var(--good-fg); background:var(--good-bg); border-color:var(--good-border);
+    }
     /* Theme toggle: both icons always shown (never just one implying "click to
        switch") — the active mode sits on a raised circle, the inactive one is
        dimmed, so current state is unambiguous without reading anything. */
@@ -568,19 +586,44 @@ _REPORT_STYLES = """\
        story, not a hard cut. Independently, the trend line "draws" toward its own
        arrowhead every 1.6s (motion concentrated at the tip, never the whole shape
        moving), and the bars/grid keep a fast ambient pulse/drift underneath it all. */
-    .market-hero { position:relative; overflow:hidden; height:240px;
-      background:radial-gradient(120% 130% at 15% 10%, #0d1613 0%, #060907 55%, #020302 100%);
-      border-bottom:1px solid rgba(255,255,255,0.06); }
+    /* No background of its own — .market-hero is a direct sibling of .page-fade/
+       .page-glow in the body (see markup), appearing after both in DOM order, so it
+       already paints above them at the same z-index:auto/0 stacking level without any
+       explicit z-index needed. With no opaque background of its own, the shared page
+       background (body's dot-grid, plus .page-fade/.page-glow's denser near-the-top
+       overlay) shows straight through it. A dedicated hero glow (two stacked
+       var(--page-glow) radial-gradient layers) was tried here and reverted twice now —
+       the hero already generates its own visual activity (drifting grid, pulsing bars,
+       glowing trend line, ticker numbers), and stacking a third white-based wash on
+       top of .page-glow's own accent flattened it into a lit grey field instead of a
+       calm, dark backdrop those elements read clearly against. Keeping the hero fully
+       dark also gives the bold, opaque .term-nav bar sitting right below it (see
+       further down) more contrast to stand out against, which is the effect actually
+       wanted here. .page-glow is left to do the ambient-light job everywhere it's
+       actually needed — the calmer body sections below the hero — rather than
+       duplicating it in the one place that benefits from staying dark. */
+    .market-hero { position:relative; overflow:hidden; height:240px; }
     .market-hero .grid { position:absolute; inset:0;
+      /* Same dot texture as the body (var(--page-grid-a/-b), 28px pitch, two layers
+         offset by half a cell) rather than its own cross-hatch pattern, so the hero
+         reads as the same visual language as the rest of the page — the drift
+         animation and bottom mask-fade below are what still make it feel "alive". */
       background-image:
-        repeating-linear-gradient(0deg, rgba(150,180,200,0.16) 0 1px, transparent 1px 40px),
-        repeating-linear-gradient(100deg, rgba(150,180,200,0.14) 0 1px, transparent 1px 70px);
+        radial-gradient(circle, var(--page-grid-a) 1px, transparent 1.5px),
+        radial-gradient(circle, var(--page-grid-b) 1px, transparent 1.5px);
+      background-size:28px 28px, 28px 28px;
+      background-position:0 0, 14px 14px;
       -webkit-mask-image:linear-gradient(to bottom, black, transparent 82%);
       mask-image:linear-gradient(to bottom, black, transparent 82%);
       animation:hero-grid-drift 26s linear infinite; }
-    @keyframes hero-grid-drift { 0% { background-position:0 0, 0 0; } 100% { background-position:0 160px, 140px 0; } }
+    /* Drift distances are multiples of the 28px tile (168=6x28, 140=5x28) so each
+       layer loops seamlessly; the second layer keeps its 14px offset constant while
+       drifting horizontally, the first drifts vertically — same two-layer parallax
+       idea as before, just retuned for the dot tile size instead of the old
+       40px/70px cross-hatch repeat sizes. */
+    @keyframes hero-grid-drift { 0% { background-position:0 0, 14px 14px; } 100% { background-position:0 168px, 154px 14px; } }
     .market-hero .bars-layer { position:absolute; inset:0; display:flex; align-items:flex-end;
-      gap:12px; padding:0 26px 26px 26px; }
+      gap:12px; padding:0 26px 0 26px; }
     .market-hero .bar { flex:0 0 20px; width:20px; border-radius:3px 3px 0 0; transform-origin:bottom;
       animation-name:hero-bar-pulse; animation-duration:7.5s; animation-timing-function:ease-in-out;
       animation-iteration-count:infinite; }
@@ -619,15 +662,6 @@ _REPORT_STYLES = """\
        out (bars) or garish (ticker text) on a light surface — light mode
        trades glow for saturation/depth instead. Colors only; the cycle,
        timing, and layout above are untouched. */
-    [data-theme="light"] .market-hero {
-      background:radial-gradient(120% 130% at 15% 10%, #ffffff 0%, #f2f0ea 55%, #e8e4d8 100%);
-      border-bottom:1px solid rgba(0,0,0,0.08);
-    }
-    [data-theme="light"] .market-hero .grid {
-      background-image:
-        repeating-linear-gradient(0deg, rgba(60,75,95,0.12) 0 1px, transparent 1px 40px),
-        repeating-linear-gradient(90deg, rgba(60,75,95,0.10) 0 1px, transparent 1px 70px);
-    }
     [data-theme="light"] .market-hero .bars-layer.bull .bar {
       background:linear-gradient(to top, rgba(20,90,40,0) 0%, rgba(29,122,58,.82) 100%);
       box-shadow:none;
@@ -651,7 +685,7 @@ _REPORT_STYLES = """\
 """
 
 _MARKET_HERO_TEMPLATE = """\
-  <div class="market-hero" aria-hidden="true">
+  <div class="market-hero" id="top" aria-hidden="true">
     <div class="grid"></div>
     <div class="bars-layer bull">
       <div class="bar" style="height:34px; animation-delay:0.0s"></div><div class="bar" style="height:58px; animation-delay:.3s"></div>
@@ -1160,7 +1194,7 @@ def _render_phase2_html(
 {_market_hero_html()}
   <nav class="term-nav" aria-label="Report sections">
     <div class="term-nav-links">
-    <a href="#market-regime">Market regime</a><a href="#candidates">Candidates</a>
+    <a href="#top">Home</a><a href="#candidates">Candidates</a>
     <a href="#highest-risk">Highest risk</a><a href="#changes">Changes</a><a href="#symbols">Symbols</a>
     <a href="#run-details">Run details</a>
     </div>
