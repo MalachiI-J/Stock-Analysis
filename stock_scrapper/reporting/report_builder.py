@@ -558,7 +558,7 @@ _REPORT_STYLES = """\
        descendant's :target state anywhere in the document — a plain sibling
        combinator can't reach backward like this. Progressive enhancement only: where
        :has() isn't supported, the chips just behave as plain nav links. */
-    body:has(#market-regime:target) .term-nav a[href="#market-regime"],
+    body:has(#top:target) .term-nav a[href="#top"],
     body:has(#candidates:target) .term-nav a[href="#candidates"],
     body:has(#highest-risk:target) .term-nav a[href="#highest-risk"],
     body:has(#changes:target) .term-nav a[href="#changes"],
@@ -592,13 +592,16 @@ _REPORT_STYLES = """\
        explicit z-index needed. With no opaque background of its own, the shared page
        background (body's dot-grid, plus .page-fade/.page-glow's denser near-the-top
        overlay) shows straight through it. A dedicated hero glow (two stacked
-       var(--page-glow) radial-gradient layers) was tried here and reverted — the hero
-       already generates its own visual activity (drifting grid, pulsing bars, glowing
-       trend line, ticker numbers), and stacking a third white-based wash on top of
-       .page-glow's own accent flattened it into a lit grey field instead of a calm,
-       dark backdrop those elements read clearly against. .page-glow is left to do
-       that ambient-light job everywhere it's actually needed — the calmer body
-       sections below the hero — rather than duplicating it here. */
+       var(--page-glow) radial-gradient layers) was tried here and reverted twice now —
+       the hero already generates its own visual activity (drifting grid, pulsing bars,
+       glowing trend line, ticker numbers), and stacking a third white-based wash on
+       top of .page-glow's own accent flattened it into a lit grey field instead of a
+       calm, dark backdrop those elements read clearly against. Keeping the hero fully
+       dark also gives the bold, opaque .term-nav bar sitting right below it (see
+       further down) more contrast to stand out against, which is the effect actually
+       wanted here. .page-glow is left to do the ambient-light job everywhere it's
+       actually needed — the calmer body sections below the hero — rather than
+       duplicating it in the one place that benefits from staying dark. */
     .market-hero { position:relative; overflow:hidden; height:240px; }
     .market-hero .grid { position:absolute; inset:0;
       /* Same dot texture as the body (var(--page-grid-a/-b), 28px pitch, two layers
@@ -682,7 +685,7 @@ _REPORT_STYLES = """\
 """
 
 _MARKET_HERO_TEMPLATE = """\
-  <div class="market-hero" aria-hidden="true">
+  <div class="market-hero" id="top" aria-hidden="true">
     <div class="grid"></div>
     <div class="bars-layer bull">
       <div class="bar" style="height:34px; animation-delay:0.0s"></div><div class="bar" style="height:58px; animation-delay:.3s"></div>
@@ -1191,7 +1194,7 @@ def _render_phase2_html(
 {_market_hero_html()}
   <nav class="term-nav" aria-label="Report sections">
     <div class="term-nav-links">
-    <a href="#market-regime">Market regime</a><a href="#candidates">Candidates</a>
+    <a href="#top">Home</a><a href="#candidates">Candidates</a>
     <a href="#highest-risk">Highest risk</a><a href="#changes">Changes</a><a href="#symbols">Symbols</a>
     <a href="#run-details">Run details</a>
     </div>
