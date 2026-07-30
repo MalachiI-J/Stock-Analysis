@@ -261,7 +261,11 @@ answer for both signals:
   anomaly, not evidence of a usable signal — it could reflect a real risk
   premium (riskier names carry higher expected return) or a miscalibration
   in how risk is scored; distinguishing those would require dedicated
-  investigation, not a reinterpretation of this data.
+  investigation, not a reinterpretation of this data. The daily Phase 2
+  report now surfaces this same Strong Candidate / High Risk figure (dated
+  to the latest `validate-signals` artifact on disk) directly above the
+  matching ranking table, with the same "descriptive anomaly, not a live
+  prediction" framing — see "Persistence and reports" above.
 - **`predict-v3`** (54,627 samples, 2008–2026, 5 purged walk-forward folds):
   holdout accuracy 50.6% against a sample-weighted baseline of 51.6%, and
   Brier score 0.2504 against a baseline of 0.2497 — below baseline on both
@@ -880,7 +884,7 @@ Walk-forward validation uses fixed warm-up and development periods as preceding 
 
 SQLite is the system of record. Safe migrations preserve existing prices and add analysis, regime, backtest, trade, fill, equity, metric, walk-forward, and experimental-prediction (`prediction_runs`/`prediction_folds`, with per-fold date ranges, symbol counts, purge counts, baselines, and evaluation provenance) tables with run identifiers, foreign keys, indexes, uniqueness rules, and transactional writes.
 
-Phase 2 reports contain run metadata, as-of/data-through dates, score version/hash, regime evidence, candidate/risk rankings, components, factors, limitations, quality issues, prior-run changes, methodology, and inline adjusted-price/SMA20/SMA50/SMA200 charts.
+Phase 2 reports contain run metadata, as-of/data-through dates, score version/hash, regime evidence, candidate/risk rankings, components, factors, limitations, quality issues, prior-run changes, methodology, and inline adjusted-price/SMA20/SMA50/SMA200 charts. If a `validate-signals` artifact exists in the reports directory, the report also surfaces the latest Strong Candidate / High Risk bucket's symbol-weighted historical excess return (with its confidence interval and a concentration-warning caveat when applicable) directly above the matching ranking table — dated to that artifact's run, not recomputed per report, and explicitly labeled as a descriptive historical pattern rather than a live prediction for the symbols currently ranked (see "Evaluation honesty" below).
 
 Backtest reports contain assumptions, date/warm-up ranges, universe/exclusions, execution and cost rules, metrics and SPY comparison, inline equity/drawdown charts, period returns, complete trades/rejections, symbol/regime performance, and bias warnings. Separate CSVs cover summary, trades, all signals, rejected candidates, orders/fills, equity, monthly returns, and annual returns. Reports are self-contained and use no CDN.
 

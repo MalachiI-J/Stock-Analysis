@@ -215,8 +215,12 @@ def write_phase2_reports(
     csv_path = output_path / f"stock_summary_{report_date_text}{suffix}.csv"
     html_path = output_path / f"stock_summary_{report_date_text}{suffix}.html"
     _write_phase2_csv(csv_path, csv_rows)
+    signal_validation = _latest_signal_validation_summary(output_path)
     html_path.write_text(
-        _render_phase2_html(report_date_text, metadata, entries, candidate_order, risk_order, normalized_issues),
+        _render_phase2_html(
+            report_date_text, metadata, entries, candidate_order, risk_order, normalized_issues,
+            signal_validation=signal_validation,
+        ),
         encoding="utf-8",
     )
     return {"csv": csv_path, "html": html_path}
@@ -462,6 +466,8 @@ _REPORT_STYLES = """\
     .card > table { margin:0; }
     .notice { padding:14px 16px; border:1px solid var(--border); border-left:3px solid var(--muted);
       background:var(--surface); color:var(--ink-2); border-radius:8px; margin:18px 0; }
+    .notice-good { border-left-color:var(--good-border); }
+    .notice-critical { border-left-color:var(--critical-border); }
     .regime-head { display:flex; align-items:center; gap:12px; }
     .regime-confidence { color:var(--ink-2); font-size:13px; font-family:var(--mono); }
     .card ul { list-style:none; margin:6px 0 0; padding:0; }
@@ -1144,6 +1150,86 @@ _THEME_SCRIPT = """\
 """
 
 
+def _latest_signal_validation_summary(reports_dir: Path) -> dict[str, Any] | None:
+    """Best-effort load of the most recent ``signal_validation_*.json`` artifact
+    (written by ``main.py validate-signals``) from the same reports directory.
+
+    ``validate-signals`` requires a fresh full-history backtest and is a manual,
+    occasional diagnostic (see README's "Evaluation honesty" section) — it is not
+    re-run as part of every daily report. This surfaces its latest known result as
+    a dated annotation rather than recomputing it, so the daily pipeline stays
+    fast. Returns ``None`` (silently — this is supplementary context, not core
+    report content) if no such artifact exists yet or it can't be parsed.
+    """
+    try:
+        candidates = sorted(
+            Path(reports_dir).glob("signal_validation_*.json"),
+            key=lambda path: path.stat().st_mtime,
+        )
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    try:
+        return json.loads(candidates[-1].read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _signal_validation_notice_html(summary: Mapping[str, Any] | None, classification: str) -> str:
+    """A dated callout summarizing one classification bucket's historical forward
+    excess return from the latest ``validate-signals`` run, if one is on file.
+
+    Framed deliberately as a descriptive, dataset-wide historical pattern — not a
+    live prediction for the specific symbols in today's ranking, and not a
+    recommendation. Mirrors the caveats ``render_signal_validation_text`` already
+    prints at the CLI (naive/descriptive p-values, concentration warnings).
+    """
+    if not isinstance(summary, Mapping):
+        return ""
+    bucket = next(
+        (
+            item
+            for item in summary.get("buckets") or []
+            if isinstance(item, Mapping) and item.get("classification") == classification
+        ),
+        None,
+    )
+    if not bucket or not bucket.get("sample_size"):
+        return ""
+    symbol_mean = bucket.get("symbol_mean_excess_return")
+    if symbol_mean is None:
+        return ""
+    ci_low = bucket.get("symbol_mean_excess_return_ci_low")
+    ci_high = bucket.get("symbol_mean_excess_return_ci_high")
+    ci_text = (
+        f"95% CI [{ci_low:+.2%}, {ci_high:+.2%}]"
+        if ci_low is not None and ci_high is not None
+        else "95% CI unavailable (fewer than 2 distinct symbols)"
+    )
+    horizon = summary.get("horizon_days")
+    benchmark = summary.get("benchmark_symbol")
+    run_id = summary.get("backtest_run_id")
+    status = "notice-critical" if _CLASSIFICATION_STATUS.get(classification) == "critical" else "notice-good"
+    concentration_note = ""
+    if bucket.get("concentration_warning"):
+        concentration_note = (
+            f" Fewer than {bucket.get('distinct_symbols')} distinct symbols back this figure — "
+            "treat it as anecdote, not a broad pattern."
+        )
+    return (
+        f'<div class="notice {status}">'
+        f"<strong>Historical signal validation ({_escape(classification)}):</strong> across "
+        f"{bucket.get('sample_size')} classified instance(s) ({bucket.get('distinct_symbols')} distinct symbol(s)) "
+        f"in the full backtested history, mean symbol-weighted forward {_escape(str(horizon))}-session excess "
+        f"return vs {_escape(str(benchmark))} was {symbol_mean:+.2%} ({ci_text})."
+        f"{concentration_note} This is a descriptive historical pattern across the whole dataset, from "
+        f"<span class=\"mono\">{_escape(str(run_id))}</span> — not a live prediction for the symbols ranked "
+        "below, and not a recommendation. See README's \"Evaluation honesty\" section."
+        "</div>"
+    )
+
+
 def _render_phase2_html(
     report_date: str,
     metadata: dict[str, Any],
@@ -1151,6 +1237,7 @@ def _render_phase2_html(
     candidate_order: list[dict[str, Any]],
     risk_order: list[dict[str, Any]],
     quality_issues: list[dict[str, Any]],
+    signal_validation: Mapping[str, Any] | None = None,
 ) -> str:
     candidate_rank = {str(item.get("symbol", "")).upper(): rank for rank, item in enumerate(candidate_order, 1)}
     risk_rank = {str(item.get("symbol", "")).upper(): rank for rank, item in enumerate(risk_order, 1)}
@@ -1172,6 +1259,8 @@ def _render_phase2_html(
 
     candidate_html = _ranking_table(candidate_order, candidate_rank, empty_message="No Candidate or Strong Candidate results.")
     risk_html = _ranking_table(risk_order, risk_rank, empty_message="No measured risk scores were available.")
+    candidate_validation_html = _signal_validation_notice_html(signal_validation, "Strong Candidate")
+    risk_validation_html = _signal_validation_notice_html(signal_validation, "High Risk")
     detail_html = "".join(_result_section(entry) for entry in entries)
     changes_html = _changes_table(entries)
     quality_html = _quality_table(quality_issues)
@@ -1210,8 +1299,10 @@ def _render_phase2_html(
   <h2 id="market-regime">Market Regime</h2>
   <div class="card regime"><div class="regime-head">{regime_badge}<span class="regime-confidence">confidence {_score(metadata.get('market_regime_confidence'))}</span></div><h4>Market-regime reasons</h4>{regime_reasons}</div>
   <h2 id="candidates">Candidate Ranking</h2>
+  {candidate_validation_html}
   <div class="card">{candidate_html}</div>
   <h2 id="highest-risk">Highest-Risk Ranking</h2>
+  {risk_validation_html}
   <div class="card">{risk_html}</div>
   <h2 id="changes">Changes From Previous Stored Analysis</h2>
   <div class="card">{changes_html}</div>

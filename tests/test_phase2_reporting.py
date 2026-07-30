@@ -232,6 +232,93 @@ def test_phase2_report_contains_complete_offline_research_content(tmp_path: Path
     assert "9999" not in content
 
 
+def _signal_validation_payload(**bucket_overrides: dict[str, object]) -> dict[str, object]:
+    strong_candidate = {
+        "classification": "Strong Candidate",
+        "sample_size": 4200,
+        "distinct_symbols": 20,
+        "hit_rate": 0.55,
+        "mean_excess_return": 0.0099,
+        "symbol_mean_excess_return": 0.0099,
+        "symbol_mean_excess_return_ci_low": 0.0001,
+        "symbol_mean_excess_return_ci_high": 0.0142,
+        "concentration_warning": False,
+    }
+    strong_candidate.update(bucket_overrides.get("Strong Candidate", {}))
+    high_risk = {
+        "classification": "High Risk",
+        "sample_size": 3100,
+        "distinct_symbols": 20,
+        "hit_rate": 0.61,
+        "mean_excess_return": 0.0324,
+        "symbol_mean_excess_return": 0.0324,
+        "symbol_mean_excess_return_ci_low": 0.0182,
+        "symbol_mean_excess_return_ci_high": 0.0448,
+        "concentration_warning": False,
+    }
+    high_risk.update(bucket_overrides.get("High Risk", {}))
+    return {
+        "backtest_run_id": "backtest-test-signalvalidation-001",
+        "horizon_days": 21,
+        "benchmark_symbol": "SPY",
+        "buckets": [strong_candidate, high_risk],
+    }
+
+
+def test_phase2_report_omits_signal_validation_notice_when_no_artifact_present(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "Historical signal validation" not in content
+
+
+def test_phase2_report_surfaces_latest_signal_validation_summary(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    (tmp_path / "signal_validation_backtest-test-signalvalidation-001.json").write_text(
+        json.dumps(_signal_validation_payload()), encoding="utf-8",
+    )
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "Historical signal validation (Strong Candidate)" in content
+    assert "Historical signal validation (High Risk)" in content
+    assert "+0.99%" in content
+    assert "+3.24%" in content
+    assert "95% CI [+0.01%, +1.42%]" in content
+    assert "95% CI [+1.82%, +4.48%]" in content
+    assert "backtest-test-signalvalidation-001" in content
+    assert "not a live prediction for the symbols ranked below, and not a recommendation" in content
+    # Placed near each ranking section, not just anywhere in the document.
+    assert content.index("Candidate Ranking") < content.index("Historical signal validation (Strong Candidate)") < content.index("Highest-Risk Ranking")
+    assert content.index("Highest-Risk Ranking") < content.index("Historical signal validation (High Risk)")
+
+
+def test_phase2_report_signal_validation_notice_flags_concentration_warning(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    payload = _signal_validation_payload(**{"High Risk": {"concentration_warning": True, "distinct_symbols": 2}})
+    (tmp_path / "signal_validation_backtest-test-signalvalidation-002.json").write_text(
+        json.dumps(payload), encoding="utf-8",
+    )
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "treat it as anecdote, not a broad pattern" in content
+
+
+def test_phase2_report_ignores_unparseable_signal_validation_artifact(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    (tmp_path / "signal_validation_broken.json").write_text("not json", encoding="utf-8")
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "Historical signal validation" not in content
+
+
 def test_phase2_report_is_deterministic_when_generation_metadata_is_fixed(tmp_path: Path) -> None:
     metadata, results, histories, issues, previous = _report_inputs()
 
