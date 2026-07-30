@@ -573,16 +573,15 @@ _REPORT_STYLES = """\
        already paints above them at the same z-index:auto/0 stacking level without any
        explicit z-index needed. With no opaque background of its own, the shared page
        background (body's dot-grid, plus .page-fade/.page-glow's denser near-the-top
-       overlay) shows straight through it. The two radial-gradient layers below are a
-       supplemental glow, not a replacement backdrop: both reuse the exact --page-glow
-       token the page-wide glow uses (so both themes are handled automatically, no
-       light-mode override needed), anchored asymmetrically toward the upper-left to
-       echo the old gradient's 15% 10% focal point, and stacked at two spreads so their
-       overlap near that point reads brighter/larger than the page-wide glow alone. */
-    .market-hero { position:relative; overflow:hidden; height:240px;
-      background:
-        radial-gradient(70% 90% at 15% 10%, var(--page-glow), transparent 65%),
-        radial-gradient(130% 150% at 15% 10%, var(--page-glow), transparent 75%); }
+       overlay) shows straight through it. A dedicated hero glow (two stacked
+       var(--page-glow) radial-gradient layers) was tried here and reverted — the hero
+       already generates its own visual activity (drifting grid, pulsing bars, glowing
+       trend line, ticker numbers), and stacking a third white-based wash on top of
+       .page-glow's own accent flattened it into a lit grey field instead of a calm,
+       dark backdrop those elements read clearly against. .page-glow is left to do
+       that ambient-light job everywhere it's actually needed — the calmer body
+       sections below the hero — rather than duplicating it here. */
+    .market-hero { position:relative; overflow:hidden; height:240px; }
     .market-hero .grid { position:absolute; inset:0;
       /* Same dot texture as the body (var(--page-grid-a/-b), 28px pitch, two layers
          offset by half a cell) rather than its own cross-hatch pattern, so the hero
@@ -603,7 +602,7 @@ _REPORT_STYLES = """\
        40px/70px cross-hatch repeat sizes. */
     @keyframes hero-grid-drift { 0% { background-position:0 0, 14px 14px; } 100% { background-position:0 168px, 154px 14px; } }
     .market-hero .bars-layer { position:absolute; inset:0; display:flex; align-items:flex-end;
-      gap:12px; padding:0 26px 26px 26px; }
+      gap:12px; padding:0 26px 0 26px; }
     .market-hero .bar { flex:0 0 20px; width:20px; border-radius:3px 3px 0 0; transform-origin:bottom;
       animation-name:hero-bar-pulse; animation-duration:7.5s; animation-timing-function:ease-in-out;
       animation-iteration-count:infinite; }
