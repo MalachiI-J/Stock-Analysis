@@ -349,7 +349,7 @@ _REPORT_STYLES = """\
          opaque card color and no longer doubles for both roles. */
       --inset-surface:var(--page);
       --track-bg:rgba(255,255,255,0.10); --chip-bg:rgba(255,255,255,0.06);
-      --nav-bg:rgba(16,19,15,0.92); --hover-bg:rgba(255,255,255,0.06);
+      --hover-bg:rgba(255,255,255,0.06);
       --card-shadow:0 12px 28px rgba(0,0,0,0.35);
       /* Deliberately DARKER/recessed than --surface (used for the active
          circle below) — that contrast is what reads as "raised," not flat. */
@@ -379,7 +379,7 @@ _REPORT_STYLES = """\
       --page-glow:rgba(20,22,18,0.05);
       --inset-surface:var(--page);
       --track-bg:rgba(0,0,0,0.08); --chip-bg:rgba(0,0,0,0.045);
-      --nav-bg:rgba(247,246,242,0.92); --hover-bg:rgba(0,0,0,0.045);
+      --hover-bg:rgba(0,0,0,0.045);
       --card-shadow:0 10px 24px rgba(0,0,0,0.10);
       --toggle-track:rgba(0,0,0,0.06); --toggle-shadow:0 1px 2px rgba(0,0,0,.18);
       --good-fg:#27500A; --good-bg:#EAF3DE; --good-border:rgba(39,80,10,0.30);
@@ -540,14 +540,32 @@ _REPORT_STYLES = """\
     /* Sticky jump nav — CSS-only "current section" cue via :target on the
        headings themselves (see h2:target above); a real scroll-spy needs JS,
        which this report intentionally limits to the decorative hero only. */
+    /* Same elevated-surface language as .card (opaque --surface + hairline border +
+       --card-shadow) rather than the old translucent/blurred nav-bg — the bar now
+       reads as a distinct floating panel above both the hero and the scrolling body,
+       instead of a faint tint that barely separated from either. */
     .term-nav { position:sticky; top:0; z-index:5; display:flex; flex-wrap:wrap; align-items:center;
       justify-content:space-between; gap:8px;
-      background:var(--nav-bg); backdrop-filter:blur(6px); border-bottom:1px solid var(--border);
+      background:var(--surface); border-bottom:1px solid var(--border); box-shadow:var(--card-shadow);
       padding:8px 24px; }
     .term-nav .term-nav-links { display:flex; flex-wrap:wrap; gap:2px 4px; }
     .term-nav a { color:var(--ink-2); text-decoration:none; font-family:var(--mono); font-size:12px;
-      text-transform:uppercase; letter-spacing:.06em; padding:5px 10px; border-radius:6px; }
-    .term-nav a:hover { color:var(--ink); background:var(--hover-bg); }
+      text-transform:uppercase; letter-spacing:.06em; padding:6px 12px; border-radius:6px;
+      background:var(--inset-surface); border:1px solid var(--border); }
+    .term-nav a:hover { color:var(--ink); background:var(--hover-bg); border-color:var(--ink-2); }
+    /* Same-page :target cue as h2:target above, reflected onto the matching nav chip.
+       :has() lets the nav (which sits before the headings in the DOM) react to a
+       descendant's :target state anywhere in the document — a plain sibling
+       combinator can't reach backward like this. Progressive enhancement only: where
+       :has() isn't supported, the chips just behave as plain nav links. */
+    body:has(#market-regime:target) .term-nav a[href="#market-regime"],
+    body:has(#candidates:target) .term-nav a[href="#candidates"],
+    body:has(#highest-risk:target) .term-nav a[href="#highest-risk"],
+    body:has(#changes:target) .term-nav a[href="#changes"],
+    body:has(#symbols:target) .term-nav a[href="#symbols"],
+    body:has(#run-details:target) .term-nav a[href="#run-details"] {
+      color:var(--good-fg); background:var(--good-bg); border-color:var(--good-border);
+    }
     /* Theme toggle: both icons always shown (never just one implying "click to
        switch") — the active mode sits on a raised circle, the inactive one is
        dimmed, so current state is unambiguous without reading anything. */
