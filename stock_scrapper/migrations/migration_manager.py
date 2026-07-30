@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-LATEST_SCHEMA_VERSION = 9
+LATEST_SCHEMA_VERSION = 10
 
 
 def _utc_now() -> str:
@@ -118,6 +118,10 @@ def apply_migrations(db_path: str | Path) -> None:
             _apply_v9(conn)
         else:
             _ensure_prediction_provenance_columns(conn)
+        if current_version < 10:
+            _apply_v10(conn)
+        else:
+            _ensure_gbm_prediction_tables(conn)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1075,3 +1079,52 @@ def _apply_v9(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO schema_metadata(schema_version,applied_at,description) VALUES(?,?,?)",
                  (9,_utc_now(),"Add predict-v3 evaluation provenance (dataset/symbol/feature/config hashes, "
                   "git revision) and per-fold date ranges, symbol counts, purge counts, and baselines"))
+
+
+def _ensure_gbm_prediction_tables(conn: sqlite3.Connection) -> None:
+    """Add tables tracking predict-v4 (gradient-boosted regression on continuous
+    excess return — stock_scrapper/prediction/gbm.py/gbm_service.py) runs over time.
+    A separate pair of tables from prediction_runs/prediction_folds rather than
+    overloading those with nullable classification-vs-regression columns and a model
+    discriminator: predict-v3 and predict-v4 have genuinely different targets
+    (binary label vs. continuous excess return) and metrics (accuracy/Brier vs.
+    MSE/mean-absolute-error/information-coefficient), so each gets its own
+    purpose-built schema, mirroring the same run+child-table shape and provenance
+    fields as prediction_runs/prediction_folds for consistency."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS gbm_prediction_runs (
+      run_id TEXT PRIMARY KEY, prediction_version TEXT NOT NULL, as_of_date TEXT NOT NULL,
+      horizon_days INTEGER NOT NULL, benchmark_symbol TEXT, status TEXT NOT NULL, message TEXT,
+      training_samples INTEGER NOT NULL DEFAULT 0, holdout_samples INTEGER NOT NULL DEFAULT 0,
+      training_start_date TEXT, training_end_date TEXT,
+      holdout_mse REAL, holdout_mean_absolute_error REAL, holdout_information_coefficient REAL,
+      baseline_mse REAL, feature_importances_json TEXT,
+      predictions_json TEXT, configuration_snapshot_json TEXT, started_at TEXT NOT NULL,
+      completed_at TEXT, error_summary TEXT,
+      dataset_fingerprint TEXT, symbol_universe_hash TEXT, feature_set_hash TEXT,
+      configuration_hash TEXT, git_commit_hash TEXT, git_dirty INTEGER)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS gbm_prediction_folds (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, fold_number INTEGER NOT NULL,
+      training_samples INTEGER NOT NULL, test_samples INTEGER NOT NULL,
+      mse REAL, mean_absolute_error REAL, information_coefficient REAL,
+      training_start_date TEXT, training_end_date TEXT, test_start_date TEXT, test_end_date TEXT,
+      training_symbol_count INTEGER, test_symbol_count INTEGER, purged_samples INTEGER,
+      baseline_mse REAL, mse_improvement_vs_baseline REAL,
+      UNIQUE(run_id, fold_number), FOREIGN KEY(run_id) REFERENCES gbm_prediction_runs(run_id) ON DELETE CASCADE)""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gbm_prediction_runs_version_as_of "
+        "ON gbm_prediction_runs(prediction_version, as_of_date)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gbm_prediction_folds_run ON gbm_prediction_folds(run_id, fold_number)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gbm_prediction_runs_dataset_fingerprint "
+        "ON gbm_prediction_runs(dataset_fingerprint)"
+    )
+
+
+def _apply_v10(conn: sqlite3.Connection) -> None:
+    _ensure_gbm_prediction_tables(conn)
+    conn.execute("INSERT INTO schema_metadata(schema_version,applied_at,description) VALUES(?,?,?)",
+                 (10,_utc_now(),"Add gbm_prediction_runs/gbm_prediction_folds to track predict-v4 "
+                  "(gradient-boosted regression) accuracy over time"))

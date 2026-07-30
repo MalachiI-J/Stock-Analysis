@@ -105,7 +105,7 @@ def select_sample_dates(
     return [date.fromisoformat(value) for value in usable[::stride_sessions]]
 
 
-def build_training_dataset(
+def _assemble_dataset(
     service: AnalysisService,
     symbols: Sequence[str],
     histories: Mapping[str, list[dict[str, Any]]],
@@ -114,8 +114,13 @@ def build_training_dataset(
     horizon_days: int,
     feature_keys: Sequence[str],
     benchmark_symbol: str,
+    target_fn: Any,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, str]]]:
-    """Assemble (features, beat-the-benchmark label) rows for every eligible symbol/date."""
+    """Shared row-assembly for both the binary (``build_training_dataset``) and
+    continuous (``build_regression_dataset``) targets — identical eligibility,
+    feature, and leakage-safety logic; only how the label/target number itself is
+    computed from ``(symbol_return, benchmark_return)`` differs, via ``target_fn``.
+    """
     service.prime_historical_features(histories, sample_dates, list(symbols))
     date_index: dict[str, dict[str, int]] = {
         symbol.upper(): {
@@ -129,7 +134,7 @@ def build_training_dataset(
     benchmark_date_index = date_index.get(benchmark_symbol.upper(), {})
 
     feature_rows: list[list[float]] = []
-    labels: list[float] = []
+    targets: list[float] = []
     meta: list[dict[str, str]] = []
     for sample_date in sample_dates:
         batch = service.analyze_loaded_many_as_of(list(symbols), histories, sample_date, persist=False)
@@ -163,7 +168,7 @@ def build_training_dataset(
             symbol_return = (future_close - entry_close) / entry_close
             benchmark_return = (benchmark_future_close - benchmark_entry_close) / benchmark_entry_close
             feature_rows.append(values)  # type: ignore[arg-type]
-            labels.append(1.0 if symbol_return > benchmark_return else 0.0)
+            targets.append(target_fn(symbol_return, benchmark_return))
             meta.append(
                 {
                     "symbol": result.symbol,
@@ -177,4 +182,45 @@ def build_training_dataset(
             )
 
     features = np.array(feature_rows, dtype=float) if feature_rows else np.empty((0, len(feature_keys)))
-    return features, np.array(labels, dtype=float), meta
+    return features, np.array(targets, dtype=float), meta
+
+
+def build_training_dataset(
+    service: AnalysisService,
+    symbols: Sequence[str],
+    histories: Mapping[str, list[dict[str, Any]]],
+    sample_dates: Sequence[date],
+    *,
+    horizon_days: int,
+    feature_keys: Sequence[str],
+    benchmark_symbol: str,
+) -> tuple[np.ndarray, np.ndarray, list[dict[str, str]]]:
+    """Assemble (features, beat-the-benchmark label) rows for every eligible symbol/date."""
+    return _assemble_dataset(
+        service, symbols, histories, sample_dates,
+        horizon_days=horizon_days, feature_keys=feature_keys, benchmark_symbol=benchmark_symbol,
+        target_fn=lambda symbol_return, benchmark_return: 1.0 if symbol_return > benchmark_return else 0.0,
+    )
+
+
+def build_regression_dataset(
+    service: AnalysisService,
+    symbols: Sequence[str],
+    histories: Mapping[str, list[dict[str, Any]]],
+    sample_dates: Sequence[date],
+    *,
+    horizon_days: int,
+    feature_keys: Sequence[str],
+    benchmark_symbol: str,
+) -> tuple[np.ndarray, np.ndarray, list[dict[str, str]]]:
+    """Assemble (features, continuous excess-return) rows for every eligible
+    symbol/date — predict-v4's target, versus predict-v3's binarized version of the
+    same underlying quantity. Keeping the magnitude (rather than just its sign)
+    preserves information predict-v3 throws away, which matters for the
+    non-monotonic, magnitude-driven patterns ``investigate-risk-inversion`` found
+    (see ``stock_scrapper/analysis/risk_diagnostics.py``)."""
+    return _assemble_dataset(
+        service, symbols, histories, sample_dates,
+        horizon_days=horizon_days, feature_keys=feature_keys, benchmark_symbol=benchmark_symbol,
+        target_fn=lambda symbol_return, benchmark_return: symbol_return - benchmark_return,
+    )

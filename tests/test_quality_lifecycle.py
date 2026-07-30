@@ -362,7 +362,7 @@ def test_migrations_are_idempotent_and_preserve_legacy_price_values(
             for value in conn.execute(
                 "SELECT schema_version FROM schema_metadata ORDER BY schema_version"
             )
-        ] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        ] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         quality_columns = {
             value[1] for value in conn.execute("PRAGMA table_info(data_quality_issues)")
         }
@@ -422,7 +422,7 @@ def test_migration_failure_rolls_back_schema_and_data_changes(
         ).fetchone()[0] == 0
         assert conn.execute(
             "SELECT MAX(schema_version) FROM schema_metadata"
-        ).fetchone()[0] == 9
+        ).fetchone()[0] == 10
     finally:
         conn.close()
 
@@ -432,7 +432,7 @@ def test_prediction_provenance_migration_rolls_back_atomically_on_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db_path = workspace_tmp_dir / "prediction-rollback.db"
-    initialize_database(db_path)  # fully migrated, including v9, before the injected failure below
+    initialize_database(db_path)  # fully migrated, including v10, before the injected failure below
 
     def fail_provenance_columns(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE TABLE prediction_rollback_probe (id INTEGER PRIMARY KEY)")
@@ -455,6 +455,6 @@ def test_prediction_provenance_migration_rolls_back_atomically_on_failure(
         assert "dataset_fingerprint" in columns
         assert conn.execute(
             "SELECT MAX(schema_version) FROM schema_metadata"
-        ).fetchone()[0] == 9
+        ).fetchone()[0] == 10
     finally:
         conn.close()

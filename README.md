@@ -135,6 +135,50 @@ only a run over genuinely new data (more history collected, a changed
 universe, a changed feature set) produces a new fingerprint. See "Evaluation
 honesty" below.
 
+`predict-v4` is a second, separate experimental model answering a related but
+distinct question: whether a *nonlinear* model does better than predict-v3's linear
+one at the exact same task. It's motivated by a concrete finding, not a fishing
+expedition — `investigate-risk-inversion` found a genuinely U-shaped relationship
+between trailing six-month return and forward performance that a linear model's
+single coefficient per feature structurally cannot represent. `predict-v4` fits a
+hand-rolled (no scikit-learn, same reasoning as `predict`) gradient-boosted
+regression tree ensemble (`stock_scrapper/prediction/gbm.py`) — deterministic,
+exhaustive best-split search, no random row/feature subsampling — against a
+**continuous** forward excess-return target (`build_regression_dataset`) rather than
+predict-v3's binarized "beat the benchmark" label, keeping the magnitude information
+the binary version throws away. It reuses the identical date-grouped, purged,
+expanding-window walk-forward machinery as `predict` (same `_fold_boundaries`
+splitting, same leakage purge), evaluated with regression-appropriate metrics
+instead: mean squared error against each fold's own honest baseline (that fold's own
+test-period target variance — the true minimum achievable MSE for always predicting
+that fold's own mean), mean absolute error, and an information coefficient (Pearson
+correlation between predicted and actual excess return). Runs persist to
+`gbm_prediction_runs`/`gbm_prediction_folds` with the same evaluation provenance as
+`prediction_runs`/`prediction_folds`. Configure via `config/prediction_rules.yaml`'s
+`gbm:` section (tree count, depth, learning rate, leaf/split minimums, L2
+regularization) — it shares `predict-v3`'s horizon/lookback/stride/folds/features so
+the two models train and evaluate over identical rows.
+
+The first real run against the full 20-year/25-symbol history
+(`predict-v4-20260730193552-db691ae3`, 54,652 training samples) found the nonlinear
+model does not help — if anything it is a clean, consistent negative result. Holdout
+MSE (0.006157) is *worse* than the fold-specific baseline (0.005881), and it loses to
+that trivial "always predict the fold's own mean" baseline in **every one of the 5
+folds** individually (e.g. fold 4: 0.008480 vs. 0.008103; fold 5: 0.008358 vs.
+0.008038) — a more consistent loss than predict-v3 shows against its own baseline.
+The information coefficient is weak and inconsistent (-0.079 in the earliest fold,
+then +0.01 to +0.05 in the other four; +0.0137 overall), far below anything that would
+support real directional skill. Today's live predictions also surfaced a concrete
+illustration of a known weakness of leaf-based models: one extreme outlier (INTC,
++18.50%, against a next-highest of +4.89% for every other symbol) — a sign of a
+poorly-supported leaf estimate for a feature combination under-represented in
+training, which a smooth linear model wouldn't produce in the same way. Matching the
+hypothesis a nonlinear model would fix predict-v3's blind spot did not pan out in
+practice; feature importances (led by `trend_slope_200`, `sixty_day_volatility`,
+`beta`) are a genuinely different ranking from predict-v3's linear coefficients, but
+that alone isn't evidence of anything actionable given the overall negative result.
+See "Evaluation honesty" below.
+
 `validate-signals` asks a complementary, higher-power question about
 `score_v1` itself: across every day a symbol was ever classified —
 independent of whether the portfolio backtester had room to act on it, which
@@ -223,15 +267,30 @@ answer for both signals:
   Brier score 0.2504 against a baseline of 0.2497 — below baseline on both
   metrics overall. Only 1 of 5 folds beats its own fold-specific baseline on
   accuracy; the most recent fold (2023–2026) is the worst of all five.
+- **`predict-v4`** (54,652 samples, same window, gradient-boosted regression on
+  continuous excess return): holdout MSE 0.006157 against a fold-specific
+  baseline of 0.005881 — worse than baseline overall, and worse in all 5 of 5
+  folds individually, a more consistent loss than predict-v3's. Information
+  coefficient is weak and inconsistent (-0.079 to +0.05 across folds). Moving
+  to a nonlinear model did not recover the edge a linear model might be
+  missing.
+- **`signal-capture-test`** (same 15 validation windows + holdout as the
+  portfolio walk-forward, `score_v1`'s own trading rules stripped out): beat
+  SPY in only 2 of 15 validation windows (13%, versus `score_v1`'s own 5 of
+  15) and lost the holdout too. Removing stop-loss/trailing-stop/regime-gate/
+  early-exit rules made results *worse*, not better — evidence those rules
+  are doing real protective work rather than suppressing a hidden edge.
 
 Taken together, neither signal has demonstrated a validated edge, and the
-deeper, wider sample makes that conclusion more solid than the earlier
-narrower one did — this is not a case where more data revealed a hidden
-edge; if anything it removed ambiguity in the negative direction. This is
-stated plainly rather than glossed over. A future claim of validated edge
-would require a model or ranking to beat its own fold/window-specific
-baseline consistently across multiple non-overlapping periods, not on a
-rerun of the same data. See Limitations.
+deeper, wider sample — plus two further, more targeted attempts to find one
+(a nonlinear model, a trading-rules-stripped direct capture of the
+classification edge) — makes that conclusion more solid than the earlier
+narrower one did. This is not a case where more data or a different model
+revealed a hidden edge; every additional check has removed ambiguity in the
+negative direction. This is stated plainly rather than glossed over. A future
+claim of validated edge would require a model or ranking to beat its own
+fold/window-specific baseline consistently across multiple non-overlapping
+periods, not on a rerun of the same data. See Limitations.
 
 ### Investigating the High Risk inversion
 
@@ -286,6 +345,40 @@ buckets, are in `reports/risk_inversion_study_backtest-20260729182530-b6a3a71d.j
 and its paired HTML report. Neither pattern changes score_v1 or predict-v3's current
 behavior; both are recorded as a starting point for a future, more targeted hypothesis
 or feature, not as anything actionable today.
+
+### Can the "Strong Candidate" edge be captured directly?
+
+`validate-signals` found "Strong Candidate" has a thin but real classification-level
+edge (symbol-weighted mean excess return +0.99%, 95% CI [+0.01%, +1.42%] — barely
+excluding zero), yet the full `score_v1` portfolio backtest still loses to SPY in most
+walk-forward windows. That gap raises an obvious question: is the edge real but being
+destroyed by `score_v1`'s own trading rules (entry/exit thresholds, stop-loss,
+trailing-stop, regime gating), or does the edge simply not survive contact with a real
+holding period and real costs? `python main.py signal-capture-test` isolates the
+question directly: entry is gated on the "Strong Candidate" classification alone (no
+extra opportunity/volume/confidence/risk/regime filters), every early-exit path
+(stop-loss, trailing-stop, profit-target, classification-based exit, regime-based exit)
+is disabled, and the only way out of a position is an unconditional exit after exactly
+`horizon_days` sessions — the same horizon `validate-signals` measures against. Realistic
+commission/slippage still apply, and position limits are widened (25 concurrent
+positions) so the cap itself can't be the bottleneck. This reuses the exact same
+purged, date-grouped walk-forward machinery as `walk-forward`, so results are directly
+comparable window-for-window.
+
+The answer, on the full 20-year/25-symbol history (`wf-signalcapture-20260730190245-2d67f6c0`):
+**worse**, not better. This maximally-permissive, risk-control-free variant beat SPY in
+only 2 of 15 validation windows (13%) and lost the holdout too (active_return -4.78%),
+compared to `score_v1`'s own 5 of 15 (33%) with its full rule set intact. Removing the
+stop-loss/trailing-stop/regime-gate/early-exit rules did not unlock the classification's
+thin edge — it made outcomes worse, which is the opposite of what "the trading rules
+are competing with a real edge" would predict. The more consistent explanation:
+`score_v1`'s exit rules are doing real protective work (cutting losing positions before
+a full `horizon_days` of downside), and the thin average edge `validate-signals` measures
+across *all* classified instances unconditionally does not, by itself, translate into a
+strategy worth running without risk management. This is exploratory diagnostic evidence,
+not a proposed change to `score_v1` — it changes nothing about its scoring, thresholds,
+or classification logic — but it closes off "just remove the trading rules" as a path to
+a validated edge.
 
 ## Phase 4 real-portfolio tracking
 
@@ -579,6 +672,17 @@ python main.py validate-signals --start 2022-07-20 --end 2026-06-30 --horizon-da
 # bucket's forward excess return? See "Investigating the High Risk inversion" below.
 python main.py investigate-risk-inversion
 python main.py investigate-risk-inversion --classifications "High Risk" "Strong Candidate"
+
+# EXPLORATORY: is validate-signals' Strong Candidate edge capturable once score_v1's own
+# trading rules stop competing with it? See "Can the Strong Candidate edge be captured
+# directly?" above.
+python main.py signal-capture-test
+python main.py signal-capture-test --horizon-days 21
+
+# EXPERIMENTAL: gradient-boosted regression on continuous excess return, separate from
+# score_v1 and predict-v3. See "Phase 5" above.
+python main.py predict-v4
+python main.py predict-v4 --symbols AAPL MSFT --as-of-date 2026-06-30
 ```
 
 `digest` reads the same saved classifications as `scores`/`explain` and groups
@@ -820,8 +924,10 @@ python -m pytest -q
 - **Research scope:** technical evidence omits fundamentals, macroeconomic releases, news, taxes, borrowing constraints, and individual circumstances.
 - **Screening universe:** `config/screening_universe.csv` is a hand-maintained illustrative list, not a live feed of any official index's constituents, and is not automatically kept current.
 - **Experimental prediction:** `predict` fits a small linear model on freely available technical indicators; its date-grouped, purged, sample-weighted walk-forward holdout accuracy/Brier score are reported next to their own fold-specific baselines precisely so a lack of real edge is visible rather than hidden — and, as of this project's current data, that is exactly what they show (see "Evaluation honesty" above). Past accuracy does not indicate future accuracy. It is not part of `score_v1`.
+- **Experimental nonlinear prediction:** `predict-v4` fits a gradient-boosted regression tree ensemble on the same evaluation methodology as `predict`, targeting continuous excess return instead of a binary label; as of this project's current data it is a consistent negative result, losing to its own fold-specific baseline in every fold (see "Evaluation honesty" above). It is not part of `score_v1` or `predict-v3`, and a single extreme prediction (an outlier tree-leaf estimate for a feature combination under-represented in training) should be treated with particular skepticism.
 - **Signal validation is descriptive, not inferential:** `validate-signals`' p-values are naive (they assume independent daily trials, which overlapping-horizon, symbol-clustered rows are not) and are labeled as such; the symbol-weighted mean and its confidence interval are the more defensible read, and buckets backed by fewer than four distinct symbols are flagged as concentration-prone rather than presented as population-level evidence.
 - **Risk-inversion diagnostics are exploratory:** `investigate-risk-inversion`'s quintile splits and Pearson correlations share `validate-signals`' overlapping-window, symbol-clustered non-independence, and testing several correlated indicators at once can look suggestive by chance. Treat its output as hypothesis generation, not a validated explanation, and it changes nothing about score_v1's scoring, thresholds, or classification logic.
+- **Signal-capture diagnostic is exploratory:** `signal-capture-test` is a maximally-permissive score_v1 variant (single-classification entry, no risk-management exits, fixed holding period) built to isolate one question — see "Can the Strong Candidate edge be captured directly?" above. It found removing score_v1's trading rules performs *worse*, not better, suggesting those rules do real protective work rather than suppressing an edge — but it is one exploratory read over one (overlapping-window) history, not a validated conclusion, and changes nothing about score_v1 itself.
 - **Advisory recommendations only:** `recommend` sizes suggestions but never places an order — there is no broker integration, and `auto_execute` in `config/trading_rules.yaml` is rejected if set to `true`. Sizing assumes a single account with no existing outside positions, ignores taxes/fees, and derives available cash from `starting_capital` plus recorded lots/sales rather than a real brokerage balance.
 
 ## Financial and historical-results disclaimer

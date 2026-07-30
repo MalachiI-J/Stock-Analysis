@@ -75,6 +75,8 @@ from stock_scrapper.portfolio import (
     evaluate_portfolio_performance,
 )
 from stock_scrapper.prediction.config import validate_prediction_config
+from stock_scrapper.prediction.gbm_persistence import persist_gbm_prediction_run
+from stock_scrapper.prediction.gbm_service import run_gbm_prediction
 from stock_scrapper.prediction.persistence import persist_prediction_run
 from stock_scrapper.prediction.service import run_prediction
 from stock_scrapper.processing.validation import validate_price_records
@@ -295,6 +297,19 @@ def build_parser() -> argparse.ArgumentParser:
     walk.add_argument("--start", help="First development date (YYYY-MM-DD)")
     walk.add_argument("--end", help="Final holdout end date (YYYY-MM-DD)")
 
+    signal_capture_parser = subparsers.add_parser(
+        "signal-capture-test",
+        help="Is validate-signals' thin Strong Candidate edge capturable once score_v1's own trading rules stop competing with it?",
+    )
+    signal_capture_parser.add_argument("--strategy", choices=("score_v1",), default="score_v1")
+    signal_capture_parser.add_argument("--symbols", nargs="+", help="Optional candidate universe")
+    signal_capture_parser.add_argument("--start", help="First development date (YYYY-MM-DD)")
+    signal_capture_parser.add_argument("--end", help="Final holdout end date (YYYY-MM-DD)")
+    signal_capture_parser.add_argument(
+        "--horizon-days", type=int,
+        help="Override config/prediction_rules.yaml's horizon_days; also the forced holding period",
+    )
+
     validate_signals_parser = subparsers.add_parser(
         "validate-signals",
         help="Does score_v1's classification beat the benchmark forward, independent of backtest sizing/timing?",
@@ -362,6 +377,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override config/prediction_rules.yaml's horizon_days, e.g. to compare horizons",
     )
     _add_as_of_argument(predict)
+
+    predict_v4 = subparsers.add_parser(
+        "predict-v4",
+        help="EXPERIMENTAL gradient-boosted regression on continuous excess return (not score_v1, not predict-v3)",
+    )
+    predict_v4.add_argument("--symbols", nargs="+", help="Optional symbol list")
+    predict_v4.add_argument(
+        "--horizon-days", type=int,
+        help="Override config/prediction_rules.yaml's horizon_days, so this stays comparable to predict/validate-signals",
+    )
+    _add_as_of_argument(predict_v4)
     return parser
 
 
@@ -916,6 +942,99 @@ def _load_backtest_inputs(
     return histories, quality
 
 
+def _signal_capture_config(base_dir: Path, args: argparse.Namespace, horizon_days: int) -> BacktestConfig:
+    """A maximally-permissive score_v1 variant that mechanically captures the "Strong
+    Candidate" classification with none of score_v1's other trading rules competing
+    with it, to test whether validate-signals' thin classification-level edge (see
+    README's "Evaluation honesty" section) is capturable at the portfolio level once
+    score_v1's own stop-loss/trailing-stop/regime-gate/early-exit rules stop cutting
+    into it. Still strategy_name="score_v1" (the only registered strategy — see
+    run_portfolio_backtest's own check) with maximum_holding_period forcing an
+    unconditional exit at the same horizon validate-signals measures against, and every
+    other early-exit/filter path disabled or maximally loosened so nothing but the
+    classification itself and the timed exit can act. Exploratory diagnostic, not a
+    proposed change to score_v1 itself.
+
+    exit_thresholds.classifications can't be an empty list (schema requires a
+    non-empty, validated subset of ALLOWED_CLASSIFICATIONS), so it keeps exactly
+    "Data Blocked" — a total data-quality blackout, not a signal-driven
+    reclassification, so still exiting on it isn't one of the "competing trading
+    rules" this diagnostic is trying to remove.
+    """
+    typed = _backtest_config(base_dir, args)
+    return typed.with_overrides(
+        entry_thresholds={
+            "classifications": ["Strong Candidate"],
+            "minimum_opportunity_score": 0.0,
+            "minimum_average_dollar_volume": 0.0,
+        },
+        exit_thresholds={
+            "classifications": ["Data Blocked"],
+            "minimum_opportunity_score": 0.0,
+            "minimum_confidence_score": 0.0,
+            "maximum_risk_score": 100.0,
+            "exit_below_sma200": False,
+            "exit_on_stress": False,
+        },
+        allowed_market_regimes=["Risk-On", "Neutral", "Risk-Off", "Stress"],
+        minimum_confidence=0.0,
+        maximum_risk=100.0,
+        maximum_positions=25,
+        stop_loss=None,
+        trailing_stop=None,
+        profit_target=None,
+        maximum_holding_period=horizon_days,
+        strategy_version=typed.strategy_version + "-signal-capture-diagnostic",
+    )
+
+
+def _print_walk_forward_results(walk_result: Any) -> int:
+    """Shared per-window reporting for both `walk-forward` and `signal-capture-test` —
+    identical presentation so their results are directly comparable."""
+    print(f"{walk_result.walk_forward_run_id}: {walk_result.status}")
+    for window in walk_result.windows:
+        print(
+            f"  {window.window_type}: {window.evaluation_start_date}.."
+            f"{window.evaluation_end_date} status={window.status} backtest={window.backtest_run_id}"
+        )
+    print()
+    print("Per-window performance vs benchmark (validation and holdout kept separate — never averaged together):")
+    validation_windows = [window for window in walk_result.windows if window.window_type == "validation"]
+    holdout_windows = [window for window in walk_result.windows if window.window_type == "holdout"]
+    for label, windows in (("validation", validation_windows), ("holdout", holdout_windows)):
+        for window in windows:
+            metrics = getattr(window, "metrics", None)
+            span = f"{window.evaluation_start_date}..{window.evaluation_end_date}"
+            if metrics is None:
+                print(f"  {label} [{span}]: no metrics recorded (status={window.status})")
+                continue
+            active_text = "n/a" if metrics.active_return is None else f"{metrics.active_return:+.2%}"
+            sharpe_text = "n/a" if metrics.sharpe_ratio is None else f"{metrics.sharpe_ratio:.2f}"
+            benchmark_sharpe_text = (
+                "n/a" if metrics.benchmark_sharpe_ratio is None else f"{metrics.benchmark_sharpe_ratio:.2f}"
+            )
+            verdict = (
+                "n/a" if metrics.active_return is None
+                else ("beat benchmark" if metrics.active_return > 0 else "trailed benchmark")
+            )
+            print(
+                f"  {label} [{span}]: active_return={active_text} sharpe={sharpe_text} "
+                f"(benchmark sharpe={benchmark_sharpe_text}) -> {verdict}"
+            )
+    if len(validation_windows) <= 1 and len(holdout_windows) <= 1:
+        print(
+            "  Only one validation window and one holdout exist with current stored history — "
+            "each of the above is a single data point, not a statistically powered walk-forward "
+            "verdict. Treat the direction as informative, not as proof of an edge."
+        )
+    failed_windows = sum(window.status == "failed" for window in walk_result.windows)
+    if failed_windows == len(walk_result.windows):
+        return int(ExitCode.OPERATION_FAILED)
+    if failed_windows:
+        return int(ExitCode.PARTIAL_FAILURE)
+    return int(ExitCode.SUCCESS)
+
+
 def run_backtests(
     config: dict[str, Any],
     logger: Any,
@@ -1244,6 +1363,114 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(f"  {prediction.symbol:<6} unavailable — {prediction.reason}")
                 else:
                     print(f"  {prediction.symbol:<6} {prediction.probability_positive:.1%}")
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "predict-v4":
+            print(
+                "EXPERIMENTAL STATISTICAL FORECAST — not part of score_v1, not a trading signal. "
+                "Predicts the continuous forward excess return over the benchmark (not just whether "
+                "it's beaten) using gradient-boosted regression trees, so it can capture nonlinear "
+                "patterns (e.g. the U-shaped six-month-return effect investigate-risk-inversion found) "
+                "predict-v3's linear model structurally cannot. Read the holdout MSE/information "
+                "coefficient below before trusting any prediction.",
+                file=sys.stderr,
+            )
+            effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
+            prediction_rules = load_prediction_rules(base_dir)
+            if args.horizon_days is not None:
+                if args.horizon_days <= 0:
+                    parser.error("--horizon-days must be positive")
+                prediction_rules = dict(prediction_rules, horizon_days=args.horizon_days)
+            scoring_rules = load_scoring_rules(base_dir)
+            roles = load_universes(config)
+            benchmark = roles["benchmark"]
+            load_symbols = sorted(set(symbols) | {benchmark} | set(roles["market_context"]) | set(roles["defensive_context"]))
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                histories = {symbol: fetch_price_history(conn, symbol, end_date=effective) for symbol in load_symbols}
+                trading_dates = [str(row["trade_date"])[:10] for row in histories.get(benchmark, [])]
+                service = AnalysisService(conn, scoring_rules, roles["candidates"])
+                result = run_gbm_prediction(
+                    service, symbols, histories, trading_dates,
+                    as_of_date=effective.isoformat(), rules=prediction_rules, benchmark_symbol=benchmark,
+                )
+                prediction_run_id = f"predict-v4-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
+                run_provenance = collect_provenance(
+                    base_dir, strategy_name="predict-v4", strategy_version="predict-v4",
+                )
+                conn.execute("BEGIN")
+                try:
+                    persist_gbm_prediction_run(
+                        conn, prediction_run_id, result,
+                        prediction_version="predict-v4",
+                        benchmark_symbol=benchmark,
+                        configuration_snapshot=prediction_rules,
+                        configuration_hash=stable_sha256(prediction_rules),
+                        git_commit_hash=run_provenance.get("git_commit_hash"),
+                        git_dirty=run_provenance.get("git_dirty"),
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+            finally:
+                conn.close()
+            if result.status == "insufficient_data":
+                print(f"prediction run: {prediction_run_id}", file=sys.stderr)
+                print(f"Missing data: {result.message}", file=sys.stderr)
+                return int(ExitCode.MISSING_DATA)
+            print(f"prediction run: {prediction_run_id}")
+            print(f"Prediction as of {result.as_of_date} | horizon={result.horizon_days} session(s) | model=predict-v4")
+            print(
+                f"Trained on {result.training_samples} sample(s) ({result.training_start_date} to "
+                f"{result.training_end_date})"
+            )
+            if result.message:
+                print(f"Note: {result.message}", file=sys.stderr)
+            mse_text = "n/a" if result.holdout_mse is None else f"{result.holdout_mse:.6f}"
+            baseline_mse_text = "n/a" if result.baseline_mse is None else f"{result.baseline_mse:.6f}"
+            mae_text = "n/a" if result.holdout_mean_absolute_error is None else f"{result.holdout_mean_absolute_error:.4f}"
+            ic_text = "n/a" if result.holdout_information_coefficient is None else f"{result.holdout_information_coefficient:+.4f}"
+            print(
+                f"Walk-forward holdout MSE: {mse_text} (sample-weighted baseline {baseline_mse_text}, "
+                "each fold's own test-period target variance — the minimum achievable MSE for always "
+                f"predicting that fold's own mean) over {result.holdout_samples} held-out sample(s) "
+                f"across {len(result.walk_forward_folds)} fold(s)"
+            )
+            print(f"Holdout mean absolute error: {mae_text} | information coefficient: {ic_text}")
+            for fold in result.walk_forward_folds:
+                fold_mse = "n/a" if fold.mse is None else f"{fold.mse:.6f}"
+                fold_baseline_mse = "n/a" if fold.baseline_mse is None else f"{fold.baseline_mse:.6f}"
+                fold_mae = "n/a" if fold.mean_absolute_error is None else f"{fold.mean_absolute_error:.4f}"
+                fold_ic = "n/a" if fold.information_coefficient is None else f"{fold.information_coefficient:+.4f}"
+                print(
+                    f"  fold {fold.fold}: train [{fold.training_start_date}..{fold.training_end_date}] "
+                    f"({fold.training_samples} samples, {fold.training_symbol_count} symbols, "
+                    f"{fold.purged_samples} purged for label/test-period overlap)"
+                )
+                print(
+                    f"    -> test [{fold.test_start_date}..{fold.test_end_date}] "
+                    f"({fold.test_samples} samples, {fold.test_symbol_count} symbols)"
+                )
+                print(
+                    f"    mse {fold_mse} vs. fold baseline {fold_baseline_mse} | mae {fold_mae} | "
+                    f"information coefficient {fold_ic}"
+                )
+            print("Feature importances (share of total SSE-reduction gain across every tree):")
+            for name, share in result.feature_importances[:10]:
+                print(f"  {name:<32} {share:.1%}")
+            print(f"Symbol predictions (predicted forward excess return vs. {benchmark}):")
+            ranked = sorted(
+                result.predictions,
+                key=lambda item: item.predicted_excess_return if item.predicted_excess_return is not None else float("-inf"),
+                reverse=True,
+            )
+            for prediction in ranked:
+                if prediction.predicted_excess_return is None:
+                    print(f"  {prediction.symbol:<6} unavailable — {prediction.reason}")
+                else:
+                    print(f"  {prediction.symbol:<6} {prediction.predicted_excess_return:+.2%}")
             return int(ExitCode.SUCCESS)
 
         if args.command in {"data-health", "data-health-report"}:
@@ -1886,48 +2113,81 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise
             finally:
                 conn.close()
-            print(f"{walk_result.walk_forward_run_id}: {walk_result.status}")
-            for window in walk_result.windows:
-                print(
-                    f"  {window.window_type}: {window.evaluation_start_date}.."
-                    f"{window.evaluation_end_date} status={window.status} backtest={window.backtest_run_id}"
+            return _print_walk_forward_results(walk_result)
+
+        if args.command == "signal-capture-test":
+            horizon_days = args.horizon_days or int(load_prediction_rules(base_dir).get("horizon_days", 21))
+            typed = _signal_capture_config(base_dir, args, horizon_days)
+            rules = load_scoring_rules(base_dir)
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                histories, quality = _load_backtest_inputs(conn, config, rules, symbols, typed)
+                trading_dates = [
+                    row["trade_date"] for row in histories.get(typed.benchmark.upper(), [])
+                ]
+
+                def executor(window: Any, immutable_config: BacktestConfig) -> WalkForwardExecutionResult:
+                    window_config = immutable_config.with_overrides(
+                        start_date=window.evaluation_start_date,
+                        end_date=window.evaluation_end_date,
+                        warm_up_days=immutable_config.walk_forward.warm_up_days,
+                    )
+                    outcome = run_portfolio_backtest(
+                        symbols,
+                        histories,
+                        rules,
+                        window_config,
+                        quality_by_symbol=quality,
+                        persist_conn=conn,
+                        commit_persistence=False,
+                        run_id=f"backtest-{window.window_id}",
+                    )
+                    return WalkForwardExecutionResult(
+                        backtest_run_id=outcome.run.run_id,
+                        metrics=outcome.metrics,
+                    )
+
+                walk_forward_run_id = (
+                    "wf-signalcapture-"
+                    + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+                    + "-"
+                    + uuid4().hex[:8]
                 )
+                conn.execute("BEGIN")
+                try:
+                    walk_result = run_walk_forward(
+                        typed,
+                        trading_dates,
+                        executor,
+                        symbols=symbols,
+                        walk_forward_run_id=walk_forward_run_id,
+                    )
+                    walk_result.benchmark_symbol = typed.benchmark
+                    walk_result.symbols = list(symbols)
+                    walk_result.configuration_snapshot = typed.to_dict()
+                    persist_walk_forward(conn, walk_result)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+            finally:
+                conn.close()
+            print(
+                "Signal-capture diagnostic: score_v1 with Strong-Candidate-only entry, no extra "
+                "score/regime gates, and every early-exit path (stop-loss, trailing-stop, "
+                "profit-target, classification-based exit) disabled — the only way out is an "
+                f"unconditional exit after exactly {horizon_days} session(s), the same horizon "
+                "validate-signals measures against."
+            )
+            print(
+                "Tests whether validate-signals' thin classification-level edge is capturable at "
+                "the portfolio level once score_v1's own trading rules stop competing with it. "
+                "Exploratory diagnostic, not a proposed change to score_v1 itself — see "
+                '"Evaluation honesty" in README.'
+            )
             print()
-            print("Per-window performance vs benchmark (validation and holdout kept separate — never averaged together):")
-            validation_windows = [window for window in walk_result.windows if window.window_type == "validation"]
-            holdout_windows = [window for window in walk_result.windows if window.window_type == "holdout"]
-            for label, windows in (("validation", validation_windows), ("holdout", holdout_windows)):
-                for window in windows:
-                    metrics = getattr(window, "metrics", None)
-                    span = f"{window.evaluation_start_date}..{window.evaluation_end_date}"
-                    if metrics is None:
-                        print(f"  {label} [{span}]: no metrics recorded (status={window.status})")
-                        continue
-                    active_text = "n/a" if metrics.active_return is None else f"{metrics.active_return:+.2%}"
-                    sharpe_text = "n/a" if metrics.sharpe_ratio is None else f"{metrics.sharpe_ratio:.2f}"
-                    benchmark_sharpe_text = (
-                        "n/a" if metrics.benchmark_sharpe_ratio is None else f"{metrics.benchmark_sharpe_ratio:.2f}"
-                    )
-                    verdict = (
-                        "n/a" if metrics.active_return is None
-                        else ("beat benchmark" if metrics.active_return > 0 else "trailed benchmark")
-                    )
-                    print(
-                        f"  {label} [{span}]: active_return={active_text} sharpe={sharpe_text} "
-                        f"(benchmark sharpe={benchmark_sharpe_text}) -> {verdict}"
-                    )
-            if len(validation_windows) <= 1 and len(holdout_windows) <= 1:
-                print(
-                    "  Only one validation window and one holdout exist with current stored history — "
-                    "each of the above is a single data point, not a statistically powered walk-forward "
-                    "verdict. Treat the direction as informative, not as proof of an edge."
-                )
-            failed_windows = sum(window.status == "failed" for window in walk_result.windows)
-            if failed_windows == len(walk_result.windows):
-                return int(ExitCode.OPERATION_FAILED)
-            if failed_windows:
-                return int(ExitCode.PARTIAL_FAILURE)
-            return int(ExitCode.SUCCESS)
+            return _print_walk_forward_results(walk_result)
 
         if args.command == "validate-signals":
             typed = _backtest_config(base_dir, args)

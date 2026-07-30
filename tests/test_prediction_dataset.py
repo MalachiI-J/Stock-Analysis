@@ -4,8 +4,11 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
 
+import pytest
+
 from stock_scrapper.models.analysis_models import AnalysisResult
 from stock_scrapper.prediction.dataset import (
+    build_regression_dataset,
     build_training_dataset,
     feature_value,
     opportunity_percentiles,
@@ -168,6 +171,68 @@ def test_build_training_dataset_drops_rows_missing_benchmark_price() -> None:
 
     assert features.shape[0] == 0
     assert meta == []
+
+
+def test_build_regression_dataset_target_is_continuous_excess_return() -> None:
+    trading_dates = _dates("2024-01-01", 20)
+    prices = [100.0 + index for index in range(20)]  # +1/session -> known excess return
+    history = {"AAA": [{"trade_date": d, "adjusted_close": p} for d, p in zip(trading_dates, prices)]}
+    history.update(_flat_history("SPY", trading_dates))  # benchmark return is always 0
+    results_by_date = {
+        d: {"AAA": _result("AAA", d, rsi=50.0 + index)} for index, d in enumerate(trading_dates)
+    }
+    service = _FakeService(results_by_date)
+    sample_date = date.fromisoformat(trading_dates[0])
+
+    features, targets, meta = build_regression_dataset(
+        service, ["AAA"], history, [sample_date],
+        horizon_days=5, feature_keys=["rsi_14"], benchmark_symbol="SPY",
+    )
+
+    # entry=100, exit=105 (5 sessions later at +1/session) -> symbol_return=0.05;
+    # benchmark is flat -> benchmark_return=0.0 -> excess_return=0.05, not a binary 1.0.
+    assert features.shape[0] == 1
+    assert targets[0] == pytest.approx(0.05)
+    assert meta == [{"symbol": "AAA", "date": trading_dates[0], "label_end_date": trading_dates[5]}]
+
+
+def test_build_regression_dataset_target_can_be_negative() -> None:
+    trading_dates = _dates("2024-01-01", 20)
+    prices = [100.0 - index for index in range(20)]  # falling price -> negative excess return
+    history = {"AAA": [{"trade_date": d, "adjusted_close": p} for d, p in zip(trading_dates, prices)]}
+    history.update(_flat_history("SPY", trading_dates))
+    results_by_date = {trading_dates[0]: {"AAA": _result("AAA", trading_dates[0])}}
+    service = _FakeService(results_by_date)
+
+    features, targets, meta = build_regression_dataset(
+        service, ["AAA"], history, [date.fromisoformat(trading_dates[0])],
+        horizon_days=5, feature_keys=["rsi_14"], benchmark_symbol="SPY",
+    )
+
+    assert features.shape[0] == 1
+    assert targets[0] < 0.0
+
+
+def test_build_regression_dataset_shares_eligibility_and_missing_feature_filtering() -> None:
+    trading_dates = _dates("2024-01-01", 10)
+    prices = [100.0] * 10
+    history = {"AAA": [{"trade_date": d, "adjusted_close": p} for d, p in zip(trading_dates, prices)]}
+    history.update(_flat_history("SPY", trading_dates))
+    results_by_date = {
+        trading_dates[0]: {"AAA": _result("AAA", trading_dates[0], eligible=False)},
+        trading_dates[1]: {"AAA": _result("AAA", trading_dates[1], rsi=None)},
+        trading_dates[2]: {"AAA": _result("AAA", trading_dates[2], rsi=60.0)},
+    }
+    service = _FakeService(results_by_date)
+    sample_dates = [date.fromisoformat(trading_dates[index]) for index in range(3)]
+
+    features, targets, meta = build_regression_dataset(
+        service, ["AAA"], history, sample_dates,
+        horizon_days=5, feature_keys=["rsi_14"], benchmark_symbol="SPY",
+    )
+
+    assert features.shape[0] == 1
+    assert meta == [{"symbol": "AAA", "date": trading_dates[2], "label_end_date": trading_dates[2 + 5]}]
 
 
 def test_opportunity_percentiles_ranks_by_score_with_symbol_tiebreak() -> None:

@@ -26,3 +26,15 @@ feature_keys:
   - volume_relative_to_average
   - market_regime_code
   - opportunity_score_percentile
+
+# predict-v4 (stock_scrapper/prediction/gbm.py): gradient-boosted regression trees on
+# the continuous excess-return target (build_regression_dataset), evaluated over the
+# exact same horizon/lookback/stride/folds/features/minimum-samples as predict-v3
+# above, so the two models are directly comparable. See README's "Evaluation honesty".
+gbm:
+  n_estimators: 100
+  max_depth: 3
+  learning_rate: 0.1
+  min_samples_leaf: 50
+  min_samples_split: 100
+  l2_lambda: 1.0

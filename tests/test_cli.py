@@ -49,6 +49,7 @@ class _Connection:
 class _BacktestConfigStub:
     benchmark: str = "SPY"
     warm_up_days: int = 99
+    strategy_version: str = "1.1.0"
 
     @property
     def walk_forward(self) -> SimpleNamespace:
@@ -58,7 +59,10 @@ class _BacktestConfigStub:
         return {"benchmark": self.benchmark, "strategy_name": "score_v1"}
 
     def with_overrides(self, **overrides: Any) -> SimpleNamespace:
-        return SimpleNamespace(benchmark=self.benchmark, **overrides)
+        merged = {"benchmark": self.benchmark, "strategy_name": "score_v1", **overrides}
+        result = SimpleNamespace(**merged)
+        result.to_dict = lambda: merged
+        return result
 
 
 def _config(tmp_path: Path) -> dict[str, Any]:
@@ -348,6 +352,73 @@ def test_insufficient_walk_forward_history_uses_missing_data_exit_code(
 
     assert cli.main(["walk-forward", "--symbols", "AAA"]) == int(ExitCode.MISSING_DATA)
     assert connections[0].rollbacks == 1
+    assert connections[0].closed is True
+
+
+def test_signal_capture_config_disables_early_exits_and_forces_holding_period(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class _CapturingStub(_BacktestConfigStub):
+        def with_overrides(self, **overrides: Any) -> SimpleNamespace:
+            captured.update(overrides)
+            return super().with_overrides(**overrides)
+
+    monkeypatch.setattr(cli, "_backtest_config", lambda _base_dir, _args: _CapturingStub())
+
+    cli._signal_capture_config(Path("."), SimpleNamespace(strategy="score_v1"), 21)
+
+    assert captured["entry_thresholds"]["classifications"] == ["Strong Candidate"]
+    assert captured["entry_thresholds"]["minimum_opportunity_score"] == 0.0
+    assert captured["entry_thresholds"]["minimum_average_dollar_volume"] == 0.0
+    assert captured["exit_thresholds"]["classifications"] == ["Data Blocked"]
+    assert captured["exit_thresholds"]["maximum_risk_score"] == 100.0
+    assert captured["exit_thresholds"]["exit_below_sma200"] is False
+    assert captured["exit_thresholds"]["exit_on_stress"] is False
+    assert captured["stop_loss"] is None
+    assert captured["trailing_stop"] is None
+    assert captured["profit_target"] is None
+    assert captured["maximum_holding_period"] == 21
+    assert captured["minimum_confidence"] == 0.0
+    assert captured["maximum_risk"] == 100.0
+    assert "Risk-Off" in captured["allowed_market_regimes"]
+    assert captured["strategy_version"] == "1.1.0-signal-capture-diagnostic"
+
+
+def test_signal_capture_config_passes_real_schema_validation() -> None:
+    """Exercises the REAL BacktestConfig.with_overrides/validate_backtesting_config —
+    the stubbed tests above never run real validation, and an earlier version of
+    _signal_capture_config passed an empty exit_thresholds.classifications list that
+    only a real validation pass ever caught (ValueError: must be a non-empty list)."""
+    repo_root = Path(__file__).resolve().parent.parent
+    args = SimpleNamespace(strategy="score_v1", symbols=None, start=None, end=None)
+
+    typed = cli._signal_capture_config(repo_root, args, 21)
+
+    assert typed.entry_thresholds.classifications == ("Strong Candidate",)
+    assert typed.exit_thresholds.classifications == ("Data Blocked",)
+    assert typed.maximum_holding_period == 21
+    assert typed.stop_loss is None
+    assert typed.trailing_stop is None
+
+
+def test_signal_capture_test_command_reuses_walk_forward_machinery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: list[str] = []
+    connections = _install_walk_forward(monkeypatch, tmp_path, ["completed", "completed"], captured)
+
+    assert cli.main(["signal-capture-test", "--symbols", "AAA"]) == int(ExitCode.SUCCESS)
+
+    output = capsys.readouterr().out
+    assert "Signal-capture diagnostic" in output
+    assert "Strong-Candidate-only entry" in output
+    assert len(captured) == 1
+    assert captured[0].startswith("wf-signalcapture-")
+    assert connections[0].commits == 1
     assert connections[0].closed is True
 
 
@@ -1228,4 +1299,107 @@ def test_predict_command_rejects_nonpositive_horizon_days(
     _install_predict_startup(monkeypatch, tmp_path)
     with pytest.raises(SystemExit) as exc_info:
         cli.main(["predict", "--symbols", "AAPL", "--horizon-days", "0"])
+    assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)
+
+
+def test_predict_v4_command_reports_insufficient_data(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from stock_scrapper.prediction.gbm_service import GbmPredictionRunResult
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cli, "run_gbm_prediction",
+        lambda *_args, **_kwargs: GbmPredictionRunResult(
+            status="insufficient_data", message="Not enough history.", as_of_date="2026-01-01", horizon_days=21,
+        ),
+    )
+
+    assert cli.main(["predict-v4", "--symbols", "AAPL"]) == int(ExitCode.MISSING_DATA)
+
+
+def test_predict_v4_command_reports_feature_importances_and_ranked_predictions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from stock_scrapper.prediction.gbm_service import (
+        GbmPredictionRunResult,
+        GbmWalkForwardFold,
+        SymbolExcessReturnPrediction,
+    )
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    result = GbmPredictionRunResult(
+        status="ok",
+        message=None,
+        as_of_date="2026-01-01",
+        horizon_days=21,
+        training_samples=400,
+        holdout_samples=100,
+        training_start_date="2023-01-01",
+        training_end_date="2025-11-01",
+        holdout_mse=0.018,
+        holdout_mean_absolute_error=0.09,
+        holdout_information_coefficient=0.04,
+        baseline_mse=0.021,
+        walk_forward_folds=[
+            GbmWalkForwardFold(1, 200, 50, mse=0.018, mean_absolute_error=0.09, information_coefficient=0.03),
+            GbmWalkForwardFold(2, 300, 50, mse=0.017, mean_absolute_error=0.08, information_coefficient=0.05),
+        ],
+        feature_importances=[("six_month_return", 0.62), ("beta", 0.28), ("atr_percentage", 0.10)],
+        predictions=[
+            SymbolExcessReturnPrediction("AAPL", 0.021, None),
+            SymbolExcessReturnPrediction("MSFT", -0.005, None),
+            SymbolExcessReturnPrediction("ZZZZ", None, "One or more required indicators are unavailable"),
+        ],
+    )
+    monkeypatch.setattr(cli, "run_gbm_prediction", lambda *_args, **_kwargs: result)
+
+    assert cli.main(["predict-v4", "--symbols", "AAPL", "MSFT", "ZZZZ"]) == int(ExitCode.SUCCESS)
+    captured = capsys.readouterr()
+    assert "EXPERIMENTAL STATISTICAL FORECAST" in captured.err
+    assert "Walk-forward holdout MSE: 0.018000" in captured.out
+    assert "fold 1: train" in captured.out
+    assert "six_month_return" in captured.out and "62.0%" in captured.out
+    lines = captured.out.splitlines()
+    aapl_line = next(line for line in lines if line.strip().startswith("AAPL"))
+    msft_line = next(line for line in lines if line.strip().startswith("MSFT"))
+    zzzz_line = next(line for line in lines if line.strip().startswith("ZZZZ"))
+    assert lines.index(aapl_line) < lines.index(msft_line) < lines.index(zzzz_line)
+    assert "+2.10%" in aapl_line
+    assert "unavailable" in zzzz_line
+
+
+def test_predict_v4_command_horizon_days_override_replaces_config_value(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from stock_scrapper.prediction.gbm_service import GbmPredictionRunResult
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    captured_rules: dict[str, Any] = {}
+
+    def _fake_run_gbm_prediction(*_args: Any, **kwargs: Any) -> GbmPredictionRunResult:
+        captured_rules.update(kwargs["rules"])
+        return GbmPredictionRunResult(
+            status="insufficient_data", message="x", as_of_date="2026-01-01",
+            horizon_days=kwargs["rules"]["horizon_days"],
+        )
+
+    monkeypatch.setattr(cli, "run_gbm_prediction", _fake_run_gbm_prediction)
+
+    cli.main(["predict-v4", "--symbols", "AAPL", "--horizon-days", "5"])
+
+    assert captured_rules["horizon_days"] == 5
+
+
+def test_predict_v4_command_rejects_nonpositive_horizon_days(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_predict_startup(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["predict-v4", "--symbols", "AAPL", "--horizon-days", "0"])
     assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)
