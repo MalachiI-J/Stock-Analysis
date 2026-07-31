@@ -31,6 +31,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "recent_overlap_sessions": 10, "corporate_action_refresh_sessions": 90,
         "scheduled_full_refresh_days": 7,
     },
+    "edgar": {
+        # SEC's fair-use policy requires every request to identify a real contact,
+        # not a hard API key — see https://www.sec.gov/os/webmaster-faq#developers.
+        "user_agent": "Stock Scraper Research",
+        "timeout_seconds": 20,
+        "max_retries": 3,
+        "retry_delay_seconds": 2,
+    },
     "universes": {
         "candidates": [
             "AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "TSLA", "JPM", "WMT", "XOM",

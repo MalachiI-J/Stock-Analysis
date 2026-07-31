@@ -232,6 +232,245 @@ def test_phase2_report_contains_complete_offline_research_content(tmp_path: Path
     assert "9999" not in content
 
 
+def _signal_validation_payload(**bucket_overrides: dict[str, object]) -> dict[str, object]:
+    strong_candidate = {
+        "classification": "Strong Candidate",
+        "sample_size": 4200,
+        "distinct_symbols": 20,
+        "hit_rate": 0.55,
+        "mean_excess_return": 0.0099,
+        "symbol_mean_excess_return": 0.0099,
+        "symbol_mean_excess_return_ci_low": 0.0001,
+        "symbol_mean_excess_return_ci_high": 0.0142,
+        "concentration_warning": False,
+    }
+    strong_candidate.update(bucket_overrides.get("Strong Candidate", {}))
+    high_risk = {
+        "classification": "High Risk",
+        "sample_size": 3100,
+        "distinct_symbols": 20,
+        "hit_rate": 0.61,
+        "mean_excess_return": 0.0324,
+        "symbol_mean_excess_return": 0.0324,
+        "symbol_mean_excess_return_ci_low": 0.0182,
+        "symbol_mean_excess_return_ci_high": 0.0448,
+        "concentration_warning": False,
+    }
+    high_risk.update(bucket_overrides.get("High Risk", {}))
+    return {
+        "backtest_run_id": "backtest-test-signalvalidation-001",
+        "horizon_days": 21,
+        "benchmark_symbol": "SPY",
+        "buckets": [strong_candidate, high_risk],
+    }
+
+
+def test_phase2_report_omits_signal_validation_notice_when_no_artifact_present(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "Historical signal validation" not in content
+
+
+def test_phase2_report_surfaces_latest_signal_validation_summary(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    (tmp_path / "signal_validation_backtest-test-signalvalidation-001.json").write_text(
+        json.dumps(_signal_validation_payload()), encoding="utf-8",
+    )
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "Historical signal validation (Strong Candidate)" in content
+    assert "Historical signal validation (High Risk)" in content
+    assert "+0.99%" in content
+    assert "+3.24%" in content
+    assert "95% CI [+0.01%, +1.42%]" in content
+    assert "95% CI [+1.82%, +4.48%]" in content
+    assert "backtest-test-signalvalidation-001" in content
+    assert "not a live prediction for the symbols ranked below, and not a recommendation" in content
+    # Placed near each ranking section, not just anywhere in the document.
+    assert content.index("Candidate Ranking") < content.index("Historical signal validation (Strong Candidate)") < content.index("Highest-Risk Ranking")
+    assert content.index("Highest-Risk Ranking") < content.index("Historical signal validation (High Risk)")
+
+
+def test_phase2_report_signal_validation_notice_flags_concentration_warning(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    payload = _signal_validation_payload(**{"High Risk": {"concentration_warning": True, "distinct_symbols": 2}})
+    (tmp_path / "signal_validation_backtest-test-signalvalidation-002.json").write_text(
+        json.dumps(payload), encoding="utf-8",
+    )
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "treat it as anecdote, not a broad pattern" in content
+
+
+def test_phase2_report_ignores_unparseable_signal_validation_artifact(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    (tmp_path / "signal_validation_broken.json").write_text("not json", encoding="utf-8")
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "Historical signal validation" not in content
+
+
+def _recommendations_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "as_of_date": "2024-12-31",
+        "account_value": 10000.0,
+        "available_cash": 8500.0,
+        "open_position_count": 1,
+        "recommendations": [
+            {
+                "symbol": "NVDA", "action": "BUY", "shares": 10.0, "estimated_dollars": 500.0,
+                "reason": "Strong trend", "model_probability": 0.6,
+                "predict_v5_excess_return": 0.234, "predict_v5_low_confidence": True,
+            },
+        ],
+        "skipped": ["AAPL: no current price available"],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_phase2_report_nav_bar_links_to_recommendations(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert '<a href="#recommendations">Recommendations</a>' in content
+    assert '<h2 id="recommendations">' in content
+
+
+def test_phase2_report_shows_placeholder_when_no_recommendations_artifact_present(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "run <span class=\"mono\">python main.py recommend</span> first" in content
+
+
+def test_phase2_report_surfaces_latest_recommendations_summary(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(
+        json.dumps(_recommendations_payload()), encoding="utf-8",
+    )
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "NVDA" in content
+    assert "model 60% beats benchmark" in content
+    assert "predict-v5 +23.4%" in content
+    assert "LOW CONFIDENCE" in content
+    assert "AAPL: no current price available" in content
+    assert "Account value $10,000.00" in content
+    # Placed right after Market Regime, before Candidate Ranking.
+    assert content.index("Market Regime") < content.index("Today's Recommendations") < content.index("Candidate Ranking")
+
+
+def test_phase2_report_uses_recommendations_matching_this_exact_report_date(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    (tmp_path / "recommendations_2024-12-30.summary.json").write_text(
+        json.dumps(_recommendations_payload(as_of_date="2024-12-30")), encoding="utf-8",
+    )
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "NVDA" not in content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
+
+
+def test_phase2_report_ignores_unparseable_recommendations_artifact(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text("not json", encoding="utf-8")
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "run <span class=\"mono\">python main.py recommend</span> first" in content
+
+
+def test_phase2_report_recommendations_render_as_cards_not_a_table(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(
+        json.dumps(_recommendations_payload()), encoding="utf-8",
+    )
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
+    assert '<div class="rec-list">' in section
+    assert '<div class="rec-card">' in section
+    assert "<table>" not in section
+    assert "NVDA" in section.split('<span class="mono rec-symbol">')[1].split("</span>")[0]
+    assert "10 sh &middot; $500.00" in section
+
+
+def test_phase2_report_recommendations_context_line_colored_by_predict_v5_sign(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    payload = _recommendations_payload(recommendations=[
+        {
+            "symbol": "NVDA", "action": "BUY", "shares": 10.0, "estimated_dollars": 500.0,
+            "reason": "Strong trend", "predict_v5_excess_return": 0.05, "predict_v5_low_confidence": False,
+        },
+        {
+            "symbol": "KO", "action": "BUY", "shares": 5.0, "estimated_dollars": 200.0,
+            "reason": "Defensive pick", "predict_v5_excess_return": -0.03, "predict_v5_low_confidence": False,
+        },
+        {
+            "symbol": "BAC", "action": "BUY", "shares": 8.0, "estimated_dollars": 300.0,
+            "reason": "Financials", "model_probability": 0.55,
+        },
+    ])
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
+    assert 'class="rec-context mono delta-good">predict-v5 +5.0%' in section
+    assert 'class="rec-context mono delta-critical">predict-v5 -3.0%' in section
+    assert 'class="rec-context mono delta-neutral">model 55% beats benchmark' in section
+
+
+def test_phase2_report_ranking_tables_use_accent_edge_not_badge_pill(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    candidate_section = content.split('id="candidates"')[1].split('id="highest-risk"')[0]
+    risk_section = content.split('id="highest-risk"')[1].split('id="changes"')[0]
+    # AAPL is "Strong Candidate" (good) and ranked #1 in both tables' shared pool.
+    assert 'data-status="good"' in candidate_section
+    assert '<td class="status-good">Strong Candidate</td>' in candidate_section
+    # TSLA is "High Risk" (critical).
+    assert 'data-status="critical"' in risk_section
+    assert '<td class="status-critical">High Risk</td>' in risk_section
+    # No more filled badge pill for classification in either ranking table.
+    assert "badge-good" not in candidate_section and "badge-critical" not in risk_section
+
+
+def test_phase2_report_changes_table_classification_badges_are_unchanged(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    changes_section = content.split("Changes From Previous Stored Analysis")[1].split("Data-Quality Concerns")[0]
+    assert 'class="badge badge-good">Strong Candidate' in changes_section
+    assert "data-status" not in changes_section
+
+
 def test_phase2_report_is_deterministic_when_generation_metadata_is_fixed(tmp_path: Path) -> None:
     metadata, results, histories, issues, previous = _report_inputs()
 

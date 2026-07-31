@@ -201,6 +201,31 @@ def test_build_recommendations_attaches_model_probability_to_buys() -> None:
     assert result.recommendations[0].model_probability == 0.63
 
 
+def test_build_recommendations_attaches_predict_v5_context_to_buys() -> None:
+    results = {"NVDA": _result("NVDA", "Strong Candidate")}
+    result = build_recommendations(
+        as_of_date="2026-01-15", results_by_symbol=results, holdings=[], positions=[],
+        lots=[], sales=[], latest_price_by_symbol={"NVDA": 50.0}, rules=_rules(),
+        predict_v5_excess_return_by_symbol={"NVDA": 0.12},
+        predict_v5_low_confidence_by_symbol={"NVDA": True},
+    )
+    buy = result.recommendations[0]
+    assert buy.predict_v5_excess_return == 0.12
+    assert buy.predict_v5_low_confidence is True
+
+
+def test_build_recommendations_defaults_predict_v5_low_confidence_to_false() -> None:
+    results = {"NVDA": _result("NVDA", "Strong Candidate")}
+    result = build_recommendations(
+        as_of_date="2026-01-15", results_by_symbol=results, holdings=[], positions=[],
+        lots=[], sales=[], latest_price_by_symbol={"NVDA": 50.0}, rules=_rules(),
+        predict_v5_excess_return_by_symbol={"NVDA": 0.05},
+    )
+    buy = result.recommendations[0]
+    assert buy.predict_v5_excess_return == 0.05
+    assert buy.predict_v5_low_confidence is False
+
+
 def test_build_recommendations_reports_account_value_and_available_cash() -> None:
     holding = HoldingAssessment(
         symbol="AAPL", shares=10.0, average_cost_basis=100.0, latest_price=110.0,
@@ -233,6 +258,21 @@ def test_render_recommendations_text_includes_buys_sells_and_disclaimer() -> Non
     assert "BUY — 1" in text and "NVDA" in text and "model: 60% beats benchmark" in text
     assert "SELL — 0" in text and "None" in text
     assert "not investment advice" in text.lower()
+
+
+def test_render_recommendations_text_includes_predict_v5_context_and_low_confidence_flag() -> None:
+    results = {"NVDA": _result("NVDA", "Strong Candidate")}
+    result = build_recommendations(
+        as_of_date="2026-01-15", results_by_symbol=results, holdings=[], positions=[],
+        lots=[], sales=[], latest_price_by_symbol={"NVDA": 50.0}, rules=_rules(),
+        predict_v5_excess_return_by_symbol={"NVDA": 0.234},
+        predict_v5_low_confidence_by_symbol={"NVDA": True},
+    )
+
+    text = render_recommendations_text(result)
+
+    assert "predict-v5: +23.4% predicted excess return" in text
+    assert "[LOW CONFIDENCE]" in text
 
 
 def test_render_recommendations_text_lists_skipped_candidates() -> None:

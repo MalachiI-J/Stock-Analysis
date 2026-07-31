@@ -4,7 +4,7 @@ import json
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator
@@ -19,6 +19,9 @@ from stock_scrapper.models.analysis_models import AnalysisResult
 
 class _Logger:
     def info(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def warning(self, *args: Any, **kwargs: Any) -> None:
         pass
 
     def exception(self, *args: Any, **kwargs: Any) -> None:
@@ -49,6 +52,7 @@ class _Connection:
 class _BacktestConfigStub:
     benchmark: str = "SPY"
     warm_up_days: int = 99
+    strategy_version: str = "1.1.0"
 
     @property
     def walk_forward(self) -> SimpleNamespace:
@@ -58,7 +62,10 @@ class _BacktestConfigStub:
         return {"benchmark": self.benchmark, "strategy_name": "score_v1"}
 
     def with_overrides(self, **overrides: Any) -> SimpleNamespace:
-        return SimpleNamespace(benchmark=self.benchmark, **overrides)
+        merged = {"benchmark": self.benchmark, "strategy_name": "score_v1", **overrides}
+        result = SimpleNamespace(**merged)
+        result.to_dict = lambda: merged
+        return result
 
 
 def _config(tmp_path: Path) -> dict[str, Any]:
@@ -351,6 +358,73 @@ def test_insufficient_walk_forward_history_uses_missing_data_exit_code(
     assert connections[0].closed is True
 
 
+def test_signal_capture_config_disables_early_exits_and_forces_holding_period(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class _CapturingStub(_BacktestConfigStub):
+        def with_overrides(self, **overrides: Any) -> SimpleNamespace:
+            captured.update(overrides)
+            return super().with_overrides(**overrides)
+
+    monkeypatch.setattr(cli, "_backtest_config", lambda _base_dir, _args: _CapturingStub())
+
+    cli._signal_capture_config(Path("."), SimpleNamespace(strategy="score_v1"), 21)
+
+    assert captured["entry_thresholds"]["classifications"] == ["Strong Candidate"]
+    assert captured["entry_thresholds"]["minimum_opportunity_score"] == 0.0
+    assert captured["entry_thresholds"]["minimum_average_dollar_volume"] == 0.0
+    assert captured["exit_thresholds"]["classifications"] == ["Data Blocked"]
+    assert captured["exit_thresholds"]["maximum_risk_score"] == 100.0
+    assert captured["exit_thresholds"]["exit_below_sma200"] is False
+    assert captured["exit_thresholds"]["exit_on_stress"] is False
+    assert captured["stop_loss"] is None
+    assert captured["trailing_stop"] is None
+    assert captured["profit_target"] is None
+    assert captured["maximum_holding_period"] == 21
+    assert captured["minimum_confidence"] == 0.0
+    assert captured["maximum_risk"] == 100.0
+    assert "Risk-Off" in captured["allowed_market_regimes"]
+    assert captured["strategy_version"] == "1.1.0-signal-capture-diagnostic"
+
+
+def test_signal_capture_config_passes_real_schema_validation() -> None:
+    """Exercises the REAL BacktestConfig.with_overrides/validate_backtesting_config —
+    the stubbed tests above never run real validation, and an earlier version of
+    _signal_capture_config passed an empty exit_thresholds.classifications list that
+    only a real validation pass ever caught (ValueError: must be a non-empty list)."""
+    repo_root = Path(__file__).resolve().parent.parent
+    args = SimpleNamespace(strategy="score_v1", symbols=None, start=None, end=None)
+
+    typed = cli._signal_capture_config(repo_root, args, 21)
+
+    assert typed.entry_thresholds.classifications == ("Strong Candidate",)
+    assert typed.exit_thresholds.classifications == ("Data Blocked",)
+    assert typed.maximum_holding_period == 21
+    assert typed.stop_loss is None
+    assert typed.trailing_stop is None
+
+
+def test_signal_capture_test_command_reuses_walk_forward_machinery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: list[str] = []
+    connections = _install_walk_forward(monkeypatch, tmp_path, ["completed", "completed"], captured)
+
+    assert cli.main(["signal-capture-test", "--symbols", "AAA"]) == int(ExitCode.SUCCESS)
+
+    output = capsys.readouterr().out
+    assert "Signal-capture diagnostic" in output
+    assert "Strong-Candidate-only entry" in output
+    assert len(captured) == 1
+    assert captured[0].startswith("wf-signalcapture-")
+    assert connections[0].commits == 1
+    assert connections[0].closed is True
+
+
 def test_walk_forward_children_use_walk_forward_warmup_and_deferred_commit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -566,6 +640,81 @@ def test_digest_command_no_save_skips_file(
     assert not (tmp_path / "reports" / "digest_2024-12-31.summary.json").exists()
 
 
+def test_dashboard_command_writes_html_without_recommend_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    _install_digest_saved_run(monkeypatch)
+
+    assert cli.main(["dashboard", "--run-id", "saved-run"]) == int(ExitCode.SUCCESS)
+
+    target = tmp_path / "reports" / "dashboard_2024-12-31.html"
+    assert target.exists()
+    html = target.read_text(encoding="utf-8")
+    assert "AAA" in html and "BBB" in html
+    assert "python main.py recommend</span> first" in html
+    captured = capsys.readouterr()
+    assert "Dashboard:" in captured.out
+
+
+def test_dashboard_command_reads_existing_recommend_summary_without_recomputing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    _install_digest_saved_run(monkeypatch)
+
+    def _fail_if_called(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("dashboard must not recompute recommend/predict-v5")
+
+    monkeypatch.setattr(cli, "build_recommendations", _fail_if_called)
+    monkeypatch.setattr(cli, "run_gbm_prediction", _fail_if_called)
+
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    summary_payload = {
+        "as_of_date": "2024-12-31", "account_value": 10000.0, "available_cash": 8500.0,
+        "open_position_count": 1,
+        "recommendations": [
+            {
+                "symbol": "NVDA", "action": "BUY", "shares": 10.0, "estimated_dollars": 500.0,
+                "reason": "Strong trend", "model_probability": 0.6,
+                "predict_v5_excess_return": 0.234, "predict_v5_low_confidence": True,
+            }
+        ],
+        "skipped": [],
+    }
+    (reports_dir / "recommendations_2024-12-31.summary.json").write_text(
+        json.dumps(summary_payload), encoding="utf-8"
+    )
+
+    assert cli.main(["dashboard", "--run-id", "saved-run"]) == int(ExitCode.SUCCESS)
+
+    html = (reports_dir / "dashboard_2024-12-31.html").read_text(encoding="utf-8")
+    assert "NVDA" in html
+    assert "predict-v5 +23.4%" in html
+    assert "LOW CONFIDENCE" in html
+
+
+def test_dashboard_command_links_to_existing_phase2_report(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    _install_digest_saved_run(monkeypatch)
+
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "stock_summary_2024-12-31_candidates_abc123.html").write_text("<html></html>", encoding="utf-8")
+
+    assert cli.main(["dashboard", "--run-id", "saved-run"]) == int(ExitCode.SUCCESS)
+
+    html = (reports_dir / "dashboard_2024-12-31.html").read_text(encoding="utf-8")
+    assert 'href="stock_summary_2024-12-31_candidates_abc123.html"' in html
+
+
 def test_digest_command_includes_holdings_section(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -721,6 +870,7 @@ def test_cleanup_logs_include_reports_deletes_only_unreferenced_patterns(
         reports_dir / "digest_2024-01-01.summary.json",
         reports_dir / "recommendations_2024-01-01.txt",
         reports_dir / "recommendations_2024-01-01.summary.json",
+        reports_dir / "dashboard_2024-01-01.html",
         reports_dir / "data_health_2024-01-01.json",
         reports_dir / "data_health_2024-01-01.html",
         reports_dir / "stock_summary_2024-01-01_screen-abc12345.csv",
@@ -751,7 +901,7 @@ def test_cleanup_logs_include_reports_deletes_only_unreferenced_patterns(
         assert path.exists(), f"{path} must never be deleted"
     assert recent_digest.exists()
     captured = capsys.readouterr()
-    assert "Deleted 8 unreferenced report file(s)" in captured.out
+    assert "Deleted 9 unreferenced report file(s)" in captured.out
 
 
 def test_cleanup_logs_without_include_reports_leaves_reports_alone(
@@ -916,8 +1066,66 @@ def test_recommend_command_writes_sized_buy_recommendation(
         {
             "symbol": "AAA", "action": "BUY", "shares": 10.0,
             "estimated_dollars": 500.0, "reason": "Strong trend", "model_probability": None,
+            "predict_v5_excess_return": None, "predict_v5_low_confidence": False,
         }
     ]
+
+
+def test_recommend_command_attaches_predict_v5_context_to_buy_recommendations(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from stock_scrapper.database import create_connection, initialize_database, upsert_price_history
+    from stock_scrapper.prediction.service import PredictionRunResult
+    from stock_scrapper.prediction.gbm_service import GbmPredictionRunResult, SymbolExcessReturnPrediction
+
+    _install_startup(monkeypatch, tmp_path)
+    _install_recommend_saved_run(monkeypatch)
+    _install_recommend_trading_rules(monkeypatch)
+    config = _config(tmp_path)
+    initialize_database(config["database_path"])
+    conn = create_connection(config["database_path"])
+    try:
+        upsert_price_history(conn, _seed_price_row("AAA", "2024-12-31", 50.0))
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(
+        cli, "load_prediction_rules",
+        lambda _base_dir: {"predict_v5": {"feature_keys": ["rsi_14"], "gbm": None}},
+    )
+    monkeypatch.setattr(cli, "load_universes", lambda _config: {
+        "candidates": ["AAA", "BBB"], "benchmark": "SPY", "market_context": ["SPY"], "defensive_context": [],
+    })
+    monkeypatch.setattr(cli, "load_scoring_rules", lambda _base_dir: {"scoring_version": "test"})
+    monkeypatch.setattr(cli, "AnalysisService", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        cli, "run_prediction",
+        lambda *_args, **_kwargs: PredictionRunResult(
+            status="ok", message=None, as_of_date="2024-12-31", horizon_days=21,
+        ),
+    )
+    monkeypatch.setattr(
+        cli, "run_gbm_prediction",
+        lambda *_args, **_kwargs: GbmPredictionRunResult(
+            status="ok", message=None, as_of_date="2024-12-31", horizon_days=21,
+            training_samples=10, holdout_samples=5,
+            predictions=[SymbolExcessReturnPrediction("AAA", 0.234, None, True)],
+        ),
+    )
+
+    assert cli.main(["recommend", "--run-id", "saved-run"]) == int(ExitCode.SUCCESS)
+
+    captured = capsys.readouterr()
+    assert "predict-v5: +23.4% predicted excess return" in captured.out
+    assert "[LOW CONFIDENCE]" in captured.out
+
+    summary_path = tmp_path / "reports" / "recommendations_2024-12-31.summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["recommendations"][0]["predict_v5_excess_return"] == 0.234
+    assert summary["recommendations"][0]["predict_v5_low_confidence"] is True
 
 
 def test_recommend_command_no_save_skips_file(
@@ -1025,7 +1233,7 @@ def _install_startup_with_real_watchlist(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     watchlist: list[str],
-) -> None:
+) -> dict[str, Any]:
     # Unlike _install_startup, this leaves load_watchlist unstubbed so a
     # separately loaded screening-universe CSV is read for real too (the
     # blanket stub would otherwise intercept both calls identically).
@@ -1036,6 +1244,7 @@ def _install_startup_with_real_watchlist(
     monkeypatch.setattr(cli, "load_config", lambda _base_dir: config)
     monkeypatch.setattr(cli, "ensure_directories", lambda _config: None)
     monkeypatch.setattr(cli, "setup_logging", lambda _config, run_id: _Logger())
+    return config
 
 
 def test_screen_command_reports_no_new_symbols(
@@ -1095,6 +1304,63 @@ def test_screen_command_reports_new_candidates(
     assert "Screener report: s.html" in captured.out
 
 
+def test_warn_if_screening_universe_stale_warns_past_threshold(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stale_date = (date.today() - timedelta(days=200)).isoformat()
+    cli._warn_if_screening_universe_stale(
+        {"screening": {"universe_last_verified": stale_date, "staleness_warning_days": 180}}
+    )
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert "screening_universe.csv" in captured.err
+    assert stale_date in captured.err
+
+
+def test_warn_if_screening_universe_stale_silent_within_threshold(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    recent_date = (date.today() - timedelta(days=10)).isoformat()
+    cli._warn_if_screening_universe_stale(
+        {"screening": {"universe_last_verified": recent_date, "staleness_warning_days": 180}}
+    )
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_warn_if_screening_universe_stale_silent_when_setting_missing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli._warn_if_screening_universe_stale({})
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_warn_if_screening_universe_stale_silent_when_malformed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli._warn_if_screening_universe_stale({"screening": {"universe_last_verified": "not-a-date"}})
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_screen_command_prints_staleness_warning_when_configured_stale(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = _install_startup_with_real_watchlist(monkeypatch, tmp_path, ["AAPL", "MSFT"])
+    stale_date = (date.today() - timedelta(days=200)).isoformat()
+    config["screening"] = {"universe_last_verified": stale_date, "staleness_warning_days": 180}
+
+    universe_path = tmp_path / "screening_universe.csv"
+    universe_path.write_text("symbol\nAAPL\nMSFT\n", encoding="utf-8")
+
+    assert cli.main(["screen", "--universe-path", str(universe_path)]) == int(ExitCode.SUCCESS)
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err and "screening_universe.csv" in captured.err
+
+
 def test_screen_command_update_failure_raises_operation_failed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1131,6 +1397,7 @@ def _install_predict_startup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     monkeypatch.setattr(cli, "initialize_database", lambda _path: None)
     monkeypatch.setattr(cli, "create_connection", lambda _path: _Connection())
     monkeypatch.setattr(cli, "fetch_price_history", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cli, "fetch_fundamentals", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cli, "AnalysisService", lambda *_args, **_kwargs: object())
 
 
@@ -1229,3 +1496,303 @@ def test_predict_command_rejects_nonpositive_horizon_days(
     with pytest.raises(SystemExit) as exc_info:
         cli.main(["predict", "--symbols", "AAPL", "--horizon-days", "0"])
     assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)
+
+
+def test_predict_v4_command_reports_insufficient_data(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from stock_scrapper.prediction.gbm_service import GbmPredictionRunResult
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cli, "run_gbm_prediction",
+        lambda *_args, **_kwargs: GbmPredictionRunResult(
+            status="insufficient_data", message="Not enough history.", as_of_date="2026-01-01", horizon_days=21,
+        ),
+    )
+
+    assert cli.main(["predict-v4", "--symbols", "AAPL"]) == int(ExitCode.MISSING_DATA)
+
+
+def test_predict_v4_command_reports_feature_importances_and_ranked_predictions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from stock_scrapper.prediction.gbm_service import (
+        GbmPredictionRunResult,
+        GbmWalkForwardFold,
+        SymbolExcessReturnPrediction,
+    )
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    result = GbmPredictionRunResult(
+        status="ok",
+        message=None,
+        as_of_date="2026-01-01",
+        horizon_days=21,
+        training_samples=400,
+        holdout_samples=100,
+        training_start_date="2023-01-01",
+        training_end_date="2025-11-01",
+        holdout_mse=0.018,
+        holdout_mean_absolute_error=0.09,
+        holdout_information_coefficient=0.04,
+        baseline_mse=0.021,
+        walk_forward_folds=[
+            GbmWalkForwardFold(1, 200, 50, mse=0.018, mean_absolute_error=0.09, information_coefficient=0.03),
+            GbmWalkForwardFold(2, 300, 50, mse=0.017, mean_absolute_error=0.08, information_coefficient=0.05),
+        ],
+        feature_importances=[("six_month_return", 0.62), ("beta", 0.28), ("atr_percentage", 0.10)],
+        predictions=[
+            SymbolExcessReturnPrediction("AAPL", 0.021, None),
+            SymbolExcessReturnPrediction("MSFT", -0.005, None),
+            SymbolExcessReturnPrediction("ZZZZ", None, "One or more required indicators are unavailable"),
+        ],
+    )
+    monkeypatch.setattr(cli, "run_gbm_prediction", lambda *_args, **_kwargs: result)
+
+    assert cli.main(["predict-v4", "--symbols", "AAPL", "MSFT", "ZZZZ"]) == int(ExitCode.SUCCESS)
+    captured = capsys.readouterr()
+    assert "EXPERIMENTAL STATISTICAL FORECAST" in captured.err
+    assert "Walk-forward holdout MSE: 0.018000" in captured.out
+    assert "fold 1: train" in captured.out
+    assert "six_month_return" in captured.out and "62.0%" in captured.out
+    lines = captured.out.splitlines()
+    aapl_line = next(line for line in lines if line.strip().startswith("AAPL"))
+    msft_line = next(line for line in lines if line.strip().startswith("MSFT"))
+    zzzz_line = next(line for line in lines if line.strip().startswith("ZZZZ"))
+    assert lines.index(aapl_line) < lines.index(msft_line) < lines.index(zzzz_line)
+    assert "+2.10%" in aapl_line
+    assert "unavailable" in zzzz_line
+
+
+def test_predict_v4_command_horizon_days_override_replaces_config_value(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from stock_scrapper.prediction.gbm_service import GbmPredictionRunResult
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    captured_rules: dict[str, Any] = {}
+
+    def _fake_run_gbm_prediction(*_args: Any, **kwargs: Any) -> GbmPredictionRunResult:
+        captured_rules.update(kwargs["rules"])
+        return GbmPredictionRunResult(
+            status="insufficient_data", message="x", as_of_date="2026-01-01",
+            horizon_days=kwargs["rules"]["horizon_days"],
+        )
+
+    monkeypatch.setattr(cli, "run_gbm_prediction", _fake_run_gbm_prediction)
+
+    cli.main(["predict-v4", "--symbols", "AAPL", "--horizon-days", "5"])
+
+    assert captured_rules["horizon_days"] == 5
+
+
+def test_predict_v4_command_rejects_nonpositive_horizon_days(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_predict_startup(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["predict-v4", "--symbols", "AAPL", "--horizon-days", "0"])
+    assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)
+
+
+def test_predict_v5_command_reports_insufficient_data(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from stock_scrapper.prediction.gbm_service import GbmPredictionRunResult
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cli, "run_gbm_prediction",
+        lambda *_args, **_kwargs: GbmPredictionRunResult(
+            status="insufficient_data", message="Not enough history.", as_of_date="2026-01-01", horizon_days=21,
+        ),
+    )
+
+    assert cli.main(["predict-v5", "--symbols", "AAPL"]) == int(ExitCode.MISSING_DATA)
+
+
+def test_predict_v5_command_flags_low_confidence_predictions_in_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from stock_scrapper.prediction.gbm_service import GbmPredictionRunResult, SymbolExcessReturnPrediction
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    result = GbmPredictionRunResult(
+        status="ok", message=None, as_of_date="2026-01-01", horizon_days=252,
+        training_samples=10, holdout_samples=5,
+        predictions=[
+            SymbolExcessReturnPrediction("AAPL", 0.02, None, low_confidence=False),
+            SymbolExcessReturnPrediction("INTC", 2.6611, None, low_confidence=True),
+        ],
+    )
+    monkeypatch.setattr(cli, "run_gbm_prediction", lambda *_args, **_kwargs: result)
+
+    exit_code = cli.main(["predict-v5", "--symbols", "AAPL", "INTC"])
+
+    assert exit_code == int(ExitCode.SUCCESS)
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    aapl_line = next(line for line in lines if line.strip().startswith("AAPL"))
+    intc_line = next(line for line in lines if line.strip().startswith("INTC"))
+    assert "LOW CONFIDENCE" not in aapl_line
+    assert "+266.11%" in intc_line and "LOW CONFIDENCE" in intc_line
+
+
+def test_predict_v5_command_passes_predict_v5_feature_keys_and_fundamentals(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from stock_scrapper.prediction.gbm_service import GbmPredictionRunResult, SymbolExcessReturnPrediction
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    requested_symbols: list[str] = []
+
+    def _fake_fetch_fundamentals(_conn: Any, symbol: str) -> list[Any]:
+        requested_symbols.append(symbol)
+        return []
+
+    monkeypatch.setattr(cli, "fetch_fundamentals", _fake_fetch_fundamentals)
+    captured_kwargs: dict[str, Any] = {}
+
+    def _fake_run_gbm_prediction(*_args: Any, **kwargs: Any) -> GbmPredictionRunResult:
+        captured_kwargs.update(kwargs)
+        return GbmPredictionRunResult(
+            status="ok", message=None, as_of_date="2026-01-01", horizon_days=21,
+            training_samples=10, holdout_samples=5,
+            predictions=[SymbolExcessReturnPrediction("AAPL", 0.01, None)],
+        )
+
+    monkeypatch.setattr(cli, "run_gbm_prediction", _fake_run_gbm_prediction)
+
+    exit_code = cli.main(["predict-v5", "--symbols", "AAPL"])
+
+    assert exit_code == int(ExitCode.SUCCESS)
+    # predict-v5's own widened feature list (from config/prediction_rules.yaml's
+    # predict_v5.feature_keys) must be passed explicitly, not the base feature_keys.
+    assert "trailing_pe" in captured_kwargs["feature_keys"]
+    assert captured_kwargs["fundamentals_by_symbol"] == {"AAPL": []}
+    assert requested_symbols == ["AAPL"]
+    # predict-v5's own (heavier) regularization from config/prediction_rules.yaml's
+    # predict_v5.gbm section must be passed explicitly, not the shared gbm section.
+    assert captured_kwargs["gbm_config"]["min_samples_leaf"] == 200
+    captured = capsys.readouterr()
+    assert "model=predict-v5" in captured.out
+    assert "EXPERIMENTAL STATISTICAL FORECAST" in captured.err
+
+
+def test_predict_v5_command_horizon_days_override_replaces_config_value(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from stock_scrapper.prediction.gbm_service import GbmPredictionRunResult
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    captured_rules: dict[str, Any] = {}
+
+    def _fake_run_gbm_prediction(*_args: Any, **kwargs: Any) -> GbmPredictionRunResult:
+        captured_rules.update(kwargs["rules"])
+        return GbmPredictionRunResult(
+            status="insufficient_data", message="x", as_of_date="2026-01-01",
+            horizon_days=kwargs["rules"]["horizon_days"],
+        )
+
+    monkeypatch.setattr(cli, "run_gbm_prediction", _fake_run_gbm_prediction)
+
+    cli.main(["predict-v5", "--symbols", "AAPL", "--horizon-days", "5"])
+
+    assert captured_rules["horizon_days"] == 5
+
+
+def test_predict_v5_command_rejects_nonpositive_horizon_days(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_predict_startup(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["predict-v5", "--symbols", "AAPL", "--horizon-days", "0"])
+    assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)
+
+
+def test_collect_fundamentals_command_persists_records_and_reports_partial_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from stock_scrapper.database import create_connection
+
+    config = _config(tmp_path)
+    config["edgar"] = {
+        "user_agent": "Stock Scraper Research test@example.com",
+        "timeout_seconds": 5, "max_retries": 1, "retry_delay_seconds": 0,
+    }
+    monkeypatch.setattr(cli, "load_config", lambda _base_dir: config)
+    monkeypatch.setattr(cli, "ensure_directories", lambda _config: None)
+    monkeypatch.setattr(cli, "load_watchlist", lambda _path: ["AAPL", "MSFT"])
+    monkeypatch.setattr(cli, "setup_logging", lambda _config, run_id: _Logger())
+
+    # AAPL resolves to a CIK and returns one usable fact; MSFT has no CIK on file
+    # (mirrors a real symbol SEC doesn't recognize) and must be counted as failed,
+    # not silently skipped.
+    monkeypatch.setattr(cli, "fetch_ticker_cik_map", lambda **_kwargs: {"AAPL": "0000320193"})
+
+    def fake_fetch_company_facts(cik: str, **_kwargs: Any) -> dict[str, Any]:
+        assert cik == "0000320193"
+        return {
+            "facts": {
+                "us-gaap": {
+                    "NetIncomeLoss": {"units": {"USD": [
+                        {
+                            "start": "2023-10-01", "end": "2023-12-30", "val": 1000.0,
+                            "fy": 2024, "fp": "Q1", "form": "10-Q", "filed": "2024-02-01",
+                        },
+                    ]}},
+                },
+            },
+        }
+
+    monkeypatch.setattr(cli, "fetch_company_facts", fake_fetch_company_facts)
+
+    exit_code = cli.main(["collect-fundamentals", "--symbols", "AAPL", "MSFT"])
+
+    assert exit_code == int(ExitCode.PARTIAL_FAILURE)
+    captured = capsys.readouterr()
+    assert "fundamentals_upserted=1 symbols=2 failed=1" in captured.out
+    assert "failed_symbols=MSFT" in captured.out
+
+
+def test_collect_fundamentals_command_treats_zero_facts_as_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A resolved CIK that returns no usable facts at all (e.g. SEC's ticker file
+    once mapped "XOM" to an unrelated shell entity) must be surfaced as a failure,
+    not silently reported as a successful, empty collection."""
+    config = _config(tmp_path)
+    config["edgar"] = {
+        "user_agent": "Stock Scraper Research test@example.com",
+        "timeout_seconds": 5, "max_retries": 1, "retry_delay_seconds": 0,
+    }
+    monkeypatch.setattr(cli, "load_config", lambda _base_dir: config)
+    monkeypatch.setattr(cli, "ensure_directories", lambda _config: None)
+    monkeypatch.setattr(cli, "load_watchlist", lambda _path: ["XOM"])
+    monkeypatch.setattr(cli, "setup_logging", lambda _config, run_id: _Logger())
+    monkeypatch.setattr(cli, "fetch_ticker_cik_map", lambda **_kwargs: {"XOM": "0002115436"})
+    monkeypatch.setattr(cli, "fetch_company_facts", lambda *_args, **_kwargs: {"facts": {"us-gaap": {}}})
+
+    exit_code = cli.main(["collect-fundamentals", "--symbols", "XOM"])
+
+    assert exit_code == int(ExitCode.PARTIAL_FAILURE)
+    captured = capsys.readouterr()
+    assert "fundamentals_upserted=0 symbols=1 failed=1" in captured.out
+    assert "failed_symbols=XOM" in captured.out

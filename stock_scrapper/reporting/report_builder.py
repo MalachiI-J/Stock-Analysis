@@ -215,8 +215,14 @@ def write_phase2_reports(
     csv_path = output_path / f"stock_summary_{report_date_text}{suffix}.csv"
     html_path = output_path / f"stock_summary_{report_date_text}{suffix}.html"
     _write_phase2_csv(csv_path, csv_rows)
+    signal_validation = _latest_signal_validation_summary(output_path)
+    recommendations_summary = _latest_recommendations_summary(output_path, report_date_text)
     html_path.write_text(
-        _render_phase2_html(report_date_text, metadata, entries, candidate_order, risk_order, normalized_issues),
+        _render_phase2_html(
+            report_date_text, metadata, entries, candidate_order, risk_order, normalized_issues,
+            signal_validation=signal_validation,
+            recommendations_summary=recommendations_summary,
+        ),
         encoding="utf-8",
     )
     return {"csv": csv_path, "html": html_path}
@@ -440,10 +446,25 @@ _REPORT_STYLES = """\
     h2:target { color:var(--good-fg); transition:color 1.8s ease; }
     h4 { margin-bottom:6px; }
     table { width:100%; border-collapse:collapse; margin:12px 0 22px; }
-    th,td { border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; }
+    th,td { padding:11px 14px; text-align:left; vertical-align:top; }
+    td { border-bottom:1px solid var(--line); }
+    tbody tr:last-child td { border-bottom:none; }
+    table:not(.metadata) tbody tr:nth-child(even) td { background:var(--th-bg); }
+    table:not(.metadata) tbody tr:hover td { background:var(--hover-bg); }
     th { background:var(--th-bg); color:var(--ink-2); font-weight:600;
-      font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+      font-size:12px; text-transform:uppercase; letter-spacing:.04em; border-bottom:1px solid var(--border); }
     td.num, th.num { text-align:right; }
+    /* Accent-edge rows (Candidate/Highest-Risk ranking): the row's left border
+       plus plain colored classification text do the job a filled badge pill
+       used to do alone — see _ranking_table(). */
+    tbody tr[data-status] { border-left:3px solid var(--neutral-fg); }
+    tbody tr[data-status="good"] { border-left-color:var(--good-fg); }
+    tbody tr[data-status="warning"] { border-left-color:var(--warning-fg); }
+    tbody tr[data-status="serious"] { border-left-color:var(--serious-fg); }
+    tbody tr[data-status="critical"] { border-left-color:var(--critical-fg); }
+    .status-good { color:var(--good-fg); } .status-warning { color:var(--warning-fg); }
+    .status-serious { color:var(--serious-fg); } .status-critical { color:var(--critical-fg); }
+    .status-neutral { color:var(--neutral-fg); }
     .mono, td.num, .stat-value, .delta, code, .kv dd, .metadata td { font-family:var(--mono); font-variant-numeric:tabular-nums; }
     /* Shared key/value table style (used by the footer's run-details
        disclosure): hairline row separators only, no visible cell borders. */
@@ -462,11 +483,22 @@ _REPORT_STYLES = """\
     .card > table { margin:0; }
     .notice { padding:14px 16px; border:1px solid var(--border); border-left:3px solid var(--muted);
       background:var(--surface); color:var(--ink-2); border-radius:8px; margin:18px 0; }
+    .notice-good { border-left-color:var(--good-border); }
+    .notice-critical { border-left-color:var(--critical-border); }
     .regime-head { display:flex; align-items:center; gap:12px; }
     .regime-confidence { color:var(--ink-2); font-size:13px; font-family:var(--mono); }
     .card ul { list-style:none; margin:6px 0 0; padding:0; }
     .card ul li { position:relative; padding-left:16px; margin:4px 0; color:var(--ink); }
     .card ul li::before { content:"–"; position:absolute; left:0; color:var(--muted); }
+    /* One card per recommendation row (Buy/Sell) instead of a spreadsheet-style
+       table — no elevation on the individual cards, since they already sit
+       inside the section's own .card container. */
+    .rec-list { display:flex; flex-direction:column; gap:8px; }
+    .rec-card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:12px 16px; }
+    .rec-card-head { display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
+    .rec-symbol { font-size:15px; font-weight:600; }
+    .rec-reason { color:var(--muted); margin-top:4px; }
+    .rec-context { font-size:12.5px; margin-top:6px; }
     .badge { display:inline-flex; align-items:center; gap:5px; padding:3px 11px; border-radius:999px;
       font-size:13px; font-weight:600; border:1px solid transparent; white-space:nowrap; }
     .badge-good { color:var(--good-fg); background:var(--good-bg); border-color:var(--good-border); }
@@ -1144,6 +1176,181 @@ _THEME_SCRIPT = """\
 """
 
 
+def _latest_signal_validation_summary(reports_dir: Path) -> dict[str, Any] | None:
+    """Best-effort load of the most recent ``signal_validation_*.json`` artifact
+    (written by ``main.py validate-signals``) from the same reports directory.
+
+    ``validate-signals`` requires a fresh full-history backtest and is a manual,
+    occasional diagnostic (see README's "Evaluation honesty" section) — it is not
+    re-run as part of every daily report. This surfaces its latest known result as
+    a dated annotation rather than recomputing it, so the daily pipeline stays
+    fast. Returns ``None`` (silently — this is supplementary context, not core
+    report content) if no such artifact exists yet or it can't be parsed.
+    """
+    try:
+        candidates = sorted(
+            Path(reports_dir).glob("signal_validation_*.json"),
+            key=lambda path: path.stat().st_mtime,
+        )
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    try:
+        return json.loads(candidates[-1].read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _signal_validation_notice_html(summary: Mapping[str, Any] | None, classification: str) -> str:
+    """A dated callout summarizing one classification bucket's historical forward
+    excess return from the latest ``validate-signals`` run, if one is on file.
+
+    Framed deliberately as a descriptive, dataset-wide historical pattern — not a
+    live prediction for the specific symbols in today's ranking, and not a
+    recommendation. Mirrors the caveats ``render_signal_validation_text`` already
+    prints at the CLI (naive/descriptive p-values, concentration warnings).
+    """
+    if not isinstance(summary, Mapping):
+        return ""
+    bucket = next(
+        (
+            item
+            for item in summary.get("buckets") or []
+            if isinstance(item, Mapping) and item.get("classification") == classification
+        ),
+        None,
+    )
+    if not bucket or not bucket.get("sample_size"):
+        return ""
+    symbol_mean = bucket.get("symbol_mean_excess_return")
+    if symbol_mean is None:
+        return ""
+    ci_low = bucket.get("symbol_mean_excess_return_ci_low")
+    ci_high = bucket.get("symbol_mean_excess_return_ci_high")
+    ci_text = (
+        f"95% CI [{ci_low:+.2%}, {ci_high:+.2%}]"
+        if ci_low is not None and ci_high is not None
+        else "95% CI unavailable (fewer than 2 distinct symbols)"
+    )
+    horizon = summary.get("horizon_days")
+    benchmark = summary.get("benchmark_symbol")
+    run_id = summary.get("backtest_run_id")
+    status = "notice-critical" if _CLASSIFICATION_STATUS.get(classification) == "critical" else "notice-good"
+    concentration_note = ""
+    if bucket.get("concentration_warning"):
+        concentration_note = (
+            f" Fewer than {bucket.get('distinct_symbols')} distinct symbols back this figure — "
+            "treat it as anecdote, not a broad pattern."
+        )
+    return (
+        f'<div class="notice {status}">'
+        f"<strong>Historical signal validation ({_escape(classification)}):</strong> across "
+        f"{bucket.get('sample_size')} classified instance(s) ({bucket.get('distinct_symbols')} distinct symbol(s)) "
+        f"in the full backtested history, mean symbol-weighted forward {_escape(str(horizon))}-session excess "
+        f"return vs {_escape(str(benchmark))} was {symbol_mean:+.2%} ({ci_text})."
+        f"{concentration_note} This is a descriptive historical pattern across the whole dataset, from "
+        f"<span class=\"mono\">{_escape(str(run_id))}</span> — not a live prediction for the symbols ranked "
+        "below, and not a recommendation. See README's \"Evaluation honesty\" section."
+        "</div>"
+    )
+
+
+def _latest_recommendations_summary(reports_dir: Path, report_date: str) -> dict[str, Any] | None:
+    """Best-effort load of ``recommendations_<report_date>.summary.json`` (written by
+    ``main.py recommend``) from the same reports directory, for this exact report date.
+
+    Not recomputed here — ``recommend`` trains predict/predict-v5 from scratch, which
+    is comparatively slow, and duplicating that per report would meaningfully slow the
+    daily pipeline for no new information. Returns ``None`` (silently — this is
+    supplementary context, not core report content) if ``recommend`` hasn't been run
+    yet for this date or the file can't be parsed.
+    """
+    path = Path(reports_dir) / f"recommendations_{report_date}.summary.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _recommendations_section_html(summary: Mapping[str, Any] | None) -> str:
+    """Today's sized BUY/SELL suggestions from the latest ``recommend`` run, if one is
+    on file for this report date. Advisory only — nothing here has been bought or
+    sold, and model context (``predict``/``predict-v5``) is displayed information,
+    never a gate on any suggestion (see README's "Phase 6a" section).
+    """
+    if not isinstance(summary, Mapping):
+        return (
+            '<p class="muted">No recommendations_&lt;date&gt;.summary.json found for this date — '
+            'run <span class="mono">python main.py recommend</span> first.</p>'
+        )
+
+    def rows(items: list[Mapping[str, Any]]) -> str:
+        if not items:
+            return "<p>None today.</p>"
+        cards = []
+        for item in items:
+            context: list[str] = []
+            probability = item.get("model_probability")
+            if probability is not None:
+                context.append(f"model {probability:.0%} beats benchmark")
+            excess_return = item.get("predict_v5_excess_return")
+            if excess_return is not None:
+                flag = (
+                    ' <span class="badge badge-warning">LOW CONFIDENCE</span>'
+                    if item.get("predict_v5_low_confidence") else ""
+                )
+                context.append(f"predict-v5 {excess_return:+.1%}{flag}")
+            shares = _finite_number(item.get("shares"))
+            dollars = _finite_number(item.get("estimated_dollars"))
+            shares_text = "n/a" if shares is None else f"{shares:g}"
+            dollars_text = "n/a" if dollars is None else f"${dollars:,.2f}"
+            if excess_return is None or excess_return == 0:
+                context_status = "neutral"
+            else:
+                context_status = "good" if excess_return > 0 else "critical"
+            context_html = (
+                f'<div class="rec-context mono delta-{context_status}">{" &middot; ".join(context)}</div>'
+                if context else ""
+            )
+            cards.append(
+                '<div class="rec-card">'
+                '<div class="rec-card-head">'
+                f'<span class="mono rec-symbol">{_display(item.get("symbol"))}</span>'
+                f'<span class="mono">{shares_text} sh &middot; {dollars_text}</span>'
+                "</div>"
+                f'<div class="rec-reason">{_display(item.get("reason"))}</div>'
+                f"{context_html}"
+                "</div>"
+            )
+        return '<div class="rec-list">' + "".join(cards) + "</div>"
+
+    recommendations = summary.get("recommendations") or []
+    buys = [item for item in recommendations if isinstance(item, Mapping) and item.get("action") == "BUY"]
+    sells = [item for item in recommendations if isinstance(item, Mapping) and item.get("action") == "SELL"]
+    skipped = summary.get("skipped") or []
+    skipped_html = (
+        "<h4>Considered but not recommended</h4><ul>"
+        + "".join(f"<li>{_escape(entry)}</li>" for entry in skipped)
+        + "</ul>"
+        if skipped else ""
+    )
+    account_value = _finite_number(summary.get("account_value"))
+    available_cash = _finite_number(summary.get("available_cash"))
+    subtitle = (
+        f'<p class="subtitle">Account value ${account_value:,.2f} &nbsp;&middot;&nbsp; '
+        f"Available cash ${available_cash:,.2f} &nbsp;&middot;&nbsp; "
+        f"Open positions {_display(summary.get('open_position_count'))}</p>"
+        if account_value is not None and available_cash is not None else ""
+    )
+    return (
+        subtitle
+        + f'<h3>Buy — {len(buys)}</h3><div class="card">{rows(buys)}</div>'
+        + f'<h3>Sell — {len(sells)}</h3><div class="card">{rows(sells)}</div>'
+        + skipped_html
+    )
+
+
 def _render_phase2_html(
     report_date: str,
     metadata: dict[str, Any],
@@ -1151,10 +1358,13 @@ def _render_phase2_html(
     candidate_order: list[dict[str, Any]],
     risk_order: list[dict[str, Any]],
     quality_issues: list[dict[str, Any]],
+    signal_validation: Mapping[str, Any] | None = None,
+    recommendations_summary: Mapping[str, Any] | None = None,
 ) -> str:
     candidate_rank = {str(item.get("symbol", "")).upper(): rank for rank, item in enumerate(candidate_order, 1)}
     risk_rank = {str(item.get("symbol", "")).upper(): rank for rank, item in enumerate(risk_order, 1)}
     regime_reasons = _render_list(metadata.get("market_regime_reasons"), "No regime reasons were recorded.")
+    recommendations_html = _recommendations_section_html(recommendations_summary)
 
     # Report date, As-of date, and Benchmark live in the header subtitle now —
     # this footer only carries the run-identification fields that don't fit
@@ -1172,6 +1382,8 @@ def _render_phase2_html(
 
     candidate_html = _ranking_table(candidate_order, candidate_rank, empty_message="No Candidate or Strong Candidate results.")
     risk_html = _ranking_table(risk_order, risk_rank, empty_message="No measured risk scores were available.")
+    candidate_validation_html = _signal_validation_notice_html(signal_validation, "Strong Candidate")
+    risk_validation_html = _signal_validation_notice_html(signal_validation, "High Risk")
     detail_html = "".join(_result_section(entry) for entry in entries)
     changes_html = _changes_table(entries)
     quality_html = _quality_table(quality_issues)
@@ -1194,7 +1406,7 @@ def _render_phase2_html(
 {_market_hero_html()}
   <nav class="term-nav" aria-label="Report sections">
     <div class="term-nav-links">
-    <a href="#top">Home</a><a href="#candidates">Candidates</a>
+    <a href="#top">Home</a><a href="#recommendations">Recommendations</a><a href="#candidates">Candidates</a>
     <a href="#highest-risk">Highest risk</a><a href="#changes">Changes</a><a href="#symbols">Symbols</a>
     <a href="#run-details">Run details</a>
     </div>
@@ -1209,9 +1421,16 @@ def _render_phase2_html(
   <div class="notice"><strong>Research disclaimer:</strong> Educational research only; not personalized financial advice. Scores and classifications do not guarantee investment performance.</div>
   <h2 id="market-regime">Market Regime</h2>
   <div class="card regime"><div class="regime-head">{regime_badge}<span class="regime-confidence">confidence {_score(metadata.get('market_regime_confidence'))}</span></div><h4>Market-regime reasons</h4>{regime_reasons}</div>
+  <h2 id="recommendations">Today's Recommendations</h2>
+  <div class="notice"><strong>Advisory only.</strong> Sized suggestions only — nothing here has been bought or
+  sold. Model context (<span class="mono">predict</span> / <span class="mono">predict-v5</span>) is displayed
+  information only, never a gate on any recommendation. See <span class="mono">python main.py recommend</span>.</div>
+  {recommendations_html}
   <h2 id="candidates">Candidate Ranking</h2>
+  {candidate_validation_html}
   <div class="card">{candidate_html}</div>
   <h2 id="highest-risk">Highest-Risk Ranking</h2>
+  {risk_validation_html}
   <div class="card">{risk_html}</div>
   <h2 id="changes">Changes From Previous Stored Analysis</h2>
   <div class="card">{changes_html}</div>
@@ -1255,10 +1474,10 @@ def _ranking_table(
             f'{_gauge_html(result.get("risk_score"), risk_status)}</span>'
         )
         rows.append(
-            "<tr>"
+            f'<tr data-status="{classification_status}">'
             f'<td class="num">{ranks.get(symbol, "")}</td>'
             f'<td><a class="mono" href="#{_symbol_anchor_id(symbol)}">{_escape(symbol)}</a></td>'
-            f"<td>{_badge(result.get('classification'), _CLASSIFICATION_STATUS)}</td>"
+            f'<td class="status-{classification_status}">{_display(result.get("classification"))}</td>'
             f'<td class="num">{opportunity_cell}</td>'
             f'<td class="num">{risk_cell}</td>'
             f'<td class="num">{_score(result.get("confidence_score"))}</td></tr>'

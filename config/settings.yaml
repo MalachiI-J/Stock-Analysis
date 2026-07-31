@@ -21,6 +21,23 @@ market_data:
   recent_overlap_sessions: 10
   corporate_action_refresh_sessions: 90
   scheduled_full_refresh_days: 7
+edgar:
+  # SEC's fair-use policy requires every request to identify a real contact, not an
+  # API key (https://www.sec.gov/os/webmaster-faq#developers) — used only by
+  # `main.py collect-fundamentals`, a manual/periodic command, not the daily run.
+  user_agent: "Stock Scraper Research malachi0110@yahoo.com"
+  timeout_seconds: 20
+  max_retries: 3
+  retry_delay_seconds: 2
+screening:
+  # config/screening_universe.csv is a hand-maintained, illustrative list of large-cap
+  # tickers (see README's Limitations: "not automatically kept current"), not a live
+  # index feed. These two settings let `screen` surface staleness as a visible warning
+  # instead of letting the list silently go stale with no signal at all. Update
+  # universe_last_verified (and re-check the list against current large-cap listings)
+  # whenever you've actually reviewed it.
+  universe_last_verified: "2026-07-31"
+  staleness_warning_days: 180
 universes:
   # Deliberately diversified beyond the original 10 mega-cap names: added healthcare
   # (UNH, JNJ), staples (PG, KO), media (DIS), telecom (T, VZ), industrials (BA, CAT),

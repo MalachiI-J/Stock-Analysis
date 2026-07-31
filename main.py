@@ -36,12 +36,19 @@ from stock_scrapper.backtesting.walk_forward import (
 )
 from stock_scrapper.collectors.yahoo_prices import YahooPriceCollector
 from stock_scrapper.collectors.corporate_actions import action_records, upsert_actions, record_action_coverage
+from stock_scrapper.collectors.sec_edgar_fundamentals import (
+    fetch_company_facts,
+    fetch_ticker_cik_map,
+    normalize_company_facts,
+    upsert_fundamentals,
+)
 from stock_scrapper.market_calendar import SessionResolver
 from stock_scrapper.config import load_config, load_watchlist, load_universes, validate_universes
 from stock_scrapper.data_health import assess_data_health
 from stock_scrapper.database import (
     close_portfolio_lots_fifo,
     create_connection,
+    fetch_fundamentals,
     fetch_price_history,
     fetch_quality_issues,
     get_analysis_run,
@@ -75,11 +82,19 @@ from stock_scrapper.portfolio import (
     evaluate_portfolio_performance,
 )
 from stock_scrapper.prediction.config import validate_prediction_config
+from stock_scrapper.prediction.gbm_persistence import persist_gbm_prediction_run
+from stock_scrapper.prediction.gbm_service import run_gbm_prediction
 from stock_scrapper.prediction.persistence import persist_prediction_run
 from stock_scrapper.prediction.service import run_prediction
 from stock_scrapper.processing.validation import validate_price_records
 from stock_scrapper.trading.config import validate_trading_rules
-from stock_scrapper.trading.recommendations import build_recommendations, render_recommendations_text
+from stock_scrapper.trading.recommendations import (
+    RecommendationRunResult,
+    TradeRecommendation,
+    build_recommendations,
+    render_recommendations_text,
+)
+from stock_scrapper.reporting.dashboard_builder import render_dashboard_html
 from stock_scrapper.trading.review import evaluate_recommendation_outcomes, render_review_text
 from stock_scrapper.reporting.report_builder import write_phase2_reports
 from stock_scrapper.reporting.risk_diagnostics_report import write_risk_diagnostics_html_report
@@ -218,6 +233,17 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_parser.add_argument("--no-model", action="store_true", help="Skip the experimental prediction model's confidence context")
     _add_as_of_argument(recommend_parser)
 
+    dashboard_parser = subparsers.add_parser(
+        "dashboard", help="Write a combined local HTML view of today's digest, recommendations, and holdings"
+    )
+    dashboard_parser.add_argument("--symbols", nargs="+", help="Optional saved symbols")
+    dashboard_source = dashboard_parser.add_mutually_exclusive_group()
+    dashboard_source.add_argument("--run-id", help="Read one exact saved run")
+    dashboard_source.add_argument("--recalculate", action="store_true")
+    dashboard_source.add_argument("--latest-any", action="store_true")
+    dashboard_parser.add_argument("--scope", choices=("candidate_universe", "all_data_symbols", "custom"))
+    _add_as_of_argument(dashboard_parser)
+
     recommend_review = subparsers.add_parser(
         "recommend-review", help="Check how a past `recommend` run's suggestions actually performed"
     )
@@ -295,6 +321,19 @@ def build_parser() -> argparse.ArgumentParser:
     walk.add_argument("--start", help="First development date (YYYY-MM-DD)")
     walk.add_argument("--end", help="Final holdout end date (YYYY-MM-DD)")
 
+    signal_capture_parser = subparsers.add_parser(
+        "signal-capture-test",
+        help="Is validate-signals' thin Strong Candidate edge capturable once score_v1's own trading rules stop competing with it?",
+    )
+    signal_capture_parser.add_argument("--strategy", choices=("score_v1",), default="score_v1")
+    signal_capture_parser.add_argument("--symbols", nargs="+", help="Optional candidate universe")
+    signal_capture_parser.add_argument("--start", help="First development date (YYYY-MM-DD)")
+    signal_capture_parser.add_argument("--end", help="Final holdout end date (YYYY-MM-DD)")
+    signal_capture_parser.add_argument(
+        "--horizon-days", type=int,
+        help="Override config/prediction_rules.yaml's horizon_days; also the forced holding period",
+    )
+
     validate_signals_parser = subparsers.add_parser(
         "validate-signals",
         help="Does score_v1's classification beat the benchmark forward, independent of backtest sizing/timing?",
@@ -346,6 +385,11 @@ def build_parser() -> argparse.ArgumentParser:
     action_refresh = subparsers.add_parser("corporate-actions-refresh", help="Refresh explicit corporate actions and checked coverage")
     action_refresh.add_argument("--symbols", nargs="+")
     action_refresh.add_argument("--full", action="store_true")
+    fundamentals_parser = subparsers.add_parser(
+        "collect-fundamentals",
+        help="Collect point-in-time SEC EDGAR fundamentals for the candidate universe (see README's 'Evaluation honesty')",
+    )
+    fundamentals_parser.add_argument("--symbols", nargs="+", help="Optional candidate symbol list")
     subparsers.add_parser("universe-show", help="Show role-aware symbol universes")
     subparsers.add_parser("universe-validate", help="Validate symbol universe roles")
     subparsers.add_parser("provenance", help="Show current software provenance")
@@ -362,6 +406,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override config/prediction_rules.yaml's horizon_days, e.g. to compare horizons",
     )
     _add_as_of_argument(predict)
+
+    predict_v4 = subparsers.add_parser(
+        "predict-v4",
+        help="EXPERIMENTAL gradient-boosted regression on continuous excess return (not score_v1, not predict-v3)",
+    )
+    predict_v4.add_argument("--symbols", nargs="+", help="Optional symbol list")
+    predict_v4.add_argument(
+        "--horizon-days", type=int,
+        help="Override config/prediction_rules.yaml's horizon_days, so this stays comparable to predict/validate-signals",
+    )
+    _add_as_of_argument(predict_v4)
+
+    predict_v5 = subparsers.add_parser(
+        "predict-v5",
+        help="EXPERIMENTAL: predict-v4's model widened with point-in-time SEC EDGAR fundamentals (not score_v1)",
+    )
+    predict_v5.add_argument("--symbols", nargs="+", help="Optional symbol list")
+    predict_v5.add_argument(
+        "--horizon-days", type=int,
+        help="Override config/prediction_rules.yaml's horizon_days, so this stays comparable to predict/predict-v4",
+    )
+    _add_as_of_argument(predict_v5)
     return parser
 
 
@@ -408,6 +474,33 @@ def _parse_date(value: str | None, *, field: str, default: date | None = None) -
         return date.fromisoformat(value)
     except ValueError as exc:
         raise InvalidDateError(f"{field} must use YYYY-MM-DD: {value}") from exc
+
+
+def _warn_if_screening_universe_stale(config: dict[str, Any]) -> None:
+    """Surface config/screening_universe.csv's staleness instead of letting a
+    hand-maintained, non-live-feed list silently rot with no visible signal (see
+    README's Limitations: "not automatically kept current"). Best-effort only —
+    a missing or malformed `screening.universe_last_verified` skips the check
+    rather than failing the whole `screen` run over an optional setting."""
+    screening_settings = config.get("screening") or {}
+    last_verified_raw = screening_settings.get("universe_last_verified")
+    if not last_verified_raw:
+        return
+    try:
+        last_verified = date.fromisoformat(str(last_verified_raw))
+    except ValueError:
+        return
+    threshold_days = int(screening_settings.get("staleness_warning_days", 180))
+    age_days = (date.today() - last_verified).days
+    if age_days > threshold_days:
+        print(
+            f"WARNING: config/screening_universe.csv was last verified {age_days} day(s) ago "
+            f"({last_verified.isoformat()}), past the {threshold_days}-day staleness threshold. "
+            "It is a hand-maintained, illustrative list, not a live index feed -- review it against "
+            "current large-cap listings, then update screening.universe_last_verified in "
+            "config/settings.yaml.",
+            file=sys.stderr,
+        )
 
 
 def _symbols_from_args(args: argparse.Namespace, watchlist: Sequence[str]) -> list[str]:
@@ -758,6 +851,7 @@ _UNREFERENCED_REPORT_PATTERNS: tuple[str, ...] = (
     "digest_*.summary.json",
     "recommendations_*.txt",
     "recommendations_*.summary.json",
+    "dashboard_*.html",
     "data_health_*.json",
     "data_health_*.html",
     "stock_summary_*_screen-*.csv",
@@ -914,6 +1008,99 @@ def _load_backtest_inputs(
     for issue in issues:
         quality.setdefault(str(issue.get("symbol", "")).upper(), []).append(issue)
     return histories, quality
+
+
+def _signal_capture_config(base_dir: Path, args: argparse.Namespace, horizon_days: int) -> BacktestConfig:
+    """A maximally-permissive score_v1 variant that mechanically captures the "Strong
+    Candidate" classification with none of score_v1's other trading rules competing
+    with it, to test whether validate-signals' thin classification-level edge (see
+    README's "Evaluation honesty" section) is capturable at the portfolio level once
+    score_v1's own stop-loss/trailing-stop/regime-gate/early-exit rules stop cutting
+    into it. Still strategy_name="score_v1" (the only registered strategy — see
+    run_portfolio_backtest's own check) with maximum_holding_period forcing an
+    unconditional exit at the same horizon validate-signals measures against, and every
+    other early-exit/filter path disabled or maximally loosened so nothing but the
+    classification itself and the timed exit can act. Exploratory diagnostic, not a
+    proposed change to score_v1 itself.
+
+    exit_thresholds.classifications can't be an empty list (schema requires a
+    non-empty, validated subset of ALLOWED_CLASSIFICATIONS), so it keeps exactly
+    "Data Blocked" — a total data-quality blackout, not a signal-driven
+    reclassification, so still exiting on it isn't one of the "competing trading
+    rules" this diagnostic is trying to remove.
+    """
+    typed = _backtest_config(base_dir, args)
+    return typed.with_overrides(
+        entry_thresholds={
+            "classifications": ["Strong Candidate"],
+            "minimum_opportunity_score": 0.0,
+            "minimum_average_dollar_volume": 0.0,
+        },
+        exit_thresholds={
+            "classifications": ["Data Blocked"],
+            "minimum_opportunity_score": 0.0,
+            "minimum_confidence_score": 0.0,
+            "maximum_risk_score": 100.0,
+            "exit_below_sma200": False,
+            "exit_on_stress": False,
+        },
+        allowed_market_regimes=["Risk-On", "Neutral", "Risk-Off", "Stress"],
+        minimum_confidence=0.0,
+        maximum_risk=100.0,
+        maximum_positions=25,
+        stop_loss=None,
+        trailing_stop=None,
+        profit_target=None,
+        maximum_holding_period=horizon_days,
+        strategy_version=typed.strategy_version + "-signal-capture-diagnostic",
+    )
+
+
+def _print_walk_forward_results(walk_result: Any) -> int:
+    """Shared per-window reporting for both `walk-forward` and `signal-capture-test` —
+    identical presentation so their results are directly comparable."""
+    print(f"{walk_result.walk_forward_run_id}: {walk_result.status}")
+    for window in walk_result.windows:
+        print(
+            f"  {window.window_type}: {window.evaluation_start_date}.."
+            f"{window.evaluation_end_date} status={window.status} backtest={window.backtest_run_id}"
+        )
+    print()
+    print("Per-window performance vs benchmark (validation and holdout kept separate — never averaged together):")
+    validation_windows = [window for window in walk_result.windows if window.window_type == "validation"]
+    holdout_windows = [window for window in walk_result.windows if window.window_type == "holdout"]
+    for label, windows in (("validation", validation_windows), ("holdout", holdout_windows)):
+        for window in windows:
+            metrics = getattr(window, "metrics", None)
+            span = f"{window.evaluation_start_date}..{window.evaluation_end_date}"
+            if metrics is None:
+                print(f"  {label} [{span}]: no metrics recorded (status={window.status})")
+                continue
+            active_text = "n/a" if metrics.active_return is None else f"{metrics.active_return:+.2%}"
+            sharpe_text = "n/a" if metrics.sharpe_ratio is None else f"{metrics.sharpe_ratio:.2f}"
+            benchmark_sharpe_text = (
+                "n/a" if metrics.benchmark_sharpe_ratio is None else f"{metrics.benchmark_sharpe_ratio:.2f}"
+            )
+            verdict = (
+                "n/a" if metrics.active_return is None
+                else ("beat benchmark" if metrics.active_return > 0 else "trailed benchmark")
+            )
+            print(
+                f"  {label} [{span}]: active_return={active_text} sharpe={sharpe_text} "
+                f"(benchmark sharpe={benchmark_sharpe_text}) -> {verdict}"
+            )
+    if len(validation_windows) <= 1 and len(holdout_windows) <= 1:
+        print(
+            "  Only one validation window and one holdout exist with current stored history — "
+            "each of the above is a single data point, not a statistically powered walk-forward "
+            "verdict. Treat the direction as informative, not as proof of an edge."
+        )
+    failed_windows = sum(window.status == "failed" for window in walk_result.windows)
+    if failed_windows == len(walk_result.windows):
+        return int(ExitCode.OPERATION_FAILED)
+    if failed_windows:
+        return int(ExitCode.PARTIAL_FAILURE)
+    return int(ExitCode.SUCCESS)
 
 
 def run_backtests(
@@ -1076,6 +1263,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             universe_path = Path(args.universe_path) if args.universe_path else base_dir / "config" / "screening_universe.csv"
             if not universe_path.exists():
                 raise InvalidConfigurationError(f"Screening universe file does not exist: {universe_path}")
+            _warn_if_screening_universe_stale(config)
             screening_symbols = load_watchlist(universe_path)
             new_symbols = _new_screening_symbols(screening_symbols, load_universes(config)["candidates"])
             if not new_symbols:
@@ -1246,6 +1434,242 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(f"  {prediction.symbol:<6} {prediction.probability_positive:.1%}")
             return int(ExitCode.SUCCESS)
 
+        if args.command == "predict-v4":
+            print(
+                "EXPERIMENTAL STATISTICAL FORECAST — not part of score_v1, not a trading signal. "
+                "Predicts the continuous forward excess return over the benchmark (not just whether "
+                "it's beaten) using gradient-boosted regression trees, so it can capture nonlinear "
+                "patterns (e.g. the U-shaped six-month-return effect investigate-risk-inversion found) "
+                "predict-v3's linear model structurally cannot. Read the holdout MSE/information "
+                "coefficient below before trusting any prediction.",
+                file=sys.stderr,
+            )
+            effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
+            prediction_rules = load_prediction_rules(base_dir)
+            if args.horizon_days is not None:
+                if args.horizon_days <= 0:
+                    parser.error("--horizon-days must be positive")
+                prediction_rules = dict(prediction_rules, horizon_days=args.horizon_days)
+            scoring_rules = load_scoring_rules(base_dir)
+            roles = load_universes(config)
+            benchmark = roles["benchmark"]
+            load_symbols = sorted(set(symbols) | {benchmark} | set(roles["market_context"]) | set(roles["defensive_context"]))
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                histories = {symbol: fetch_price_history(conn, symbol, end_date=effective) for symbol in load_symbols}
+                trading_dates = [str(row["trade_date"])[:10] for row in histories.get(benchmark, [])]
+                service = AnalysisService(conn, scoring_rules, roles["candidates"])
+                result = run_gbm_prediction(
+                    service, symbols, histories, trading_dates,
+                    as_of_date=effective.isoformat(), rules=prediction_rules, benchmark_symbol=benchmark,
+                )
+                prediction_run_id = f"predict-v4-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
+                run_provenance = collect_provenance(
+                    base_dir, strategy_name="predict-v4", strategy_version="predict-v4",
+                )
+                conn.execute("BEGIN")
+                try:
+                    persist_gbm_prediction_run(
+                        conn, prediction_run_id, result,
+                        prediction_version="predict-v4",
+                        benchmark_symbol=benchmark,
+                        configuration_snapshot=prediction_rules,
+                        configuration_hash=stable_sha256(prediction_rules),
+                        git_commit_hash=run_provenance.get("git_commit_hash"),
+                        git_dirty=run_provenance.get("git_dirty"),
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+            finally:
+                conn.close()
+            if result.status == "insufficient_data":
+                print(f"prediction run: {prediction_run_id}", file=sys.stderr)
+                print(f"Missing data: {result.message}", file=sys.stderr)
+                return int(ExitCode.MISSING_DATA)
+            print(f"prediction run: {prediction_run_id}")
+            print(f"Prediction as of {result.as_of_date} | horizon={result.horizon_days} session(s) | model=predict-v4")
+            print(
+                f"Trained on {result.training_samples} sample(s) ({result.training_start_date} to "
+                f"{result.training_end_date})"
+            )
+            if result.message:
+                print(f"Note: {result.message}", file=sys.stderr)
+            mse_text = "n/a" if result.holdout_mse is None else f"{result.holdout_mse:.6f}"
+            baseline_mse_text = "n/a" if result.baseline_mse is None else f"{result.baseline_mse:.6f}"
+            mae_text = "n/a" if result.holdout_mean_absolute_error is None else f"{result.holdout_mean_absolute_error:.4f}"
+            ic_text = "n/a" if result.holdout_information_coefficient is None else f"{result.holdout_information_coefficient:+.4f}"
+            print(
+                f"Walk-forward holdout MSE: {mse_text} (sample-weighted baseline {baseline_mse_text}, "
+                "each fold's own test-period target variance — the minimum achievable MSE for always "
+                f"predicting that fold's own mean) over {result.holdout_samples} held-out sample(s) "
+                f"across {len(result.walk_forward_folds)} fold(s)"
+            )
+            print(f"Holdout mean absolute error: {mae_text} | information coefficient: {ic_text}")
+            for fold in result.walk_forward_folds:
+                fold_mse = "n/a" if fold.mse is None else f"{fold.mse:.6f}"
+                fold_baseline_mse = "n/a" if fold.baseline_mse is None else f"{fold.baseline_mse:.6f}"
+                fold_mae = "n/a" if fold.mean_absolute_error is None else f"{fold.mean_absolute_error:.4f}"
+                fold_ic = "n/a" if fold.information_coefficient is None else f"{fold.information_coefficient:+.4f}"
+                print(
+                    f"  fold {fold.fold}: train [{fold.training_start_date}..{fold.training_end_date}] "
+                    f"({fold.training_samples} samples, {fold.training_symbol_count} symbols, "
+                    f"{fold.purged_samples} purged for label/test-period overlap)"
+                )
+                print(
+                    f"    -> test [{fold.test_start_date}..{fold.test_end_date}] "
+                    f"({fold.test_samples} samples, {fold.test_symbol_count} symbols)"
+                )
+                print(
+                    f"    mse {fold_mse} vs. fold baseline {fold_baseline_mse} | mae {fold_mae} | "
+                    f"information coefficient {fold_ic}"
+                )
+            print("Feature importances (share of total SSE-reduction gain across every tree):")
+            for name, share in result.feature_importances[:10]:
+                print(f"  {name:<32} {share:.1%}")
+            print(f"Symbol predictions (predicted forward excess return vs. {benchmark}):")
+            ranked = sorted(
+                result.predictions,
+                key=lambda item: item.predicted_excess_return if item.predicted_excess_return is not None else float("-inf"),
+                reverse=True,
+            )
+            for prediction in ranked:
+                if prediction.predicted_excess_return is None:
+                    print(f"  {prediction.symbol:<6} unavailable — {prediction.reason}")
+                elif prediction.low_confidence:
+                    print(
+                        f"  {prediction.symbol:<6} {prediction.predicted_excess_return:+.2%}  "
+                        "[LOW CONFIDENCE: far outside the training data's typical range -- "
+                        "likely an extrapolated outlier, not a trustworthy forecast]"
+                    )
+                else:
+                    print(f"  {prediction.symbol:<6} {prediction.predicted_excess_return:+.2%}")
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "predict-v5":
+            print(
+                "EXPERIMENTAL STATISTICAL FORECAST — not part of score_v1, not a trading signal, not "
+                "predict-v3/predict-v4. Same gradient-boosted regression on continuous forward excess "
+                "return as predict-v4, widened with point-in-time SEC EDGAR fundamentals (trailing P/E, "
+                "price-to-book, debt-to-equity, revenue/earnings growth, return on equity) — the one "
+                "genuinely new data source left untried after price/volume-only signals repeatedly "
+                "failed to show a validated edge. Run `collect-fundamentals` first, or symbols will show "
+                "as unavailable. Read the holdout MSE/information coefficient below before trusting any "
+                "prediction, and compare against predict-v4's own recorded numbers (README's 'Evaluation "
+                "honesty' section) to see whether fundamentals actually moved the needle.",
+                file=sys.stderr,
+            )
+            effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
+            prediction_rules = load_prediction_rules(base_dir)
+            if args.horizon_days is not None:
+                if args.horizon_days <= 0:
+                    parser.error("--horizon-days must be positive")
+                prediction_rules = dict(prediction_rules, horizon_days=args.horizon_days)
+            predict_v5_feature_keys = list(prediction_rules["predict_v5"]["feature_keys"])
+            predict_v5_gbm_config = prediction_rules["predict_v5"].get("gbm")
+            scoring_rules = load_scoring_rules(base_dir)
+            roles = load_universes(config)
+            benchmark = roles["benchmark"]
+            load_symbols = sorted(set(symbols) | {benchmark} | set(roles["market_context"]) | set(roles["defensive_context"]))
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                histories = {symbol: fetch_price_history(conn, symbol, end_date=effective) for symbol in load_symbols}
+                trading_dates = [str(row["trade_date"])[:10] for row in histories.get(benchmark, [])]
+                fundamentals_by_symbol = {symbol: fetch_fundamentals(conn, symbol) for symbol in symbols}
+                service = AnalysisService(conn, scoring_rules, roles["candidates"])
+                result = run_gbm_prediction(
+                    service, symbols, histories, trading_dates,
+                    as_of_date=effective.isoformat(), rules=prediction_rules, benchmark_symbol=benchmark,
+                    feature_keys=predict_v5_feature_keys, fundamentals_by_symbol=fundamentals_by_symbol,
+                    gbm_config=predict_v5_gbm_config,
+                )
+                prediction_run_id = f"predict-v5-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
+                run_provenance = collect_provenance(
+                    base_dir, strategy_name="predict-v5", strategy_version="predict-v5",
+                )
+                conn.execute("BEGIN")
+                try:
+                    persist_gbm_prediction_run(
+                        conn, prediction_run_id, result,
+                        prediction_version="predict-v5",
+                        benchmark_symbol=benchmark,
+                        configuration_snapshot=prediction_rules,
+                        configuration_hash=stable_sha256(prediction_rules),
+                        git_commit_hash=run_provenance.get("git_commit_hash"),
+                        git_dirty=run_provenance.get("git_dirty"),
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+            finally:
+                conn.close()
+            if result.status == "insufficient_data":
+                print(f"prediction run: {prediction_run_id}", file=sys.stderr)
+                print(f"Missing data: {result.message}", file=sys.stderr)
+                return int(ExitCode.MISSING_DATA)
+            print(f"prediction run: {prediction_run_id}")
+            print(f"Prediction as of {result.as_of_date} | horizon={result.horizon_days} session(s) | model=predict-v5")
+            print(
+                f"Trained on {result.training_samples} sample(s) ({result.training_start_date} to "
+                f"{result.training_end_date})"
+            )
+            if result.message:
+                print(f"Note: {result.message}", file=sys.stderr)
+            mse_text = "n/a" if result.holdout_mse is None else f"{result.holdout_mse:.6f}"
+            baseline_mse_text = "n/a" if result.baseline_mse is None else f"{result.baseline_mse:.6f}"
+            mae_text = "n/a" if result.holdout_mean_absolute_error is None else f"{result.holdout_mean_absolute_error:.4f}"
+            ic_text = "n/a" if result.holdout_information_coefficient is None else f"{result.holdout_information_coefficient:+.4f}"
+            print(
+                f"Walk-forward holdout MSE: {mse_text} (sample-weighted baseline {baseline_mse_text}, "
+                "each fold's own test-period target variance — the minimum achievable MSE for always "
+                f"predicting that fold's own mean) over {result.holdout_samples} held-out sample(s) "
+                f"across {len(result.walk_forward_folds)} fold(s)"
+            )
+            print(f"Holdout mean absolute error: {mae_text} | information coefficient: {ic_text}")
+            for fold in result.walk_forward_folds:
+                fold_mse = "n/a" if fold.mse is None else f"{fold.mse:.6f}"
+                fold_baseline_mse = "n/a" if fold.baseline_mse is None else f"{fold.baseline_mse:.6f}"
+                fold_mae = "n/a" if fold.mean_absolute_error is None else f"{fold.mean_absolute_error:.4f}"
+                fold_ic = "n/a" if fold.information_coefficient is None else f"{fold.information_coefficient:+.4f}"
+                print(
+                    f"  fold {fold.fold}: train [{fold.training_start_date}..{fold.training_end_date}] "
+                    f"({fold.training_samples} samples, {fold.training_symbol_count} symbols, "
+                    f"{fold.purged_samples} purged for label/test-period overlap)"
+                )
+                print(
+                    f"    -> test [{fold.test_start_date}..{fold.test_end_date}] "
+                    f"({fold.test_samples} samples, {fold.test_symbol_count} symbols)"
+                )
+                print(
+                    f"    mse {fold_mse} vs. fold baseline {fold_baseline_mse} | mae {fold_mae} | "
+                    f"information coefficient {fold_ic}"
+                )
+            print("Feature importances (share of total SSE-reduction gain across every tree):")
+            for name, share in result.feature_importances[:10]:
+                print(f"  {name:<32} {share:.1%}")
+            print(f"Symbol predictions (predicted forward excess return vs. {benchmark}):")
+            ranked = sorted(
+                result.predictions,
+                key=lambda item: item.predicted_excess_return if item.predicted_excess_return is not None else float("-inf"),
+                reverse=True,
+            )
+            for prediction in ranked:
+                if prediction.predicted_excess_return is None:
+                    print(f"  {prediction.symbol:<6} unavailable — {prediction.reason}")
+                elif prediction.low_confidence:
+                    print(
+                        f"  {prediction.symbol:<6} {prediction.predicted_excess_return:+.2%}  "
+                        "[LOW CONFIDENCE: far outside the training data's typical range -- "
+                        "likely an extrapolated outlier, not a trustworthy forecast]"
+                    )
+                else:
+                    print(f"  {prediction.symbol:<6} {prediction.predicted_excess_return:+.2%}")
+            return int(ExitCode.SUCCESS)
+
         if args.command in {"data-health", "data-health-report"}:
             initialize_database(config["database_path"]); conn = create_connection(config["database_path"])
             try: health = assess_data_health(conn, symbols, int(config.get("market_data", {}).get("provider_delay_minutes", 30)))
@@ -1287,6 +1711,53 @@ def main(argv: Sequence[str] | None = None) -> int:
                         record_action_coverage(conn,symbol,"yfinance",start.isoformat(),end.isoformat(),[],status="failed",error=str(exc)); conn.commit()
             finally: conn.close()
             print(f"actions_upserted={total} symbols={len(symbols)} failed={len(failures)}")
+            return int(ExitCode.PARTIAL_FAILURE if failures else ExitCode.SUCCESS)
+
+        if args.command == "collect-fundamentals":
+            initialize_database(config["database_path"]); conn = create_connection(config["database_path"])
+            edgar_config = config.get("edgar") or {}
+            user_agent = str(edgar_config.get("user_agent", "")).strip()
+            timeout_seconds = int(edgar_config.get("timeout_seconds", 20))
+            max_retries = int(edgar_config.get("max_retries", 3))
+            retry_delay_seconds = float(edgar_config.get("retry_delay_seconds", 2))
+            failures: list[str] = []; total = 0
+            try:
+                cik_map = fetch_ticker_cik_map(
+                    user_agent=user_agent, timeout_seconds=timeout_seconds,
+                    max_retries=max_retries, retry_delay_seconds=retry_delay_seconds,
+                )
+                for symbol in symbols:
+                    cik = cik_map.get(symbol)
+                    if cik is None:
+                        failures.append(symbol)
+                        logger.warning(f"No SEC CIK found for {symbol}")
+                        continue
+                    try:
+                        facts = fetch_company_facts(
+                            cik, user_agent=user_agent, timeout_seconds=timeout_seconds,
+                            max_retries=max_retries, retry_delay_seconds=retry_delay_seconds,
+                        )
+                        records = normalize_company_facts(symbol, facts)
+                        if not records:
+                            # A zero-fact response usually means the resolved CIK is
+                            # wrong (e.g. SEC's own ticker file once mapped "XOM" to an
+                            # unrelated shell entity with no filings), not that a real
+                            # operating company genuinely has no fundamentals on file.
+                            # Surfaced as a failure so it's investigated, not silently
+                            # treated as a successful, empty collection.
+                            failures.append(symbol)
+                            logger.warning(f"Zero fundamentals facts returned for {symbol} (CIK {cik}) — check the CIK mapping")
+                            continue
+                        total += upsert_fundamentals(conn, records)
+                        conn.commit()
+                    except Exception as exc:
+                        conn.rollback(); failures.append(symbol)
+                        logger.warning(f"Fundamentals collection failed for {symbol}: {exc}")
+            finally:
+                conn.close()
+            print(f"fundamentals_upserted={total} symbols={len(symbols)} failed={len(failures)}")
+            if failures:
+                print(f"failed_symbols={','.join(failures)}")
             return int(ExitCode.PARTIAL_FAILURE if failures else ExitCode.SUCCESS)
 
         if args.command == "revisions-classify":
@@ -1429,6 +1900,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         latest_price_by_symbol[candidate_symbol] = price
 
                 model_probability_by_symbol: dict[str, float] = {}
+                predict_v5_excess_return_by_symbol: dict[str, float] = {}
+                predict_v5_low_confidence_by_symbol: dict[str, bool] = {}
                 if not args.no_model:
                     try:
                         prediction_rules = load_prediction_rules(base_dir)
@@ -1454,6 +1927,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                     except Exception:
                         # The experimental model is context only; never let it block a recommendation run.
                         model_probability_by_symbol = {}
+
+                    try:
+                        predict_v5_feature_keys = list(prediction_rules["predict_v5"]["feature_keys"])
+                        predict_v5_gbm_config = prediction_rules["predict_v5"].get("gbm")
+                        fundamentals_by_symbol = {symbol: fetch_fundamentals(conn, symbol) for symbol in symbols}
+                        v5_service = AnalysisService(conn, scoring_rules, roles["candidates"])
+                        v5_result = run_gbm_prediction(
+                            v5_service, symbols, histories, trading_dates,
+                            as_of_date=effective.isoformat(), rules=prediction_rules, benchmark_symbol=benchmark,
+                            feature_keys=predict_v5_feature_keys, fundamentals_by_symbol=fundamentals_by_symbol,
+                            gbm_config=predict_v5_gbm_config,
+                        )
+                        if v5_result.status == "ok":
+                            for item in v5_result.predictions:
+                                if item.predicted_excess_return is not None:
+                                    predict_v5_excess_return_by_symbol[item.symbol] = item.predicted_excess_return
+                                    predict_v5_low_confidence_by_symbol[item.symbol] = item.low_confidence
+                    except Exception:
+                        # Same rule as above: predict-v5 is displayed context only, never a gate.
+                        predict_v5_excess_return_by_symbol = {}
+                        predict_v5_low_confidence_by_symbol = {}
             finally:
                 conn.close()
 
@@ -1467,6 +1961,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 latest_price_by_symbol=latest_price_by_symbol,
                 rules=trading_rules,
                 model_probability_by_symbol=model_probability_by_symbol,
+                predict_v5_excess_return_by_symbol=predict_v5_excess_return_by_symbol,
+                predict_v5_low_confidence_by_symbol=predict_v5_low_confidence_by_symbol,
             )
             text = render_recommendations_text(outcome)
             print(text)
@@ -1489,6 +1985,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "estimated_dollars": rec.estimated_dollars,
                             "reason": rec.reason,
                             "model_probability": rec.model_probability,
+                            "predict_v5_excess_return": rec.predict_v5_excess_return,
+                            "predict_v5_low_confidence": rec.predict_v5_low_confidence,
                         }
                         for rec in outcome.recommendations
                     ],
@@ -1496,6 +1994,90 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
                 summary_target.write_text(json.dumps(summary_payload, indent=2, sort_keys=True), encoding="utf-8")
                 print(f"Summary: {summary_target}")
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "dashboard":
+            explicit = bool(getattr(args, "symbols", None))
+            if args.recalculate:
+                effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
+                batch = _analysis_batch(config, base_dir, symbols, effective, persist=True, universe=universe)
+                results = batch.results
+                as_of_date, data_through_date = batch.as_of_date, batch.data_through_date
+                regime, regime_confidence = batch.market_context.regime, batch.market_context.confidence
+            else:
+                saved, results = _load_saved_results(
+                    config, args.run_id, symbols if explicit else None,
+                    latest_any=args.latest_any, scope=args.scope,
+                )
+                as_of_date, data_through_date = saved.get("as_of_date"), saved.get("data_through_date")
+                regime = saved.get("market_regime") or (results[0].market_regime if results else "Insufficient Market Data")
+                regime_confidence = saved.get("market_regime_confidence")
+            as_of_text = str(as_of_date)[:10]
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                previous = _previous_analysis(conn, as_of_text)
+                results_by_symbol = {result.symbol: result for result in results}
+                holdings = _assess_open_holdings(
+                    conn, base_dir, _parse_date(as_of_text, field="as-of date"), results_by_symbol
+                )
+            finally:
+                conn.close()
+            digest_payload = build_digest(
+                as_of_date=as_of_text,
+                data_through_date=str(data_through_date)[:10] if data_through_date else None,
+                market_regime=str(regime),
+                market_regime_confidence=regime_confidence,
+                results=results,
+                previous_results=previous,
+                holdings=holdings,
+            )
+
+            # Read, not recompute: `recommend` trains predict/predict-v5 from scratch,
+            # which is comparatively slow, and this page's job is to combine what the
+            # daily pipeline already produced, not double that cost for no new data.
+            recommend_outcome: RecommendationRunResult | None = None
+            recommend_summary_path = Path(config["reports_dir"]) / f"recommendations_{as_of_text}.summary.json"
+            if recommend_summary_path.exists():
+                recommend_data = json.loads(recommend_summary_path.read_text(encoding="utf-8"))
+                recommend_outcome = RecommendationRunResult(
+                    as_of_date=str(recommend_data.get("as_of_date", as_of_text)),
+                    account_value=float(recommend_data.get("account_value", 0.0)),
+                    available_cash=float(recommend_data.get("available_cash", 0.0)),
+                    open_position_count=int(recommend_data.get("open_position_count", 0)),
+                    recommendations=[
+                        TradeRecommendation(
+                            symbol=str(item["symbol"]), action=str(item["action"]), shares=float(item["shares"]),
+                            estimated_dollars=float(item["estimated_dollars"]), reason=str(item["reason"]),
+                            model_probability=item.get("model_probability"),
+                            predict_v5_excess_return=item.get("predict_v5_excess_return"),
+                            predict_v5_low_confidence=bool(item.get("predict_v5_low_confidence", False)),
+                        )
+                        for item in recommend_data.get("recommendations", [])
+                    ],
+                    skipped=list(recommend_data.get("skipped", [])),
+                )
+
+            phase2_report_href = None
+            candidate_reports = sorted(
+                Path(config["reports_dir"]).glob(f"stock_summary_{as_of_text}_candidates_*.html"),
+                key=lambda path: path.stat().st_mtime, reverse=True,
+            )
+            if candidate_reports:
+                phase2_report_href = candidate_reports[0].name
+
+            html_content = render_dashboard_html(
+                as_of_date=as_of_text,
+                market_regime=str(regime),
+                market_regime_confidence=regime_confidence,
+                digest=digest_payload,
+                recommend=recommend_outcome,
+                phase2_report_href=phase2_report_href,
+            )
+            target = Path(config["reports_dir"]) / f"dashboard_{as_of_text}.html"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(html_content, encoding="utf-8")
+            print(f"Dashboard: {target}")
             return int(ExitCode.SUCCESS)
 
         if args.command == "recommend-review":
@@ -1886,48 +2468,81 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise
             finally:
                 conn.close()
-            print(f"{walk_result.walk_forward_run_id}: {walk_result.status}")
-            for window in walk_result.windows:
-                print(
-                    f"  {window.window_type}: {window.evaluation_start_date}.."
-                    f"{window.evaluation_end_date} status={window.status} backtest={window.backtest_run_id}"
+            return _print_walk_forward_results(walk_result)
+
+        if args.command == "signal-capture-test":
+            horizon_days = args.horizon_days or int(load_prediction_rules(base_dir).get("horizon_days", 21))
+            typed = _signal_capture_config(base_dir, args, horizon_days)
+            rules = load_scoring_rules(base_dir)
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                histories, quality = _load_backtest_inputs(conn, config, rules, symbols, typed)
+                trading_dates = [
+                    row["trade_date"] for row in histories.get(typed.benchmark.upper(), [])
+                ]
+
+                def executor(window: Any, immutable_config: BacktestConfig) -> WalkForwardExecutionResult:
+                    window_config = immutable_config.with_overrides(
+                        start_date=window.evaluation_start_date,
+                        end_date=window.evaluation_end_date,
+                        warm_up_days=immutable_config.walk_forward.warm_up_days,
+                    )
+                    outcome = run_portfolio_backtest(
+                        symbols,
+                        histories,
+                        rules,
+                        window_config,
+                        quality_by_symbol=quality,
+                        persist_conn=conn,
+                        commit_persistence=False,
+                        run_id=f"backtest-{window.window_id}",
+                    )
+                    return WalkForwardExecutionResult(
+                        backtest_run_id=outcome.run.run_id,
+                        metrics=outcome.metrics,
+                    )
+
+                walk_forward_run_id = (
+                    "wf-signalcapture-"
+                    + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+                    + "-"
+                    + uuid4().hex[:8]
                 )
+                conn.execute("BEGIN")
+                try:
+                    walk_result = run_walk_forward(
+                        typed,
+                        trading_dates,
+                        executor,
+                        symbols=symbols,
+                        walk_forward_run_id=walk_forward_run_id,
+                    )
+                    walk_result.benchmark_symbol = typed.benchmark
+                    walk_result.symbols = list(symbols)
+                    walk_result.configuration_snapshot = typed.to_dict()
+                    persist_walk_forward(conn, walk_result)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+            finally:
+                conn.close()
+            print(
+                "Signal-capture diagnostic: score_v1 with Strong-Candidate-only entry, no extra "
+                "score/regime gates, and every early-exit path (stop-loss, trailing-stop, "
+                "profit-target, classification-based exit) disabled — the only way out is an "
+                f"unconditional exit after exactly {horizon_days} session(s), the same horizon "
+                "validate-signals measures against."
+            )
+            print(
+                "Tests whether validate-signals' thin classification-level edge is capturable at "
+                "the portfolio level once score_v1's own trading rules stop competing with it. "
+                "Exploratory diagnostic, not a proposed change to score_v1 itself — see "
+                '"Evaluation honesty" in README.'
+            )
             print()
-            print("Per-window performance vs benchmark (validation and holdout kept separate — never averaged together):")
-            validation_windows = [window for window in walk_result.windows if window.window_type == "validation"]
-            holdout_windows = [window for window in walk_result.windows if window.window_type == "holdout"]
-            for label, windows in (("validation", validation_windows), ("holdout", holdout_windows)):
-                for window in windows:
-                    metrics = getattr(window, "metrics", None)
-                    span = f"{window.evaluation_start_date}..{window.evaluation_end_date}"
-                    if metrics is None:
-                        print(f"  {label} [{span}]: no metrics recorded (status={window.status})")
-                        continue
-                    active_text = "n/a" if metrics.active_return is None else f"{metrics.active_return:+.2%}"
-                    sharpe_text = "n/a" if metrics.sharpe_ratio is None else f"{metrics.sharpe_ratio:.2f}"
-                    benchmark_sharpe_text = (
-                        "n/a" if metrics.benchmark_sharpe_ratio is None else f"{metrics.benchmark_sharpe_ratio:.2f}"
-                    )
-                    verdict = (
-                        "n/a" if metrics.active_return is None
-                        else ("beat benchmark" if metrics.active_return > 0 else "trailed benchmark")
-                    )
-                    print(
-                        f"  {label} [{span}]: active_return={active_text} sharpe={sharpe_text} "
-                        f"(benchmark sharpe={benchmark_sharpe_text}) -> {verdict}"
-                    )
-            if len(validation_windows) <= 1 and len(holdout_windows) <= 1:
-                print(
-                    "  Only one validation window and one holdout exist with current stored history — "
-                    "each of the above is a single data point, not a statistically powered walk-forward "
-                    "verdict. Treat the direction as informative, not as proof of an edge."
-                )
-            failed_windows = sum(window.status == "failed" for window in walk_result.windows)
-            if failed_windows == len(walk_result.windows):
-                return int(ExitCode.OPERATION_FAILED)
-            if failed_windows:
-                return int(ExitCode.PARTIAL_FAILURE)
-            return int(ExitCode.SUCCESS)
+            return _print_walk_forward_results(walk_result)
 
         if args.command == "validate-signals":
             typed = _backtest_config(base_dir, args)

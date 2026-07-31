@@ -11,10 +11,15 @@ combines two existing, independently-validated signals rather than inventing
 new ones: SELL recommendations reuse `evaluate_holding()` from
 `stock_scrapper/portfolio.py` (the exact rules a backtest would have exited
 on), and BUY candidates are score_v1's own `Strong Candidate`/`Candidate`
-classifications. The experimental `predict` model's probability is attached
-to each BUY as displayed context only ("model: 45% beats benchmark") — never
-as a gate — since its accuracy doesn't yet warrant driving a real trade
-decision.
+classifications. Both experimental prediction models are attached to each BUY
+as displayed context only — never as a gate, since neither's accuracy yet
+warrants driving a real trade decision: `predict`'s probability
+("model: 45% beats benchmark"), and `predict-v5`'s predicted excess-return
+magnitude ("predict-v5: +12.3% predicted excess return"), including its
+`[LOW CONFIDENCE]` suffix whenever that prediction is a statistically extreme,
+likely-extrapolated outlier (see "Evaluation honesty" below) — the same
+flag `predict-v5`'s own CLI output shows, now surfaced in the one command a
+user actually checks daily instead of only in the standalone diagnostic run.
 
 Position sizing follows the same weight-based approach as the backtester's
 `BacktestConfig` (`max_position_weight`, `cash_reserve`), configured in
@@ -57,6 +62,14 @@ Phase 2 analysis over them (as a non-persisted `custom`-scope batch, so
 routine screening never clutters `analysis-list`), and reports any that
 qualify as Candidate/Strong Candidate plus a full report for the rest. Pass
 `--update` to explicitly collect data for the screening universe first.
+
+Because that list is hand-maintained rather than a live feed, `screen` also checks
+`screening.universe_last_verified` in `config/settings.yaml` and prints a stderr
+warning (never a failure) once more than `staleness_warning_days` (default 180) have
+passed since it was last actually reviewed — a way to surface "this list is stale"
+instead of letting it silently drift with no signal at all. Update
+`universe_last_verified` whenever you've reviewed the CSV against current large-cap
+listings.
 
 `scripts/run_daily.ps1` shows the digest as a native Windows toast
 notification (`scripts/send_toast.ps1`, using PowerShell's own registered
@@ -134,6 +147,180 @@ and is recognizable as a rerun, not a second independent piece of evidence;
 only a run over genuinely new data (more history collected, a changed
 universe, a changed feature set) produces a new fingerprint. See "Evaluation
 honesty" below.
+
+`predict-v4` is a second, separate experimental model answering a related but
+distinct question: whether a *nonlinear* model does better than predict-v3's linear
+one at the exact same task. It's motivated by a concrete finding, not a fishing
+expedition — `investigate-risk-inversion` found a genuinely U-shaped relationship
+between trailing six-month return and forward performance that a linear model's
+single coefficient per feature structurally cannot represent. `predict-v4` fits a
+hand-rolled (no scikit-learn, same reasoning as `predict`) gradient-boosted
+regression tree ensemble (`stock_scrapper/prediction/gbm.py`) — deterministic,
+exhaustive best-split search, no random row/feature subsampling — against a
+**continuous** forward excess-return target (`build_regression_dataset`) rather than
+predict-v3's binarized "beat the benchmark" label, keeping the magnitude information
+the binary version throws away. It reuses the identical date-grouped, purged,
+expanding-window walk-forward machinery as `predict` (same `_fold_boundaries`
+splitting, same leakage purge), evaluated with regression-appropriate metrics
+instead: mean squared error against each fold's own honest baseline (that fold's own
+test-period target variance — the true minimum achievable MSE for always predicting
+that fold's own mean), mean absolute error, and an information coefficient (Pearson
+correlation between predicted and actual excess return). Runs persist to
+`gbm_prediction_runs`/`gbm_prediction_folds` with the same evaluation provenance as
+`prediction_runs`/`prediction_folds`. Configure via `config/prediction_rules.yaml`'s
+`gbm:` section (tree count, depth, learning rate, leaf/split minimums, L2
+regularization) — it shares `predict-v3`'s horizon/lookback/stride/folds/features so
+the two models train and evaluate over identical rows.
+
+The first real run against the full 20-year/25-symbol history
+(`predict-v4-20260730193552-db691ae3`, 54,652 training samples) found the nonlinear
+model does not help — if anything it is a clean, consistent negative result. Holdout
+MSE (0.006157) is *worse* than the fold-specific baseline (0.005881), and it loses to
+that trivial "always predict the fold's own mean" baseline in **every one of the 5
+folds** individually (e.g. fold 4: 0.008480 vs. 0.008103; fold 5: 0.008358 vs.
+0.008038) — a more consistent loss than predict-v3 shows against its own baseline.
+The information coefficient is weak and inconsistent (-0.079 in the earliest fold,
+then +0.01 to +0.05 in the other four; +0.0137 overall), far below anything that would
+support real directional skill. Today's live predictions also surfaced a concrete
+illustration of a known weakness of leaf-based models: one extreme outlier (INTC,
++18.50%, against a next-highest of +4.89% for every other symbol) — a sign of a
+poorly-supported leaf estimate for a feature combination under-represented in
+training, which a smooth linear model wouldn't produce in the same way. Matching the
+hypothesis a nonlinear model would fix predict-v3's blind spot did not pan out in
+practice; feature importances (led by `trend_slope_200`, `sixty_day_volatility`,
+`beta`) are a genuinely different ranking from predict-v3's linear coefficients, but
+that alone isn't evidence of anything actionable given the overall negative result.
+See "Evaluation honesty" below.
+
+`predict-v5` is a third, separate experimental model asking the one question the
+other two couldn't: whether a genuinely new *data source* — not another reslice or
+remodel of price/volume history — recovers an edge. `collect-fundamentals` pulls
+point-in-time company financials directly from SEC EDGAR's free XBRL
+`companyfacts` API (`stock_scrapper/collectors/sec_edgar_fundamentals.py`), storing
+raw facts (net income, revenue, assets, liabilities, stockholders' equity, diluted
+EPS, shares outstanding) each tagged with its own `filed_date` — the day a value
+actually became public. `stock_scrapper/processing/fundamentals_features.py` turns
+these into point-in-time features strictly bounded by that date (a fact filed after
+an as-of date is never visible to it, mirroring price history's own no-lookahead
+discipline): trailing P/E, price-to-book, debt-to-equity, revenue/earnings growth
+(year-over-year, trailing-twelve-month), and return on equity. `predict-v5` reuses
+`predict-v4`'s exact gradient-boosted model and evaluation methodology unchanged,
+just with a wider `feature_keys` list (`config/prediction_rules.yaml`'s
+`predict_v5.feature_keys`) — the base technical indicators plus the six
+fundamentals above — so it stays directly comparable to predict-v4.
+
+The first real run against the full candidate universe
+(`predict-v5-20260731123026-dc54187d`, 23,400 training samples, 2010–2026 — a
+narrower window than predict-v4's because a fundamentals-derived feature needs
+several years of prior quarterly filings before it's usable) also came back
+negative, and more decisively so: holdout MSE (0.008533) is worse than the
+fold-specific baseline (0.007285) in **every one of the 5 folds** individually, and
+the information coefficient (-0.0500 overall) is, if anything, more negative than
+predict-v4's. What makes this result notable rather than a simple repeat: the two
+fundamentals features (`trailing_pe`, `price_to_book`) were the model's *most*
+important features by SSE-reduction gain (11.7% and 9.4%, ahead of every technical
+indicator), with `earnings_growth_yoy` and `debt_to_equity` also in the top eight.
+The model didn't ignore the new data — it leaned on it heavily — and still lost to
+a trivial baseline in every fold. That is evidence the fundamentals themselves
+don't carry real forward-return signal at this horizon (at least via this
+point-in-time TTM approach), not evidence the model failed to look. A known
+coverage gap: about a third of candidate symbols showed "unavailable" for today's
+live prediction because their revenue figures use XBRL tag variants outside the
+small alias list `sec_edgar_fundamentals.py` currently checks — a data-completeness
+limitation, not a lookahead or correctness bug. See "Evaluation honesty" below.
+
+**Does the horizon matter?** Fundamentals are classically a multi-quarter/multi-year
+signal, not a ~1-month one — the 21-session horizon above was inherited from
+predict-v3/v4 for comparability, not chosen because it suits fundamentals. Since
+`--horizon-days` already lets any `predict-v5` run override that, two more runs
+tested 63 sessions (~1 quarter) and 252 sessions (~1 year) against the same real
+database, using existing code, not a new model. This initial scan (with the
+15/25-symbol coverage and shared predict-v4 hyperparameters in place at the time —
+see below for the fixes applied afterward) still established the basic pattern:
+
+| Horizon | Holdout MSE vs. baseline | Folds beating baseline | Information coefficient | Top feature (share of gain) |
+|---|---|---|---|---|
+| 21 sessions | 0.008533 vs. 0.007285 (worse) | 0 of 5 | -0.0500 | `trailing_pe` (11.7%) |
+| 63 sessions | 0.029014 vs. 0.025104 (worse) | 1 of 5 | +0.0113 | `sixty_day_volatility` (14.3%) |
+| 252 sessions | 0.383058 vs. 0.349628 (worse) | 0 of 5 | +0.0410 | `return_on_equity` (29.9%) |
+
+Fundamentals' share of feature-importance gain grows sharply with horizon — a
+plausible pattern (profitability/quality factors are exactly what classic
+long-horizon fundamentals literature would predict matters at this scale) — and the
+252-session aggregate information coefficient is the highest of the three. But this
+scan also surfaced a real, separate bug, not just a "coverage gap": about a third of
+candidates showed "unavailable," and tracing why (rather than assuming it was the
+already-known revenue-tag limitation) found that most of it was two concrete, fixable
+problems — (1) large companies with noncontrolling interests (T, VZ, PG) tag only
+`StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest`, never plain
+`StockholdersEquity`; (2) SEC's own ticker-to-CIK file maps "XOM" to an unrelated
+shell entity ("ExxonMobil Holdings Corp") with zero XBRL facts, not the real Exxon
+Mobil Corporation. Both are now fixed (a fallback alias, and a documented CIK
+override, plus a safeguard that treats a zero-fact response as a collection failure
+rather than a silent empty success), and a third case (companies that never tag
+`Liabilities` directly, only `Assets` and `StockholdersEquity`) is handled by deriving
+it from the accounting identity `Liabilities = Assets − StockholdersEquity` — exact,
+not an approximation. Coverage went from 15/25 to 25/25 candidates.
+
+With full coverage, the single pre-committed confirmatory retest at 252 sessions
+(chosen before rerunning, not selected after seeing this run's result) is the most
+interesting outcome of this entire investigation: training samples nearly doubled
+(21,675 → 39,580), the overall MSE gap against baseline narrowed sharply (0.255943 vs.
+0.254308 — about 0.6% worse, down from ~9.6% worse), the information coefficient rose
+to **+0.1624** (the highest recorded anywhere in this project), and for the first time
+**2 of 5 folds actually beat their own fold-specific baseline** on MSE (folds 3 and 5),
+with 4 of 5 folds showing a positive information coefficient. All six fundamentals
+features rank in the top 8 by gain, together accounting for nearly 70% of it.
+
+This still falls short of a validated edge, and comes with a serious practical
+caveat: today's live prediction for INTC was **+323.73%**, an obviously broken value
+(predicting INTC will beat SPY by over 300 percentage points in a year is not a sane
+forecast) — the same known tree-ensemble weakness already documented for
+`predict-v4` (an outlier leaf estimate for a sparsely-populated feature combination),
+worse here because fundamentals only update quarterly, so a 252-session horizon
+effectively has very few independent fundamental "vectors" per symbol to split on.
+
+Diagnosing this directly (not guessing) found the exact mechanism: INTC's current
+`trailing_pe` is a large *negative* number (unprofitable trailing twelve months),
+`earnings_growth_yoy` is -82.5%, and this combination is rare enough in 20 years of
+training history that it likely lands in a leaf backed by only one or two genuinely
+independent quarterly precedents — repeated across many trading days, so a leaf
+"sample count" doesn't mean real statistical diversity here. `predict_v5.gbm` in
+`config/prediction_rules.yaml` now carries its own (heavier) regularization than
+predict-v4's shared `gbm` section — `min_samples_leaf`/`min_samples_split` raised
+~4x, `l2_lambda` raised 10x, shallower/slower boosting — one clearly-justified
+configuration change, not a hyperparameter scan. Rerunning with it (still the same
+252-session horizon, full 25/25 coverage) genuinely improved the model: MSE gap
+narrowed further and, for the first time anywhere in this project, **the aggregate
+holdout MSE beats its baseline outright** (0.246875 vs. 0.254308), **3 of 5 folds**
+now beat their own baseline (up from 2), and the information coefficient rose to
+**+0.1624 → +0.1910**. But INTC's outlier barely moved (+323.73% → +266.11%, despite
+4x/10x stronger regularization) — evidence this reflects a genuinely rare historical
+precedent the model is extrapolating from, not a simple overfitting artifact
+regularization alone fixes.
+
+Rather than keep chasing the outlier itself, `predict_v5`/`predict_v4`'s
+`SymbolExcessReturnPrediction` now carries a `low_confidence` flag: any live
+prediction more than `OUTLIER_STD_MULTIPLIER` (3) training-target standard
+deviations from zero is labeled `[LOW CONFIDENCE: ...]` in the CLI output rather
+than shown with the same apparent trustworthiness as an ordinary prediction — the
+raw value is never suppressed or altered, only flagged (`gbm_service.py`). On the
+real run above, INTC (+266.11%) is flagged; every other symbol, including TSLA's
+also-large +44.24%, is not.
+
+`predict-v5`'s prediction (and its `low_confidence` flag) is now also attached to
+`recommend`'s BUY output as displayed context (see "Phase 6a" above) — the same rule
+as `predict`'s probability: never a gate, always labeled, so the outlier-flagging
+mechanism protects the one command actually checked day-to-day, not only the
+standalone diagnostic run.
+
+**Read together, this is the strongest result in the whole project** — real,
+diagnosed, and honestly improved aggregate statistics — **but still not a validated
+edge**, and the live model needs its outlier-flagging mechanism (now in place) before
+any of its predictions should be trusted at all. Before doing anything else with
+predict-v5, the honest next step is a genuinely new out-of-sample confirmatory run
+(e.g. after the next quarter's fundamentals update) rather than another rerun of the
+same 2010–2026 data.
 
 `validate-signals` asks a complementary, higher-power question about
 `score_v1` itself: across every day a symbol was ever classified —
@@ -217,21 +404,60 @@ answer for both signals:
   anomaly, not evidence of a usable signal — it could reflect a real risk
   premium (riskier names carry higher expected return) or a miscalibration
   in how risk is scored; distinguishing those would require dedicated
-  investigation, not a reinterpretation of this data.
+  investigation, not a reinterpretation of this data. The daily Phase 2
+  report now surfaces this same Strong Candidate / High Risk figure (dated
+  to the latest `validate-signals` artifact on disk) directly above the
+  matching ranking table, with the same "descriptive anomaly, not a live
+  prediction" framing — see "Persistence and reports" above.
 - **`predict-v3`** (54,627 samples, 2008–2026, 5 purged walk-forward folds):
   holdout accuracy 50.6% against a sample-weighted baseline of 51.6%, and
   Brier score 0.2504 against a baseline of 0.2497 — below baseline on both
   metrics overall. Only 1 of 5 folds beats its own fold-specific baseline on
   accuracy; the most recent fold (2023–2026) is the worst of all five.
+- **`predict-v4`** (54,652 samples, same window, gradient-boosted regression on
+  continuous excess return): holdout MSE 0.006157 against a fold-specific
+  baseline of 0.005881 — worse than baseline overall, and worse in all 5 of 5
+  folds individually, a more consistent loss than predict-v3's. Information
+  coefficient is weak and inconsistent (-0.079 to +0.05 across folds). Moving
+  to a nonlinear model did not recover the edge a linear model might be
+  missing.
+- **`signal-capture-test`** (same 15 validation windows + holdout as the
+  portfolio walk-forward, `score_v1`'s own trading rules stripped out): beat
+  SPY in only 2 of 15 validation windows (13%, versus `score_v1`'s own 5 of
+  15) and lost the holdout too. Removing stop-loss/trailing-stop/regime-gate/
+  early-exit rules made results *worse*, not better — evidence those rules
+  are doing real protective work rather than suppressing a hidden edge.
+- **`predict-v5`** (23,400 samples, 2010–2026 — narrower than predict-v4's
+  window because point-in-time fundamentals require several years of prior
+  quarterly filings before a sample date has a usable trailing-twelve-month
+  figure): predict-v4's identical gradient-boosted model and evaluation
+  methodology, widened with point-in-time SEC EDGAR fundamentals (trailing
+  P/E, price-to-book, debt-to-equity, revenue/earnings growth, return on
+  equity — see "Fundamentals data" below). Holdout MSE 0.008533 against a
+  fold-specific baseline of 0.007285 — worse than baseline overall, and worse
+  in all 5 of 5 folds individually, the same clean negative pattern as
+  predict-v4. Information coefficient is weak and, on balance, more negative
+  than predict-v4's (-0.0500 overall; per-fold range -0.1505 to +0.0083).
+  Notably, this is *not* a case of the model ignoring the new features:
+  `trailing_pe` and `price_to_book` were its two most important features by
+  SSE-reduction gain (11.7% and 9.4%, ahead of every technical indicator), and
+  `earnings_growth_yoy`/`debt_to_equity` also ranked in the top eight. The
+  fundamentals were used heavily and still didn't produce a validated edge —
+  evidence against the data itself carrying real forward-return signal at this
+  horizon, not evidence the model failed to look. This closes off the last
+  remaining untried lever (a genuinely new data source) from this angle.
 
 Taken together, neither signal has demonstrated a validated edge, and the
-deeper, wider sample makes that conclusion more solid than the earlier
-narrower one did — this is not a case where more data revealed a hidden
-edge; if anything it removed ambiguity in the negative direction. This is
-stated plainly rather than glossed over. A future claim of validated edge
-would require a model or ranking to beat its own fold/window-specific
-baseline consistently across multiple non-overlapping periods, not on a
-rerun of the same data. See Limitations.
+deeper, wider sample — plus three further, more targeted attempts to find one
+(a nonlinear model, a trading-rules-stripped direct capture of the
+classification edge, and a genuinely new fundamentals data source) — makes
+that conclusion more solid than the earlier narrower one did. This is not a
+case where more data, a different model, or a new data source revealed a
+hidden edge; every additional check has removed ambiguity in the negative
+direction. This is stated plainly rather than glossed over. A future claim of
+validated edge would require a model or ranking to beat its own fold/window-
+specific baseline consistently across multiple non-overlapping periods, not on
+a rerun of the same data. See Limitations.
 
 ### Investigating the High Risk inversion
 
@@ -286,6 +512,40 @@ buckets, are in `reports/risk_inversion_study_backtest-20260729182530-b6a3a71d.j
 and its paired HTML report. Neither pattern changes score_v1 or predict-v3's current
 behavior; both are recorded as a starting point for a future, more targeted hypothesis
 or feature, not as anything actionable today.
+
+### Can the "Strong Candidate" edge be captured directly?
+
+`validate-signals` found "Strong Candidate" has a thin but real classification-level
+edge (symbol-weighted mean excess return +0.99%, 95% CI [+0.01%, +1.42%] — barely
+excluding zero), yet the full `score_v1` portfolio backtest still loses to SPY in most
+walk-forward windows. That gap raises an obvious question: is the edge real but being
+destroyed by `score_v1`'s own trading rules (entry/exit thresholds, stop-loss,
+trailing-stop, regime gating), or does the edge simply not survive contact with a real
+holding period and real costs? `python main.py signal-capture-test` isolates the
+question directly: entry is gated on the "Strong Candidate" classification alone (no
+extra opportunity/volume/confidence/risk/regime filters), every early-exit path
+(stop-loss, trailing-stop, profit-target, classification-based exit, regime-based exit)
+is disabled, and the only way out of a position is an unconditional exit after exactly
+`horizon_days` sessions — the same horizon `validate-signals` measures against. Realistic
+commission/slippage still apply, and position limits are widened (25 concurrent
+positions) so the cap itself can't be the bottleneck. This reuses the exact same
+purged, date-grouped walk-forward machinery as `walk-forward`, so results are directly
+comparable window-for-window.
+
+The answer, on the full 20-year/25-symbol history (`wf-signalcapture-20260730190245-2d67f6c0`):
+**worse**, not better. This maximally-permissive, risk-control-free variant beat SPY in
+only 2 of 15 validation windows (13%) and lost the holdout too (active_return -4.78%),
+compared to `score_v1`'s own 5 of 15 (33%) with its full rule set intact. Removing the
+stop-loss/trailing-stop/regime-gate/early-exit rules did not unlock the classification's
+thin edge — it made outcomes worse, which is the opposite of what "the trading rules
+are competing with a real edge" would predict. The more consistent explanation:
+`score_v1`'s exit rules are doing real protective work (cutting losing positions before
+a full `horizon_days` of downside), and the thin average edge `validate-signals` measures
+across *all* classified instances unconditionally does not, by itself, translate into a
+strategy worth running without risk management. This is exploratory diagnostic evidence,
+not a proposed change to `score_v1` — it changes nothing about its scoring, thresholds,
+or classification logic — but it closes off "just remove the trading rules" as a path to
+a validated edge.
 
 ## Phase 4 real-portfolio tracking
 
@@ -454,23 +714,50 @@ No API key or paid account is required. Runtime settings come from YAML; see [Co
 ## Daily automation
 
 `scripts/run_daily.ps1` runs `python main.py run` (collect → validate →
-analyze → report), `python main.py digest`, and `python main.py recommend`,
-in that order, logging combined output to `logs/daily_run_<timestamp>.log`.
-The Windows toast notification combines the digest and recommendation
-summaries into one message, with the recommendation line explicitly marked
-"advisory, unproven model" so it never reads as a stronger signal than it
-is. After the notification, the script opens that day's canonical Phase 2
-HTML report (`stock_summary_<date>_candidates_<hash>.html`, located by its
-documented filename pattern) in the default browser, gated by
+analyze → report), `python main.py digest`, `python main.py recommend`, and
+`python main.py dashboard`, in that order, logging combined output to
+`logs/daily_run_<timestamp>.log`. The Windows toast notification combines the
+digest and recommendation summaries into one message, with the recommendation
+line explicitly marked "advisory, unproven model" so it never reads as a
+stronger signal than it is. After the notification, the script opens the
+dashboard (`reports/dashboard_<date>.html` — falling back to that day's raw
+canonical Phase 2 HTML report if the dashboard step didn't produce a file, so
+this is never a regression) in the default browser, gated by
 `open_reports_automatically` in `config/settings.yaml` (default `true`); if
-no report was produced for today, this is skipped and noted in the log
-rather than treated as a failure. It uses `cmd.exe` for output redirection rather than
+neither exists for today, opening is skipped and noted in the log rather than
+treated as a failure. It uses `cmd.exe` for output redirection rather than
 PowerShell's native `2>&1`/`*>>`, which otherwise wraps every stderr line
 from a Python process (the app logger writes `INFO` to stderr) in a
 spurious `NativeCommandError` and can emit UTF-16 log files.
 
+`dashboard` combines today's digest, `recommend`'s sized suggestions, and real
+portfolio holdings into one local HTML page (`stock_scrapper/reporting/
+dashboard_builder.py`, reusing the same dark/light report theme as the
+canonical Phase 2 report) with a link out to that full report for anyone who
+wants the underlying per-symbol detail. It reads `recommend`'s own saved
+`recommendations_<date>.summary.json` rather than recomputing predict/
+predict-v5 itself — that training is the slow part of the pipeline, and
+re-running it a second time just to build this page would roughly double the
+daily run's cost for no new information. If that file doesn't exist yet (e.g.
+`dashboard` is run standalone before `recommend`), the recommendations section
+shows a note instead of failing.
+
+If `run`, `digest`, or `recommend` exits nonzero, the script shows a distinct
+"Stock Scrapper daily run FAILED" toast (exit codes plus which log file to check)
+instead of the usual summary. This exists because a failure previously looked
+identical to "nothing to report" — no toast at all — which is easy to miss for
+days. A clean run still gets exactly the combined summary toast described above;
+only a genuine failure gets the separate alert.
+
 A Windows Task Scheduler task (`\StockScrapper\DailyRun`) runs this script
-Monday–Friday. Inspect or change it with:
+Monday–Friday. Its configuration is defined in source at
+`scripts/register_task.ps1` (weekday trigger time, `StartWhenAvailable` so a
+missed run — e.g. the machine was asleep — catches up once it's next on, and a
+retry policy of 2 attempts 5 minutes apart for transient failures like a flaky
+network request) rather than existing only as manually-clicked, undocumented
+state on one machine; re-run it any time after changing its parameters to apply
+them (`Unregister-ScheduledTask` then `Register-ScheduledTask` under the hood, so
+it's always safe to re-run). Inspect or change the live task with:
 
 ```powershell
 Get-ScheduledTask -TaskPath "\StockScrapper\" -TaskName "DailyRun"
@@ -556,6 +843,11 @@ python main.py recommend --run-id <analysis-run-id> --no-save
 python main.py recommend-review --recommendation-date 2026-07-27
 python main.py recommend-review --recommendation-date 2026-07-27 --as-of-date 2026-08-17
 
+# Combined local HTML view of today's digest, recommendations, and holdings
+# (reads recommend's saved summary rather than retraining predict/predict-v5)
+python main.py dashboard
+python main.py dashboard --recalculate
+
 # Delete old log files; --include-reports also removes old digest/data-health/screener files
 python main.py cleanup-logs
 python main.py cleanup-logs --days 7
@@ -579,6 +871,26 @@ python main.py validate-signals --start 2022-07-20 --end 2026-06-30 --horizon-da
 # bucket's forward excess return? See "Investigating the High Risk inversion" below.
 python main.py investigate-risk-inversion
 python main.py investigate-risk-inversion --classifications "High Risk" "Strong Candidate"
+
+# EXPLORATORY: is validate-signals' Strong Candidate edge capturable once score_v1's own
+# trading rules stop competing with it? See "Can the Strong Candidate edge be captured
+# directly?" above.
+python main.py signal-capture-test
+python main.py signal-capture-test --horizon-days 21
+
+# EXPERIMENTAL: gradient-boosted regression on continuous excess return, separate from
+# score_v1 and predict-v3. See "Phase 5" above.
+python main.py predict-v4
+python main.py predict-v4 --symbols AAPL MSFT --as-of-date 2026-06-30
+
+# Collect point-in-time SEC EDGAR fundamentals for the candidate universe (manual/
+# periodic -- not part of daily `run`; fundamentals change quarterly, not daily).
+python main.py collect-fundamentals
+python main.py collect-fundamentals --symbols AAPL MSFT
+
+# EXPERIMENTAL: predict-v4 widened with point-in-time fundamentals. See "Phase 5" above.
+python main.py predict-v5
+python main.py predict-v5 --symbols AAPL MSFT --as-of-date 2026-06-30
 ```
 
 `digest` reads the same saved classifications as `scores`/`explain` and groups
@@ -774,11 +1086,15 @@ Walk-forward validation uses fixed warm-up and development periods as preceding 
 
 ## Persistence and reports
 
-SQLite is the system of record. Safe migrations preserve existing prices and add analysis, regime, backtest, trade, fill, equity, metric, walk-forward, and experimental-prediction (`prediction_runs`/`prediction_folds`, with per-fold date ranges, symbol counts, purge counts, baselines, and evaluation provenance) tables with run identifiers, foreign keys, indexes, uniqueness rules, and transactional writes.
+SQLite is the system of record. Safe migrations preserve existing prices and add analysis, regime, backtest, trade, fill, equity, metric, walk-forward, experimental-prediction (`prediction_runs`/`prediction_folds`, `gbm_prediction_runs`/`gbm_prediction_folds` shared by predict-v4 and predict-v5 via a `prediction_version` column, with per-fold date ranges, symbol counts, purge counts, baselines, and evaluation provenance), and fundamentals (`fundamentals` — point-in-time SEC EDGAR facts, each row tagged with its own `filed_date`) tables with run identifiers, foreign keys, indexes, uniqueness rules, and transactional writes.
 
-Phase 2 reports contain run metadata, as-of/data-through dates, score version/hash, regime evidence, candidate/risk rankings, components, factors, limitations, quality issues, prior-run changes, methodology, and inline adjusted-price/SMA20/SMA50/SMA200 charts.
+Phase 2 reports contain run metadata, as-of/data-through dates, score version/hash, regime evidence, candidate/risk rankings, components, factors, limitations, quality issues, prior-run changes, methodology, and inline adjusted-price/SMA20/SMA50/SMA200 charts. If a `validate-signals` artifact exists in the reports directory, the report also surfaces the latest Strong Candidate / High Risk bucket's symbol-weighted historical excess return (with its confidence interval and a concentration-warning caveat when applicable) directly above the matching ranking table — dated to that artifact's run, not recomputed per report, and explicitly labeled as a descriptive historical pattern rather than a live prediction for the symbols currently ranked (see "Evaluation honesty" below).
+
+If `recommend`'s own `recommendations_<date>.summary.json` exists **for that exact report date** (not "latest of any date," unlike the `validate-signals` notice above — recommendations are dated daily output, not an occasional diagnostic), the report also carries a "Today's Recommendations" section — reachable from the nav bar — showing the same sized BUY/SELL suggestions and `predict`/`predict-v5` model context as `recommend`'s own output and the `dashboard` page, read from that saved file rather than recomputed (same reasoning as `dashboard`: retraining predict-v5 per report would be needlessly slow). If no file exists yet for that date, the section shows a note to run `recommend` first instead of silently omitting itself.
 
 Backtest reports contain assumptions, date/warm-up ranges, universe/exclusions, execution and cost rules, metrics and SPY comparison, inline equity/drawdown charts, period returns, complete trades/rejections, symbol/regime performance, and bias warnings. Separate CSVs cover summary, trades, all signals, rejected candidates, orders/fills, equity, monthly returns, and annual returns. Reports are self-contained and use no CDN.
+
+`reports/dashboard_<date>.html` is not persisted anywhere else — it is rebuilt fresh each time `dashboard` runs from whatever `digest`/`recommend` data is currently available (recomputing the digest side directly, reading `recommend`'s saved summary rather than retraining its model), and is cleaned up by `cleanup-logs --include-reports` like the other unreferenced daily report files.
 
 ## Project structure
 
@@ -787,14 +1103,14 @@ main.py                         CLI entry point
 config/                         Settings, scoring, backtest rules, watchlist
 stock_scrapper/analysis/        Indicators-to-score research workflow
 stock_scrapper/backtesting/     Configuration, simulation, persistence, metrics, reports
-stock_scrapper/collectors/      Daily market-data collection
+stock_scrapper/collectors/      Daily market-data collection; SEC EDGAR fundamentals (manual/periodic)
 stock_scrapper/migrations/      Safe SQLite schema migrations
-stock_scrapper/processing/      Validation, indicators, relative strength
-stock_scrapper/reporting/       Phase 2 offline reporting and the daily digest
+stock_scrapper/processing/      Validation, indicators, relative strength, point-in-time fundamentals features
+stock_scrapper/reporting/       Phase 2 offline reporting, the daily digest, and the combined dashboard
 stock_scrapper/portfolio.py     Real-holdings aggregation and hold/sell assessment
 stock_scrapper/prediction/      Experimental forward-return prediction (config, dataset, model, service, persistence)
 stock_scrapper/trading/         Advisory trade recommendations, sizing, and hindsight review (config, recommendations, review)
-scripts/                        Daily automation wrapper, toast notification (Task Scheduler entry point)
+scripts/                        Daily automation wrapper, toast notification, reproducible Task Scheduler registration
 tools/                          Clean source-archive tooling
 data/                           Local SQLite and caches; not source-controlled
 reports/                        Generated offline reports; not source-controlled
@@ -812,16 +1128,19 @@ python -m pytest -q
 
 ## Limitations
 
-- **Static watchlist:** the configured universe is not reconstructed historically.
-- **Survivorship bias:** delisted, merged, bankrupt, or otherwise unavailable securities may be absent, which can overstate robustness.
+- **Static watchlist:** the configured candidate universe and `config/screening_universe.csv` are both hand-maintained, not reconstructed historically or kept current by any live feed. `screen` now warns once the screening list hasn't been reviewed in a while (`screening.universe_last_verified`/`staleness_warning_days` in `config/settings.yaml`, default 180 days), so staleness is at least a visible, actionable caveat instead of silent drift — but a genuinely current or historically-accurate universe would need a real index-constituents data source, which conflicts with this project's free/no-API-key design and was deliberately not attempted (a scraped/unofficial source would be fragile and could silently go wrong).
+- **Survivorship bias:** delisted, merged, bankrupt, or otherwise unavailable securities may be absent from both the candidate universe and any historical backtest, which can overstate robustness. This is a structural limitation of building on free daily-bar data, not a fixable code gap: correcting it needs a historical point-in-time constituents dataset (which symbols were actually in the investable universe on each past date, including ones since delisted), and no free, reliable source of that exists.
 - **Free-data limitations:** yfinance data may be delayed, revised, incomplete, rate-limited, or inconsistent across corporate actions.
 - **Daily bars:** OHLC data cannot reveal the exact intraday order of events.
 - **Historical simulation:** fills are modeled from stored bars and configured assumptions, not an exchange order book.
-- **Research scope:** technical evidence omits fundamentals, macroeconomic releases, news, taxes, borrowing constraints, and individual circumstances.
+- **Research scope:** `score_v1` itself is technical-only and omits fundamentals, macroeconomic releases, news, taxes, borrowing constraints, and individual circumstances. `predict-v5` (see below) experimentally adds point-in-time company fundamentals, but only as features for that one experimental model — it changes nothing about `score_v1`'s own scoring or classification logic.
 - **Screening universe:** `config/screening_universe.csv` is a hand-maintained illustrative list, not a live feed of any official index's constituents, and is not automatically kept current.
 - **Experimental prediction:** `predict` fits a small linear model on freely available technical indicators; its date-grouped, purged, sample-weighted walk-forward holdout accuracy/Brier score are reported next to their own fold-specific baselines precisely so a lack of real edge is visible rather than hidden — and, as of this project's current data, that is exactly what they show (see "Evaluation honesty" above). Past accuracy does not indicate future accuracy. It is not part of `score_v1`.
+- **Experimental nonlinear prediction:** `predict-v4` fits a gradient-boosted regression tree ensemble on the same evaluation methodology as `predict`, targeting continuous excess return instead of a binary label; as of this project's current data it is a consistent negative result, losing to its own fold-specific baseline in every fold (see "Evaluation honesty" above). It is not part of `score_v1` or `predict-v3`, and a single extreme prediction (an outlier tree-leaf estimate for a feature combination under-represented in training) should be treated with particular skepticism.
+- **Experimental fundamentals-augmented prediction:** `predict-v5` widens `predict-v4` with point-in-time SEC EDGAR fundamentals across all 25 candidates; at a 21-session horizon it is a clean negative result, and at a 252-session (~1 year) horizon, with its own heavier regularization (`predict_v5.gbm` in `config/prediction_rules.yaml`), it is the closest to a real edge anything in this project has shown — the aggregate holdout MSE beats its baseline outright for the first time anywhere in this project, 3 of 5 folds beat their own baseline, and the information coefficient is +0.1910 — but it is still not validated (see "Evaluation honesty" above for the full numbers). Any `predict-v4`/`predict-v5` prediction flagged `[LOW CONFIDENCE]` in the CLI output (more than `OUTLIER_STD_MULTIPLIER`, currently 3, training-target standard deviations from zero) is an extrapolated outlier, not a trustworthy forecast — diagnosed directly for INTC's real +266%–+324% predictions across these runs, traced to a rare, sparsely-precedented feature combination (deeply negative trailing P/E and earnings growth) that heavier regularization alone could not fully tame. `collect-fundamentals`'s CIK resolution and concept-alias coverage had two real bugs (a wrong SEC ticker-to-CIK mapping for XOM; missing noncontrolling-interest equity tag variants) found and fixed this session — neither was a lookahead-safety issue (every fact used is still bounded by its own `filed_date`), but any symbol newly added to the candidate universe should be spot-checked the same way before trusting its fundamentals coverage.
 - **Signal validation is descriptive, not inferential:** `validate-signals`' p-values are naive (they assume independent daily trials, which overlapping-horizon, symbol-clustered rows are not) and are labeled as such; the symbol-weighted mean and its confidence interval are the more defensible read, and buckets backed by fewer than four distinct symbols are flagged as concentration-prone rather than presented as population-level evidence.
 - **Risk-inversion diagnostics are exploratory:** `investigate-risk-inversion`'s quintile splits and Pearson correlations share `validate-signals`' overlapping-window, symbol-clustered non-independence, and testing several correlated indicators at once can look suggestive by chance. Treat its output as hypothesis generation, not a validated explanation, and it changes nothing about score_v1's scoring, thresholds, or classification logic.
+- **Signal-capture diagnostic is exploratory:** `signal-capture-test` is a maximally-permissive score_v1 variant (single-classification entry, no risk-management exits, fixed holding period) built to isolate one question — see "Can the Strong Candidate edge be captured directly?" above. It found removing score_v1's trading rules performs *worse*, not better, suggesting those rules do real protective work rather than suppressing an edge — but it is one exploratory read over one (overlapping-window) history, not a validated conclusion, and changes nothing about score_v1 itself.
 - **Advisory recommendations only:** `recommend` sizes suggestions but never places an order — there is no broker integration, and `auto_execute` in `config/trading_rules.yaml` is rejected if set to `true`. Sizing assumes a single account with no existing outside positions, ignores taxes/fees, and derives available cash from `starting_capital` plus recorded lots/sales rather than a real brokerage balance.
 
 ## Financial and historical-results disclaimer

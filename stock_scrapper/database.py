@@ -199,6 +199,29 @@ def fetch_price_history(
     ]
 
 
+FUNDAMENTALS_COLUMNS = (
+    "symbol", "concept", "source_tag", "fiscal_year", "fiscal_period", "form",
+    "period_start", "period_end", "filed_date", "value", "unit", "frame", "collected_at",
+)
+
+
+def fetch_fundamentals(conn: sqlite3.Connection, symbol: str) -> list[dict[str, Any]]:
+    """Load every stored SEC EDGAR fundamentals fact for one symbol (see
+    ``stock_scrapper/collectors/sec_edgar_fundamentals.py``). Point-in-time filtering
+    happens downstream in ``fundamentals_as_of``/``fundamentals_features_as_of`` — this
+    always returns the complete history on file, unfiltered by any as-of date.
+    """
+    sql = (
+        f"SELECT {', '.join(FUNDAMENTALS_COLUMNS)} FROM fundamentals "
+        "WHERE symbol = ? ORDER BY filed_date ASC"
+    )
+    rows = conn.execute(sql, (symbol.strip().upper(),)).fetchall()
+    return [
+        dict(row) if isinstance(row, sqlite3.Row) else dict(zip(FUNDAMENTALS_COLUMNS, row, strict=True))
+        for row in rows
+    ]
+
+
 def canonical_values(row: Mapping[str, Any]) -> str:
     """Canonical JSON snapshot used by revision audit rows."""
     values = {key: (None if isinstance(row.get(key), float) and math.isnan(row.get(key)) else row.get(key)) for key in FINGERPRINT_FIELDS}

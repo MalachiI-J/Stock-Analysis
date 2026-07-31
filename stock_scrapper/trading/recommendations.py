@@ -4,9 +4,11 @@ Advisory only: nothing here places an order. SELL signals are exactly the ones
 :func:`stock_scrapper.portfolio.evaluate_holding` already computes (the same rules a
 backtest would exit on), so a live sell recommendation and a backtest exit always agree.
 BUY candidates come from score_v1's own classification (Strong Candidate / Candidate) —
-the experimental prediction model's probability is attached to each candidate purely as
-displayed context, never as a gate, since its accuracy doesn't yet warrant driving a
-real trade decision (see stock_scrapper/prediction/).
+the experimental prediction models' output is attached to each candidate purely as
+displayed context, never as a gate, since neither's accuracy yet warrants driving a
+real trade decision (see stock_scrapper/prediction/): predict's probability of beating
+the benchmark, and predict-v5's predicted excess-return magnitude plus its
+``low_confidence`` flag for statistically extreme, likely-extrapolated predictions.
 
 There is no persisted cash ledger. Available cash is derived from the existing
 portfolio_lots/portfolio_sales tables plus one user-set "starting_capital" figure:
@@ -49,6 +51,8 @@ class TradeRecommendation:
     estimated_dollars: float
     reason: str
     model_probability: float | None = None
+    predict_v5_excess_return: float | None = None
+    predict_v5_low_confidence: bool = False
 
 
 @dataclass(slots=True)
@@ -79,9 +83,13 @@ def build_recommendations(
     latest_price_by_symbol: Mapping[str, float],
     rules: Mapping[str, Any],
     model_probability_by_symbol: Mapping[str, float] | None = None,
+    predict_v5_excess_return_by_symbol: Mapping[str, float] | None = None,
+    predict_v5_low_confidence_by_symbol: Mapping[str, bool] | None = None,
 ) -> RecommendationRunResult:
     """Compute SELL signals for held positions and sized BUY candidates for the rest."""
     model_probability_by_symbol = model_probability_by_symbol or {}
+    predict_v5_excess_return_by_symbol = predict_v5_excess_return_by_symbol or {}
+    predict_v5_low_confidence_by_symbol = predict_v5_low_confidence_by_symbol or {}
     held_symbols = {position.symbol for position in positions}
     available_cash = compute_available_cash(lots, sales, starting_capital=float(rules["starting_capital"]))
     holdings_value = sum(_holding_value(holding) for holding in holdings)
@@ -160,6 +168,8 @@ def build_recommendations(
                 symbol=result.symbol, action="BUY", shares=float(shares),
                 estimated_dollars=estimated_dollars, reason=result.primary_reason,
                 model_probability=model_probability_by_symbol.get(result.symbol),
+                predict_v5_excess_return=predict_v5_excess_return_by_symbol.get(result.symbol),
+                predict_v5_low_confidence=predict_v5_low_confidence_by_symbol.get(result.symbol, False),
             )
         )
         spendable -= estimated_dollars
@@ -201,8 +211,13 @@ def render_recommendations_text(result: RecommendationRunResult) -> str:
             probability_text = (
                 "" if rec.model_probability is None else f" | model: {rec.model_probability:.0%} beats benchmark"
             )
+            v5_text = ""
+            if rec.predict_v5_excess_return is not None:
+                confidence_suffix = " [LOW CONFIDENCE]" if rec.predict_v5_low_confidence else ""
+                v5_text = f" | predict-v5: {rec.predict_v5_excess_return:+.1%} predicted excess return{confidence_suffix}"
             lines.append(
-                f"  {rec.symbol:<6} {rec.shares:g} sh (~${rec.estimated_dollars:,.2f}) — {rec.reason}{probability_text}"
+                f"  {rec.symbol:<6} {rec.shares:g} sh (~${rec.estimated_dollars:,.2f}) — "
+                f"{rec.reason}{probability_text}{v5_text}"
             )
     else:
         lines.append("  None")
