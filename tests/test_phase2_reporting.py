@@ -319,6 +319,85 @@ def test_phase2_report_ignores_unparseable_signal_validation_artifact(tmp_path: 
     assert "Historical signal validation" not in content
 
 
+def _recommendations_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "as_of_date": "2024-12-31",
+        "account_value": 10000.0,
+        "available_cash": 8500.0,
+        "open_position_count": 1,
+        "recommendations": [
+            {
+                "symbol": "NVDA", "action": "BUY", "shares": 10.0, "estimated_dollars": 500.0,
+                "reason": "Strong trend", "model_probability": 0.6,
+                "predict_v5_excess_return": 0.234, "predict_v5_low_confidence": True,
+            },
+        ],
+        "skipped": ["AAPL: no current price available"],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_phase2_report_nav_bar_links_to_recommendations(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert '<a href="#recommendations">Recommendations</a>' in content
+    assert '<h2 id="recommendations">' in content
+
+
+def test_phase2_report_shows_placeholder_when_no_recommendations_artifact_present(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "run <span class=\"mono\">python main.py recommend</span> first" in content
+
+
+def test_phase2_report_surfaces_latest_recommendations_summary(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(
+        json.dumps(_recommendations_payload()), encoding="utf-8",
+    )
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "NVDA" in content
+    assert "model 60% beats benchmark" in content
+    assert "predict-v5 +23.4%" in content
+    assert "LOW CONFIDENCE" in content
+    assert "AAPL: no current price available" in content
+    assert "Account value $10,000.00" in content
+    # Placed right after Market Regime, before Candidate Ranking.
+    assert content.index("Market Regime") < content.index("Today's Recommendations") < content.index("Candidate Ranking")
+
+
+def test_phase2_report_uses_recommendations_matching_this_exact_report_date(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    (tmp_path / "recommendations_2024-12-30.summary.json").write_text(
+        json.dumps(_recommendations_payload(as_of_date="2024-12-30")), encoding="utf-8",
+    )
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "NVDA" not in content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
+
+
+def test_phase2_report_ignores_unparseable_recommendations_artifact(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text("not json", encoding="utf-8")
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "run <span class=\"mono\">python main.py recommend</span> first" in content
+
+
 def test_phase2_report_is_deterministic_when_generation_metadata_is_fixed(tmp_path: Path) -> None:
     metadata, results, histories, issues, previous = _report_inputs()
 

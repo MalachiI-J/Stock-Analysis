@@ -216,10 +216,12 @@ def write_phase2_reports(
     html_path = output_path / f"stock_summary_{report_date_text}{suffix}.html"
     _write_phase2_csv(csv_path, csv_rows)
     signal_validation = _latest_signal_validation_summary(output_path)
+    recommendations_summary = _latest_recommendations_summary(output_path, report_date_text)
     html_path.write_text(
         _render_phase2_html(
             report_date_text, metadata, entries, candidate_order, risk_order, normalized_issues,
             signal_validation=signal_validation,
+            recommendations_summary=recommendations_summary,
         ),
         encoding="utf-8",
     )
@@ -1230,6 +1232,93 @@ def _signal_validation_notice_html(summary: Mapping[str, Any] | None, classifica
     )
 
 
+def _latest_recommendations_summary(reports_dir: Path, report_date: str) -> dict[str, Any] | None:
+    """Best-effort load of ``recommendations_<report_date>.summary.json`` (written by
+    ``main.py recommend``) from the same reports directory, for this exact report date.
+
+    Not recomputed here — ``recommend`` trains predict/predict-v5 from scratch, which
+    is comparatively slow, and duplicating that per report would meaningfully slow the
+    daily pipeline for no new information. Returns ``None`` (silently — this is
+    supplementary context, not core report content) if ``recommend`` hasn't been run
+    yet for this date or the file can't be parsed.
+    """
+    path = Path(reports_dir) / f"recommendations_{report_date}.summary.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _recommendations_section_html(summary: Mapping[str, Any] | None) -> str:
+    """Today's sized BUY/SELL suggestions from the latest ``recommend`` run, if one is
+    on file for this report date. Advisory only — nothing here has been bought or
+    sold, and model context (``predict``/``predict-v5``) is displayed information,
+    never a gate on any suggestion (see README's "Phase 6a" section).
+    """
+    if not isinstance(summary, Mapping):
+        return (
+            '<p class="muted">No recommendations_&lt;date&gt;.summary.json found for this date — '
+            'run <span class="mono">python main.py recommend</span> first.</p>'
+        )
+
+    def rows(items: list[Mapping[str, Any]]) -> str:
+        if not items:
+            return "<p>None today.</p>"
+        body = []
+        for item in items:
+            context: list[str] = []
+            probability = item.get("model_probability")
+            if probability is not None:
+                context.append(f"model {probability:.0%} beats benchmark")
+            excess_return = item.get("predict_v5_excess_return")
+            if excess_return is not None:
+                flag = (
+                    ' <span class="badge badge-warning">LOW CONFIDENCE</span>'
+                    if item.get("predict_v5_low_confidence") else ""
+                )
+                context.append(f"predict-v5 {excess_return:+.1%}{flag}")
+            shares = _finite_number(item.get("shares"))
+            dollars = _finite_number(item.get("estimated_dollars"))
+            body.append(
+                "<tr>"
+                f'<td class="mono">{_display(item.get("symbol"))}</td>'
+                f'<td class="num">{"n/a" if shares is None else f"{shares:g}"}</td>'
+                f'<td class="num">{"n/a" if dollars is None else f"${dollars:,.2f}"}</td>'
+                f"<td>{_display(item.get('reason'))}</td>"
+                f"<td>{' &middot; '.join(context)}</td>"
+                "</tr>"
+            )
+        return (
+            '<table><thead><tr><th>Symbol</th><th class="num">Shares</th><th class="num">Est. $</th>'
+            "<th>Reason</th><th>Model context</th></tr></thead><tbody>" + "".join(body) + "</tbody></table>"
+        )
+
+    recommendations = summary.get("recommendations") or []
+    buys = [item for item in recommendations if isinstance(item, Mapping) and item.get("action") == "BUY"]
+    sells = [item for item in recommendations if isinstance(item, Mapping) and item.get("action") == "SELL"]
+    skipped = summary.get("skipped") or []
+    skipped_html = (
+        "<h4>Considered but not recommended</h4><ul>"
+        + "".join(f"<li>{_escape(entry)}</li>" for entry in skipped)
+        + "</ul>"
+        if skipped else ""
+    )
+    account_value = _finite_number(summary.get("account_value"))
+    available_cash = _finite_number(summary.get("available_cash"))
+    subtitle = (
+        f'<p class="subtitle">Account value ${account_value:,.2f} &nbsp;&middot;&nbsp; '
+        f"Available cash ${available_cash:,.2f} &nbsp;&middot;&nbsp; "
+        f"Open positions {_display(summary.get('open_position_count'))}</p>"
+        if account_value is not None and available_cash is not None else ""
+    )
+    return (
+        subtitle
+        + f'<h3>Buy — {len(buys)}</h3><div class="card">{rows(buys)}</div>'
+        + f'<h3>Sell — {len(sells)}</h3><div class="card">{rows(sells)}</div>'
+        + skipped_html
+    )
+
+
 def _render_phase2_html(
     report_date: str,
     metadata: dict[str, Any],
@@ -1238,10 +1327,12 @@ def _render_phase2_html(
     risk_order: list[dict[str, Any]],
     quality_issues: list[dict[str, Any]],
     signal_validation: Mapping[str, Any] | None = None,
+    recommendations_summary: Mapping[str, Any] | None = None,
 ) -> str:
     candidate_rank = {str(item.get("symbol", "")).upper(): rank for rank, item in enumerate(candidate_order, 1)}
     risk_rank = {str(item.get("symbol", "")).upper(): rank for rank, item in enumerate(risk_order, 1)}
     regime_reasons = _render_list(metadata.get("market_regime_reasons"), "No regime reasons were recorded.")
+    recommendations_html = _recommendations_section_html(recommendations_summary)
 
     # Report date, As-of date, and Benchmark live in the header subtitle now —
     # this footer only carries the run-identification fields that don't fit
@@ -1283,7 +1374,7 @@ def _render_phase2_html(
 {_market_hero_html()}
   <nav class="term-nav" aria-label="Report sections">
     <div class="term-nav-links">
-    <a href="#top">Home</a><a href="#candidates">Candidates</a>
+    <a href="#top">Home</a><a href="#recommendations">Recommendations</a><a href="#candidates">Candidates</a>
     <a href="#highest-risk">Highest risk</a><a href="#changes">Changes</a><a href="#symbols">Symbols</a>
     <a href="#run-details">Run details</a>
     </div>
@@ -1298,6 +1389,11 @@ def _render_phase2_html(
   <div class="notice"><strong>Research disclaimer:</strong> Educational research only; not personalized financial advice. Scores and classifications do not guarantee investment performance.</div>
   <h2 id="market-regime">Market Regime</h2>
   <div class="card regime"><div class="regime-head">{regime_badge}<span class="regime-confidence">confidence {_score(metadata.get('market_regime_confidence'))}</span></div><h4>Market-regime reasons</h4>{regime_reasons}</div>
+  <h2 id="recommendations">Today's Recommendations</h2>
+  <div class="notice"><strong>Advisory only.</strong> Sized suggestions only — nothing here has been bought or
+  sold. Model context (<span class="mono">predict</span> / <span class="mono">predict-v5</span>) is displayed
+  information only, never a gate on any recommendation. See <span class="mono">python main.py recommend</span>.</div>
+  {recommendations_html}
   <h2 id="candidates">Candidate Ranking</h2>
   {candidate_validation_html}
   <div class="card">{candidate_html}</div>
