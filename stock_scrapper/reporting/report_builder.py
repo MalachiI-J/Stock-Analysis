@@ -446,10 +446,25 @@ _REPORT_STYLES = """\
     h2:target { color:var(--good-fg); transition:color 1.8s ease; }
     h4 { margin-bottom:6px; }
     table { width:100%; border-collapse:collapse; margin:12px 0 22px; }
-    th,td { border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; }
+    th,td { padding:11px 14px; text-align:left; vertical-align:top; }
+    td { border-bottom:1px solid var(--line); }
+    tbody tr:last-child td { border-bottom:none; }
+    table:not(.metadata) tbody tr:nth-child(even) td { background:var(--th-bg); }
+    table:not(.metadata) tbody tr:hover td { background:var(--hover-bg); }
     th { background:var(--th-bg); color:var(--ink-2); font-weight:600;
-      font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+      font-size:12px; text-transform:uppercase; letter-spacing:.04em; border-bottom:1px solid var(--border); }
     td.num, th.num { text-align:right; }
+    /* Accent-edge rows (Candidate/Highest-Risk ranking): the row's left border
+       plus plain colored classification text do the job a filled badge pill
+       used to do alone — see _ranking_table(). */
+    tbody tr[data-status] { border-left:3px solid var(--neutral-fg); }
+    tbody tr[data-status="good"] { border-left-color:var(--good-fg); }
+    tbody tr[data-status="warning"] { border-left-color:var(--warning-fg); }
+    tbody tr[data-status="serious"] { border-left-color:var(--serious-fg); }
+    tbody tr[data-status="critical"] { border-left-color:var(--critical-fg); }
+    .status-good { color:var(--good-fg); } .status-warning { color:var(--warning-fg); }
+    .status-serious { color:var(--serious-fg); } .status-critical { color:var(--critical-fg); }
+    .status-neutral { color:var(--neutral-fg); }
     .mono, td.num, .stat-value, .delta, code, .kv dd, .metadata td { font-family:var(--mono); font-variant-numeric:tabular-nums; }
     /* Shared key/value table style (used by the footer's run-details
        disclosure): hairline row separators only, no visible cell borders. */
@@ -475,6 +490,15 @@ _REPORT_STYLES = """\
     .card ul { list-style:none; margin:6px 0 0; padding:0; }
     .card ul li { position:relative; padding-left:16px; margin:4px 0; color:var(--ink); }
     .card ul li::before { content:"–"; position:absolute; left:0; color:var(--muted); }
+    /* One card per recommendation row (Buy/Sell) instead of a spreadsheet-style
+       table — no elevation on the individual cards, since they already sit
+       inside the section's own .card container. */
+    .rec-list { display:flex; flex-direction:column; gap:8px; }
+    .rec-card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:12px 16px; }
+    .rec-card-head { display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
+    .rec-symbol { font-size:15px; font-weight:600; }
+    .rec-reason { color:var(--muted); margin-top:4px; }
+    .rec-context { font-size:12.5px; margin-top:6px; }
     .badge { display:inline-flex; align-items:center; gap:5px; padding:3px 11px; border-radius:999px;
       font-size:13px; font-weight:600; border:1px solid transparent; white-space:nowrap; }
     .badge-good { color:var(--good-fg); background:var(--good-bg); border-color:var(--good-border); }
@@ -1264,7 +1288,7 @@ def _recommendations_section_html(summary: Mapping[str, Any] | None) -> str:
     def rows(items: list[Mapping[str, Any]]) -> str:
         if not items:
             return "<p>None today.</p>"
-        body = []
+        cards = []
         for item in items:
             context: list[str] = []
             probability = item.get("model_probability")
@@ -1279,19 +1303,27 @@ def _recommendations_section_html(summary: Mapping[str, Any] | None) -> str:
                 context.append(f"predict-v5 {excess_return:+.1%}{flag}")
             shares = _finite_number(item.get("shares"))
             dollars = _finite_number(item.get("estimated_dollars"))
-            body.append(
-                "<tr>"
-                f'<td class="mono">{_display(item.get("symbol"))}</td>'
-                f'<td class="num">{"n/a" if shares is None else f"{shares:g}"}</td>'
-                f'<td class="num">{"n/a" if dollars is None else f"${dollars:,.2f}"}</td>'
-                f"<td>{_display(item.get('reason'))}</td>"
-                f"<td>{' &middot; '.join(context)}</td>"
-                "</tr>"
+            shares_text = "n/a" if shares is None else f"{shares:g}"
+            dollars_text = "n/a" if dollars is None else f"${dollars:,.2f}"
+            if excess_return is None or excess_return == 0:
+                context_status = "neutral"
+            else:
+                context_status = "good" if excess_return > 0 else "critical"
+            context_html = (
+                f'<div class="rec-context mono delta-{context_status}">{" &middot; ".join(context)}</div>'
+                if context else ""
             )
-        return (
-            '<table><thead><tr><th>Symbol</th><th class="num">Shares</th><th class="num">Est. $</th>'
-            "<th>Reason</th><th>Model context</th></tr></thead><tbody>" + "".join(body) + "</tbody></table>"
-        )
+            cards.append(
+                '<div class="rec-card">'
+                '<div class="rec-card-head">'
+                f'<span class="mono rec-symbol">{_display(item.get("symbol"))}</span>'
+                f'<span class="mono">{shares_text} sh &middot; {dollars_text}</span>'
+                "</div>"
+                f'<div class="rec-reason">{_display(item.get("reason"))}</div>'
+                f"{context_html}"
+                "</div>"
+            )
+        return '<div class="rec-list">' + "".join(cards) + "</div>"
 
     recommendations = summary.get("recommendations") or []
     buys = [item for item in recommendations if isinstance(item, Mapping) and item.get("action") == "BUY"]
@@ -1442,10 +1474,10 @@ def _ranking_table(
             f'{_gauge_html(result.get("risk_score"), risk_status)}</span>'
         )
         rows.append(
-            "<tr>"
+            f'<tr data-status="{classification_status}">'
             f'<td class="num">{ranks.get(symbol, "")}</td>'
             f'<td><a class="mono" href="#{_symbol_anchor_id(symbol)}">{_escape(symbol)}</a></td>'
-            f"<td>{_badge(result.get('classification'), _CLASSIFICATION_STATUS)}</td>"
+            f'<td class="status-{classification_status}">{_display(result.get("classification"))}</td>'
             f'<td class="num">{opportunity_cell}</td>'
             f'<td class="num">{risk_cell}</td>'
             f'<td class="num">{_score(result.get("confidence_score"))}</td></tr>'

@@ -398,6 +398,79 @@ def test_phase2_report_ignores_unparseable_recommendations_artifact(tmp_path: Pa
     assert "run <span class=\"mono\">python main.py recommend</span> first" in content
 
 
+def test_phase2_report_recommendations_render_as_cards_not_a_table(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(
+        json.dumps(_recommendations_payload()), encoding="utf-8",
+    )
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
+    assert '<div class="rec-list">' in section
+    assert '<div class="rec-card">' in section
+    assert "<table>" not in section
+    assert "NVDA" in section.split('<span class="mono rec-symbol">')[1].split("</span>")[0]
+    assert "10 sh &middot; $500.00" in section
+
+
+def test_phase2_report_recommendations_context_line_colored_by_predict_v5_sign(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    payload = _recommendations_payload(recommendations=[
+        {
+            "symbol": "NVDA", "action": "BUY", "shares": 10.0, "estimated_dollars": 500.0,
+            "reason": "Strong trend", "predict_v5_excess_return": 0.05, "predict_v5_low_confidence": False,
+        },
+        {
+            "symbol": "KO", "action": "BUY", "shares": 5.0, "estimated_dollars": 200.0,
+            "reason": "Defensive pick", "predict_v5_excess_return": -0.03, "predict_v5_low_confidence": False,
+        },
+        {
+            "symbol": "BAC", "action": "BUY", "shares": 8.0, "estimated_dollars": 300.0,
+            "reason": "Financials", "model_probability": 0.55,
+        },
+    ])
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
+    assert 'class="rec-context mono delta-good">predict-v5 +5.0%' in section
+    assert 'class="rec-context mono delta-critical">predict-v5 -3.0%' in section
+    assert 'class="rec-context mono delta-neutral">model 55% beats benchmark' in section
+
+
+def test_phase2_report_ranking_tables_use_accent_edge_not_badge_pill(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    candidate_section = content.split('id="candidates"')[1].split('id="highest-risk"')[0]
+    risk_section = content.split('id="highest-risk"')[1].split('id="changes"')[0]
+    # AAPL is "Strong Candidate" (good) and ranked #1 in both tables' shared pool.
+    assert 'data-status="good"' in candidate_section
+    assert '<td class="status-good">Strong Candidate</td>' in candidate_section
+    # TSLA is "High Risk" (critical).
+    assert 'data-status="critical"' in risk_section
+    assert '<td class="status-critical">High Risk</td>' in risk_section
+    # No more filled badge pill for classification in either ranking table.
+    assert "badge-good" not in candidate_section and "badge-critical" not in risk_section
+
+
+def test_phase2_report_changes_table_classification_badges_are_unchanged(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    changes_section = content.split("Changes From Previous Stored Analysis")[1].split("Data-Quality Concerns")[0]
+    assert 'class="badge badge-good">Strong Candidate' in changes_section
+    assert "data-status" not in changes_section
+
+
 def test_phase2_report_is_deterministic_when_generation_metadata_is_fixed(tmp_path: Path) -> None:
     metadata, results, histories, issues, previous = _report_inputs()
 
