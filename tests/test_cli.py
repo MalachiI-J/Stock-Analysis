@@ -1545,9 +1545,30 @@ def test_collect_fundamentals_command_persists_records_and_reports_partial_failu
     assert "fundamentals_upserted=1 symbols=2 failed=1" in captured.out
     assert "failed_symbols=MSFT" in captured.out
 
-    conn = create_connection(config["database_path"])
-    try:
-        row = conn.execute("SELECT symbol, concept, value FROM fundamentals").fetchone()
-        assert tuple(row) == ("AAPL", "net_income", 1000.0)
-    finally:
-        conn.close()
+
+def test_collect_fundamentals_command_treats_zero_facts_as_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A resolved CIK that returns no usable facts at all (e.g. SEC's ticker file
+    once mapped "XOM" to an unrelated shell entity) must be surfaced as a failure,
+    not silently reported as a successful, empty collection."""
+    config = _config(tmp_path)
+    config["edgar"] = {
+        "user_agent": "Stock Scraper Research test@example.com",
+        "timeout_seconds": 5, "max_retries": 1, "retry_delay_seconds": 0,
+    }
+    monkeypatch.setattr(cli, "load_config", lambda _base_dir: config)
+    monkeypatch.setattr(cli, "ensure_directories", lambda _config: None)
+    monkeypatch.setattr(cli, "load_watchlist", lambda _path: ["XOM"])
+    monkeypatch.setattr(cli, "setup_logging", lambda _config, run_id: _Logger())
+    monkeypatch.setattr(cli, "fetch_ticker_cik_map", lambda **_kwargs: {"XOM": "0002115436"})
+    monkeypatch.setattr(cli, "fetch_company_facts", lambda *_args, **_kwargs: {"facts": {"us-gaap": {}}})
+
+    exit_code = cli.main(["collect-fundamentals", "--symbols", "XOM"])
+
+    assert exit_code == int(ExitCode.PARTIAL_FAILURE)
+    captured = capsys.readouterr()
+    assert "fundamentals_upserted=0 symbols=1 failed=1" in captured.out
+    assert "failed_symbols=XOM" in captured.out

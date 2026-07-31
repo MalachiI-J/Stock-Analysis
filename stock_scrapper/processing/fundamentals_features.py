@@ -118,6 +118,13 @@ def fundamentals_as_of(records: Sequence[Mapping[str, Any]], as_of: date) -> dic
         result[concept] = _latest_instant_value(records, concept, as_of)
     for concept in _FLOW_CONCEPTS:
         result[concept] = trailing_four_quarter_sum(records, concept, as_of)
+    if result["liabilities"] is None and result["assets"] is not None and result["stockholders_equity"] is not None:
+        # Some large companies (live-checked: AMZN, VZ) never explicitly tag
+        # "Liabilities" as its own XBRL fact, only the balance-sheet total
+        # ("LiabilitiesAndStockholdersEquity") and equity. Liabilities = Assets -
+        # StockholdersEquity is the fundamental accounting identity, not an
+        # approximation, so this is exact whenever both inputs are available.
+        result["liabilities"] = result["assets"] - result["stockholders_equity"]
     return result
 
 

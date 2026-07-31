@@ -216,6 +216,62 @@ live prediction because their revenue figures use XBRL tag variants outside the
 small alias list `sec_edgar_fundamentals.py` currently checks — a data-completeness
 limitation, not a lookahead or correctness bug. See "Evaluation honesty" below.
 
+**Does the horizon matter?** Fundamentals are classically a multi-quarter/multi-year
+signal, not a ~1-month one — the 21-session horizon above was inherited from
+predict-v3/v4 for comparability, not chosen because it suits fundamentals. Since
+`--horizon-days` already lets any `predict-v5` run override that, two more runs
+tested 63 sessions (~1 quarter) and 252 sessions (~1 year) against the same real
+database, using existing code, not a new model:
+
+| Horizon | Holdout MSE vs. baseline | Folds beating baseline | Information coefficient | Top feature (share of gain) |
+|---|---|---|---|---|
+| 21 sessions | 0.008533 vs. 0.007285 (worse) | 0 of 5 | -0.0500 | `trailing_pe` (11.7%) |
+| 63 sessions | 0.029014 vs. 0.025104 (worse) | 1 of 5 | +0.0113 | `sixty_day_volatility` (14.3%) |
+| 252 sessions | 0.383058 vs. 0.349628 (worse) | 0 of 5 | +0.0410 | `return_on_equity` (29.9%) |
+
+Fundamentals' share of feature-importance gain grows sharply with horizon — a
+plausible pattern (profitability/quality factors are exactly what classic
+long-horizon fundamentals literature would predict matters at this scale) — and the
+252-session aggregate information coefficient is the highest of the three. But this
+scan also surfaced a real, separate bug, not just a "coverage gap": about a third of
+candidates showed "unavailable," and tracing why (rather than assuming it was the
+already-known revenue-tag limitation) found that most of it was two concrete, fixable
+problems — (1) large companies with noncontrolling interests (T, VZ, PG) tag only
+`StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest`, never plain
+`StockholdersEquity`; (2) SEC's own ticker-to-CIK file maps "XOM" to an unrelated
+shell entity ("ExxonMobil Holdings Corp") with zero XBRL facts, not the real Exxon
+Mobil Corporation. Both are now fixed (a fallback alias, and a documented CIK
+override, plus a safeguard that treats a zero-fact response as a collection failure
+rather than a silent empty success), and a third case (companies that never tag
+`Liabilities` directly, only `Assets` and `StockholdersEquity`) is handled by deriving
+it from the accounting identity `Liabilities = Assets − StockholdersEquity` — exact,
+not an approximation. Coverage went from 15/25 to 25/25 candidates.
+
+With full coverage, the single pre-committed confirmatory retest at 252 sessions
+(chosen before rerunning, not selected after seeing this run's result) is the most
+interesting outcome of this entire investigation: training samples nearly doubled
+(21,675 → 39,580), the overall MSE gap against baseline narrowed sharply (0.255943 vs.
+0.254308 — about 0.6% worse, down from ~9.6% worse), the information coefficient rose
+to **+0.1624** (the highest recorded anywhere in this project), and for the first time
+**2 of 5 folds actually beat their own fold-specific baseline** on MSE (folds 3 and 5),
+with 4 of 5 folds showing a positive information coefficient. All six fundamentals
+features rank in the top 8 by gain, together accounting for nearly 70% of it.
+
+This still falls short of a validated edge — 3 of 5 folds remain worse than baseline
+and the aggregate MSE is still (barely) worse overall — but it is the first result
+in this whole project to cross "beats baseline" in more than one fold. It comes with
+a serious caveat that argues against trusting it as-is: today's live prediction for
+INTC is **+323.73%**, an obviously broken value (predicting INTC will beat SPY by over
+300 percentage points in a year is not a sane forecast). This is the same known
+tree-ensemble weakness already documented for `predict-v4` (an outlier leaf estimate
+for a sparsely-populated feature combination), worse here because fundamentals only
+update quarterly, so a 252-session horizon effectively has very few independent
+fundamental "vectors" per symbol to split on — exactly the kind of leaf-sparsity that
+produces extreme, poorly-supported extrapolations. **Read together: the aggregate
+walk-forward statistics improved genuinely, but the live model is not currently
+trustworthy for real predictions, and this is a promising thread to keep
+investigating carefully, not a result to act on.**
+
 `validate-signals` asks a complementary, higher-power question about
 `score_v1` itself: across every day a symbol was ever classified —
 independent of whether the portfolio backtester had room to act on it, which
@@ -995,7 +1051,7 @@ python -m pytest -q
 - **Screening universe:** `config/screening_universe.csv` is a hand-maintained illustrative list, not a live feed of any official index's constituents, and is not automatically kept current.
 - **Experimental prediction:** `predict` fits a small linear model on freely available technical indicators; its date-grouped, purged, sample-weighted walk-forward holdout accuracy/Brier score are reported next to their own fold-specific baselines precisely so a lack of real edge is visible rather than hidden — and, as of this project's current data, that is exactly what they show (see "Evaluation honesty" above). Past accuracy does not indicate future accuracy. It is not part of `score_v1`.
 - **Experimental nonlinear prediction:** `predict-v4` fits a gradient-boosted regression tree ensemble on the same evaluation methodology as `predict`, targeting continuous excess return instead of a binary label; as of this project's current data it is a consistent negative result, losing to its own fold-specific baseline in every fold (see "Evaluation honesty" above). It is not part of `score_v1` or `predict-v3`, and a single extreme prediction (an outlier tree-leaf estimate for a feature combination under-represented in training) should be treated with particular skepticism.
-- **Experimental fundamentals-augmented prediction:** `predict-v5` widens `predict-v4` with point-in-time SEC EDGAR fundamentals; as of this project's current data it is also a consistent negative result (worse than baseline in every fold), despite the fundamentals features ranking among the model's most important by gain — see "Evaluation honesty" above. `collect-fundamentals`'s concept-alias coverage is incomplete for some symbols' older or industry-specific revenue tag variants, which is a data-completeness gap, not a lookahead-safety issue (every fact used is still bounded by its own `filed_date`).
+- **Experimental fundamentals-augmented prediction:** `predict-v5` widens `predict-v4` with point-in-time SEC EDGAR fundamentals across all 25 candidates; at a 21-session horizon it is a clean negative result, and at a 252-session (~1 year) horizon it is the closest to a real edge anything in this project has shown (2 of 5 folds beat their own baseline, information coefficient +0.1624) — but still not validated, and today's live prediction for at least one symbol (INTC, +323.73%) is an obviously broken outlier from sparse tree-leaf coverage, so it should not be trusted for real use as-is. See "Evaluation honesty" above for the full comparison across horizons. `collect-fundamentals`'s CIK resolution and concept-alias coverage had two real bugs (a wrong SEC ticker-to-CIK mapping for XOM; missing noncontrolling-interest equity tag variants) found and fixed this session — neither was a lookahead-safety issue (every fact used is still bounded by its own `filed_date`), but any symbol newly added to the candidate universe should be spot-checked the same way before trusting its fundamentals coverage.
 - **Signal validation is descriptive, not inferential:** `validate-signals`' p-values are naive (they assume independent daily trials, which overlapping-horizon, symbol-clustered rows are not) and are labeled as such; the symbol-weighted mean and its confidence interval are the more defensible read, and buckets backed by fewer than four distinct symbols are flagged as concentration-prone rather than presented as population-level evidence.
 - **Risk-inversion diagnostics are exploratory:** `investigate-risk-inversion`'s quintile splits and Pearson correlations share `validate-signals`' overlapping-window, symbol-clustered non-independence, and testing several correlated indicators at once can look suggestive by chance. Treat its output as hypothesis generation, not a validated explanation, and it changes nothing about score_v1's scoring, thresholds, or classification logic.
 - **Signal-capture diagnostic is exploratory:** `signal-capture-test` is a maximally-permissive score_v1 variant (single-classification entry, no risk-management exits, fixed holding period) built to isolate one question — see "Can the Strong Candidate edge be captured directly?" above. It found removing score_v1's trading rules performs *worse*, not better, suggesting those rules do real protective work rather than suppressing an edge — but it is one exploratory read over one (overlapping-window) history, not a validated conclusion, and changes nothing about score_v1 itself.

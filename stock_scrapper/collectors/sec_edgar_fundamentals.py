@@ -55,7 +55,12 @@ CONCEPT_ALIASES: dict[str, tuple[str, ...]] = {
     "revenue": ("SalesRevenueNet", "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax"),
     "assets": ("Assets",),
     "liabilities": ("Liabilities",),
-    "stockholders_equity": ("StockholdersEquity",),
+    # Large companies with noncontrolling (minority) interests commonly tag only the
+    # NCI-inclusive total, not plain "StockholdersEquity" -- live-checked against T,
+    # VZ, PG: all three have zero "StockholdersEquity" facts and rely entirely on
+    # this alias. Preferring the parent-only tag first keeps "book value per share"
+    # meaning what an investor would expect when a company reports both.
+    "stockholders_equity": ("StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"),
     "eps_diluted": ("EarningsPerShareDiluted", "EarningsPerShareBasicAndDiluted"),
     "shares_outstanding": ("CommonStockSharesOutstanding", "WeightedAverageNumberOfDilutedSharesOutstanding"),
 }
@@ -97,6 +102,16 @@ def _request_json(url: str, *, user_agent: str, timeout_seconds: int, max_retrie
     raise RuntimeError(f"Failed to fetch {url}: {last_error}") from last_error
 
 
+# SEC's own ticker->CIK file (fetched by fetch_ticker_cik_map below) is occasionally
+# wrong for a ticker -- live-checked: it maps "XOM" to CIK 0002115436, "ExxonMobil
+# Holdings Corp" (a subsidiary with zero XBRL facts on file), not CIK 0000034088,
+# "Exxon Mobil Corporation" (the actual NYSE-listed parent, 438 concepts on file).
+# Applied after the fetched mapping so an override always wins over SEC's own data.
+_CIK_OVERRIDES: dict[str, str] = {
+    "XOM": "0000034088",
+}
+
+
 def fetch_ticker_cik_map(
     *, user_agent: str, timeout_seconds: int = 20, max_retries: int = 3, retry_delay_seconds: float = 2.0,
 ) -> dict[str, str]:
@@ -118,6 +133,7 @@ def fetch_ticker_cik_map(
         cik = row.get("cik_str")
         if ticker and cik is not None:
             mapping[ticker] = str(int(cik)).zfill(10)
+    mapping.update(_CIK_OVERRIDES)
     return mapping
 
 

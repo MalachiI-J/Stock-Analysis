@@ -85,6 +85,31 @@ def test_fundamentals_as_of_instant_concept_uses_latest_known_balance_and_respec
     assert fundamentals_as_of(records, date(2023, 1, 15))["assets"] == 5000.0
 
 
+def test_fundamentals_as_of_derives_liabilities_from_assets_minus_equity_when_untagged() -> None:
+    """Some companies (live-checked: AMZN, VZ) never tag "Liabilities" directly,
+    only Assets and StockholdersEquity -- Liabilities = Assets - Equity is the
+    accounting identity, not an approximation, so it should fill the gap exactly."""
+    records = [
+        _instant("assets", "2023-12-31", "2024-01-15", 1000.0),
+        _instant("stockholders_equity", "2023-12-31", "2024-01-15", 400.0),
+    ]
+    assert fundamentals_as_of(records, date(2024, 2, 1))["liabilities"] == 600.0
+
+
+def test_fundamentals_as_of_prefers_explicit_liabilities_over_derived() -> None:
+    records = [
+        _instant("assets", "2023-12-31", "2024-01-15", 1000.0),
+        _instant("stockholders_equity", "2023-12-31", "2024-01-15", 400.0),
+        _instant("liabilities", "2023-12-31", "2024-01-15", 550.0),  # explicit, should win
+    ]
+    assert fundamentals_as_of(records, date(2024, 2, 1))["liabilities"] == 550.0
+
+
+def test_fundamentals_as_of_does_not_derive_liabilities_when_assets_or_equity_missing() -> None:
+    records = [_instant("assets", "2023-12-31", "2024-01-15", 1000.0)]
+    assert fundamentals_as_of(records, date(2024, 2, 1))["liabilities"] is None
+
+
 def test_revenue_and_earnings_growth_yoy_compare_two_ttm_windows_one_year_apart() -> None:
     net_income_records = _net_income_quarters()
     growth = earnings_growth_yoy(net_income_records, date(2024, 2, 1))

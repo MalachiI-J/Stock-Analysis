@@ -1678,6 +1678,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                             max_retries=max_retries, retry_delay_seconds=retry_delay_seconds,
                         )
                         records = normalize_company_facts(symbol, facts)
+                        if not records:
+                            # A zero-fact response usually means the resolved CIK is
+                            # wrong (e.g. SEC's own ticker file once mapped "XOM" to an
+                            # unrelated shell entity with no filings), not that a real
+                            # operating company genuinely has no fundamentals on file.
+                            # Surfaced as a failure so it's investigated, not silently
+                            # treated as a successful, empty collection.
+                            failures.append(symbol)
+                            logger.warning(f"Zero fundamentals facts returned for {symbol} (CIK {cik}) — check the CIK mapping")
+                            continue
                         total += upsert_fundamentals(conn, records)
                         conn.commit()
                     except Exception as exc:

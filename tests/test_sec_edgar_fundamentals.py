@@ -80,6 +80,27 @@ def test_normalize_company_facts_flattens_allowlisted_concepts_and_merges_aliase
     assert eps[0]["unit"] == "USD/shares"
 
 
+def test_normalize_company_facts_falls_back_to_nci_inclusive_stockholders_equity() -> None:
+    """Large companies with noncontrolling interests (live-checked: T, VZ, PG) often
+    tag only the NCI-inclusive total, never plain "StockholdersEquity"."""
+    facts = {
+        "facts": {
+            "us-gaap": {
+                "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest": {"units": {"USD": [
+                    _fact_row(val=7000.0, filed="2024-02-01"),
+                ]}},
+            }
+        }
+    }
+
+    records = normalize_company_facts("T", facts)
+
+    equity = [r for r in records if r["concept"] == "stockholders_equity"]
+    assert len(equity) == 1
+    assert equity[0]["source_tag"] == "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"
+    assert equity[0]["value"] == 7000.0
+
+
 def test_normalize_company_facts_handles_missing_sections_gracefully() -> None:
     assert normalize_company_facts("AAPL", {}) == []
     assert normalize_company_facts("AAPL", {"facts": {}}) == []
@@ -158,8 +179,29 @@ def test_fetch_ticker_cik_map_parses_and_zero_pads_cik(monkeypatch: pytest.Monke
 
     result = fetch_ticker_cik_map(user_agent="Stock Scraper Research test@example.com")
 
-    assert result == {"AAPL": "0000320193", "MSFT": "0000789019"}
+    assert result["AAPL"] == "0000320193"
+    assert result["MSFT"] == "0000789019"
     assert calls[0]["headers"]["User-Agent"] == "Stock Scraper Research test@example.com"
+
+
+def test_fetch_ticker_cik_map_applies_known_cik_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SEC's own ticker file maps "XOM" to an unrelated shell entity with no XBRL
+    facts (live-verified); the override must win over whatever SEC's file says."""
+    class _FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"0": {"cik_str": 2115436, "ticker": "XOM", "title": "ExxonMobil Holdings Corp"}}
+
+    monkeypatch.setattr(
+        "stock_scrapper.collectors.sec_edgar_fundamentals.requests.get",
+        lambda *_args, **_kwargs: _FakeResponse(),
+    )
+
+    result = fetch_ticker_cik_map(user_agent="Stock Scraper Research test@example.com")
+
+    assert result["XOM"] == "0000034088"
 
 
 def test_fetch_company_facts_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
