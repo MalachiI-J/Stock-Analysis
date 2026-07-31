@@ -121,6 +121,57 @@ def test_validate_prediction_config_accepts_widened_predict_v5_feature_keys() ->
     result = validate_prediction_config(rules)
 
     assert result["predict_v5"]["feature_keys"] == ["rsi_14", "trailing_pe", "price_to_book"]
+    assert result["predict_v5"]["gbm"] is None  # optional -- absent means "fall back to shared gbm"
+
+
+def test_validate_prediction_config_accepts_predict_v5_own_gbm_override() -> None:
+    rules = _valid_rules()
+    rules["predict_v5"] = {
+        "feature_keys": ["trailing_pe"],
+        "gbm": {
+            "n_estimators": 100, "max_depth": 2, "learning_rate": 0.05,
+            "min_samples_leaf": 200, "min_samples_split": 400, "l2_lambda": 10.0,
+        },
+    }
+
+    result = validate_prediction_config(rules)
+
+    assert result["predict_v5"]["gbm"] == {
+        "n_estimators": 100, "max_depth": 2, "learning_rate": 0.05,
+        "min_samples_leaf": 200, "min_samples_split": 400, "l2_lambda": 10.0,
+    }
+    # The shared top-level "gbm" section (predict-v4's) is untouched by predict_v5's override.
+    assert result["gbm"]["min_samples_leaf"] == 50
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("n_estimators", 0), ("max_depth", -1), ("learning_rate", 0.0), ("min_samples_leaf", 0), ("min_samples_split", 0)],
+)
+def test_validate_prediction_config_rejects_invalid_predict_v5_gbm_values(key: str, value: object) -> None:
+    rules = _valid_rules()
+    base_gbm = {
+        "n_estimators": 100, "max_depth": 2, "learning_rate": 0.05,
+        "min_samples_leaf": 200, "min_samples_split": 400, "l2_lambda": 10.0,
+    }
+    rules["predict_v5"] = {"feature_keys": ["trailing_pe"], "gbm": {**base_gbm, key: value}}
+
+    with pytest.raises(ValueError, match=f"predict_v5.gbm.{key}"):
+        validate_prediction_config(rules)
+
+
+def test_validate_prediction_config_rejects_negative_predict_v5_gbm_l2_lambda() -> None:
+    rules = _valid_rules()
+    rules["predict_v5"] = {
+        "feature_keys": ["trailing_pe"],
+        "gbm": {
+            "n_estimators": 100, "max_depth": 2, "learning_rate": 0.05,
+            "min_samples_leaf": 200, "min_samples_split": 400, "l2_lambda": -1.0,
+        },
+    }
+
+    with pytest.raises(ValueError, match="predict_v5.gbm.l2_lambda"):
+        validate_prediction_config(rules)
 
 
 def test_validate_prediction_config_rejects_non_dict_input() -> None:

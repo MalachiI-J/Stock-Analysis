@@ -37,15 +37,32 @@ from stock_scrapper.prediction.service import _fold_boundaries, _weighted_averag
 from stock_scrapper.utilities.hashing import stable_sha256
 
 
+# A prediction more than this many training-target standard deviations from zero is
+# flagged rather than trusted at face value — tree ensembles can extrapolate a rare,
+# poorly-supported feature combination into an extreme value (see the real INTC case
+# in README's "Evaluation honesty": +323.73%, then +266.11% even after a 4x/10x
+# regularization increase, revealing this reflects genuine but sparse/noisy historical
+# precedent, not a simple leaf-overfitting artifact regularization alone fixes).
+OUTLIER_STD_MULTIPLIER = 3.0
+
+
 @dataclass(slots=True)
 class SymbolExcessReturnPrediction:
     """One symbol's predicted forward excess return over the benchmark, or why it
     has none. Unlike predict-v3's probability, this is a signed magnitude — e.g.
-    ``+0.02`` means "predicted to beat the benchmark by about 2 percentage points"."""
+    ``+0.02`` means "predicted to beat the benchmark by about 2 percentage points".
+
+    ``low_confidence`` is never used to suppress or alter ``predicted_excess_return``
+    — it only flags that the raw value is statistically extreme (see
+    ``OUTLIER_STD_MULTIPLIER``) relative to the training target's own spread, so a
+    caller can warn rather than silently presenting an extrapolated outlier with the
+    same apparent confidence as an ordinary prediction.
+    """
 
     symbol: str
     predicted_excess_return: float | None
     reason: str | None = None
+    low_confidence: bool = False
 
 
 @dataclass(slots=True)
@@ -331,6 +348,12 @@ def run_gbm_prediction(
         min_samples_leaf=min_samples_leaf, min_samples_split=min_samples_split, l2_lambda=gbm_l2_lambda,
     )
 
+    # The threshold a live prediction is judged against: how spread out the actual
+    # training targets were. A prediction many multiples of that spread away from zero
+    # is extrapolating into territory the model saw little or nothing like in training.
+    training_target_std = float(targets.std()) if targets.shape[0] else 0.0
+    outlier_threshold = OUTLIER_STD_MULTIPLIER * training_target_std
+
     today_batch = service.analyze_loaded_many_as_of(
         list(target_symbols), histories, date.fromisoformat(as_of_date), persist=False
     )
@@ -356,7 +379,9 @@ def run_gbm_prediction(
                 SymbolExcessReturnPrediction(result.symbol, None, "One or more required indicators are unavailable")
             )
             continue
-        predictions.append(SymbolExcessReturnPrediction(result.symbol, final_model.predict(values), None))
+        predicted_value = final_model.predict(values)
+        low_confidence = outlier_threshold > 0 and abs(predicted_value) > outlier_threshold
+        predictions.append(SymbolExcessReturnPrediction(result.symbol, predicted_value, None, low_confidence))
 
     return GbmPredictionRunResult(
         status="ok",

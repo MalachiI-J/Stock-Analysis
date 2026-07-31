@@ -142,6 +142,42 @@ def test_run_gbm_prediction_succeeds_and_reports_today_predictions() -> None:
     assert "Not eligible" in by_symbol["CCC"].reason
 
 
+def test_run_gbm_prediction_flags_predictions_far_outside_training_target_spread() -> None:
+    """A prediction that extrapolates from a rare, poorly-supported training
+    precedent (see the real INTC case in README's "Evaluation honesty") should
+    be flagged as low_confidence, not presented with the same apparent
+    trustworthiness as an ordinary in-range prediction."""
+    trading_dates = _dates("2024-01-01", 40)
+    prices = [100.0] * 40
+    for i in range(20, 25):
+        prices[i] = 100.0 + (i - 19) * 5000.0  # one huge, rare price move
+    history = {"AAA": [{"trade_date": d, "adjusted_close": p} for d, p in zip(trading_dates, prices)]}
+    history.update(_flat_benchmark(trading_dates))
+    as_of = trading_dates[-1]
+
+    results_by_date: dict[str, dict[str, AnalysisResult]] = {}
+    for index, d in enumerate(trading_dates[:-1]):
+        rsi = 95.0 if index == 19 else 50.0  # rsi=95 occurs exactly once, right before the huge move
+        results_by_date[d] = {"AAA": _result("AAA", d, rsi=rsi)}
+    results_by_date[as_of] = {
+        "AAA": _result("AAA", as_of, rsi=50.0),  # ordinary, well-represented feature value
+        "BBB": _result("BBB", as_of, rsi=95.0),  # matches the one rare, extreme precedent
+    }
+    service = _FakeService(results_by_date)
+    rules = dict(_RULES, minimum_training_samples=1)
+
+    result = run_gbm_prediction(
+        service, ["AAA", "BBB"], history, trading_dates,
+        as_of_date=as_of, rules=rules, benchmark_symbol="SPY",
+    )
+
+    assert result.status == "ok"
+    by_symbol = {p.symbol: p for p in result.predictions}
+    assert by_symbol["AAA"].low_confidence is False
+    assert by_symbol["BBB"].low_confidence is True
+    assert by_symbol["BBB"].predicted_excess_return is not None  # flagged, not suppressed
+
+
 def test_run_gbm_prediction_handles_too_few_samples_for_any_walk_forward_fold() -> None:
     trading_dates = _dates("2024-01-01", 4)  # horizon_days=3 embargo -> exactly 1 sample date
     prices = [100.0, 101.0, 102.0, 103.0]

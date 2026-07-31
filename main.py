@@ -1492,6 +1492,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             for prediction in ranked:
                 if prediction.predicted_excess_return is None:
                     print(f"  {prediction.symbol:<6} unavailable — {prediction.reason}")
+                elif prediction.low_confidence:
+                    print(
+                        f"  {prediction.symbol:<6} {prediction.predicted_excess_return:+.2%}  "
+                        "[LOW CONFIDENCE: far outside the training data's typical range -- "
+                        "likely an extrapolated outlier, not a trustworthy forecast]"
+                    )
                 else:
                     print(f"  {prediction.symbol:<6} {prediction.predicted_excess_return:+.2%}")
             return int(ExitCode.SUCCESS)
@@ -1516,6 +1522,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     parser.error("--horizon-days must be positive")
                 prediction_rules = dict(prediction_rules, horizon_days=args.horizon_days)
             predict_v5_feature_keys = list(prediction_rules["predict_v5"]["feature_keys"])
+            predict_v5_gbm_config = prediction_rules["predict_v5"].get("gbm")
             scoring_rules = load_scoring_rules(base_dir)
             roles = load_universes(config)
             benchmark = roles["benchmark"]
@@ -1531,6 +1538,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     service, symbols, histories, trading_dates,
                     as_of_date=effective.isoformat(), rules=prediction_rules, benchmark_symbol=benchmark,
                     feature_keys=predict_v5_feature_keys, fundamentals_by_symbol=fundamentals_by_symbol,
+                    gbm_config=predict_v5_gbm_config,
                 )
                 prediction_run_id = f"predict-v5-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
                 run_provenance = collect_provenance(
@@ -1606,6 +1614,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             for prediction in ranked:
                 if prediction.predicted_excess_return is None:
                     print(f"  {prediction.symbol:<6} unavailable — {prediction.reason}")
+                elif prediction.low_confidence:
+                    print(
+                        f"  {prediction.symbol:<6} {prediction.predicted_excess_return:+.2%}  "
+                        "[LOW CONFIDENCE: far outside the training data's typical range -- "
+                        "likely an extrapolated outlier, not a trustworthy forecast]"
+                    )
                 else:
                     print(f"  {prediction.symbol:<6} {prediction.predicted_excess_return:+.2%}")
             return int(ExitCode.SUCCESS)

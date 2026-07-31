@@ -39,12 +39,31 @@ gbm:
   min_samples_split: 100
   l2_lambda: 1.0
 
-# predict-v5: reuses predict-v4's exact gradient-boosted model/hyperparameters (the
-# "gbm" section above) and evaluation methodology, widening only the feature list with
-# point-in-time SEC EDGAR fundamentals (stock_scrapper/processing/fundamentals_features.py)
-# -- the one data-source lever not yet tried after four negative price/volume-only
-# attempts. See README's "Evaluation honesty" for the actual result once run.
+# predict-v5: predict-v4's gradient-boosted model/methodology, widening only the
+# feature list with point-in-time SEC EDGAR fundamentals
+# (stock_scrapper/processing/fundamentals_features.py) -- the one data-source lever not
+# yet tried after four negative price/volume-only attempts. See README's "Evaluation
+# honesty" for the actual result once run.
 predict_v5:
+  # Own (heavier) regularization than predict-v4's shared "gbm" section above --
+  # diagnosed directly from a real failure: the 252-session run's live prediction for
+  # INTC was +323.73%, an obviously broken value. Root cause: fundamentals only update
+  # quarterly, so a training "leaf" satisfying min_samples_leaf can still correspond to
+  # only one or two truly independent quarterly events (repeated across every trading
+  # day until the next filing), not real statistical diversity -- exactly the setup for
+  # gradient boosting to compound an extreme, poorly-supported leaf value across 100
+  # rounds. min_samples_leaf/min_samples_split are raised ~4x, l2_lambda (leaf-value
+  # shrinkage: leaf_value = sum(residuals)/(count+l2_lambda)) raised 10x, max_depth
+  # reduced (fewer, shallower splits means less opportunity to carve out a rare
+  # feature combination), and learning_rate halved (slower compounding per round).
+  # This is one clearly-justified configuration change, not a hyperparameter scan.
+  gbm:
+    n_estimators: 100
+    max_depth: 2
+    learning_rate: 0.05
+    min_samples_leaf: 200
+    min_samples_split: 400
+    l2_lambda: 10.0
   feature_keys:
     - rsi_14
     - distance_from_sma200

@@ -1426,6 +1426,35 @@ def test_predict_v5_command_reports_insufficient_data(
     assert cli.main(["predict-v5", "--symbols", "AAPL"]) == int(ExitCode.MISSING_DATA)
 
 
+def test_predict_v5_command_flags_low_confidence_predictions_in_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from stock_scrapper.prediction.gbm_service import GbmPredictionRunResult, SymbolExcessReturnPrediction
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    result = GbmPredictionRunResult(
+        status="ok", message=None, as_of_date="2026-01-01", horizon_days=252,
+        training_samples=10, holdout_samples=5,
+        predictions=[
+            SymbolExcessReturnPrediction("AAPL", 0.02, None, low_confidence=False),
+            SymbolExcessReturnPrediction("INTC", 2.6611, None, low_confidence=True),
+        ],
+    )
+    monkeypatch.setattr(cli, "run_gbm_prediction", lambda *_args, **_kwargs: result)
+
+    exit_code = cli.main(["predict-v5", "--symbols", "AAPL", "INTC"])
+
+    assert exit_code == int(ExitCode.SUCCESS)
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    aapl_line = next(line for line in lines if line.strip().startswith("AAPL"))
+    intc_line = next(line for line in lines if line.strip().startswith("INTC"))
+    assert "LOW CONFIDENCE" not in aapl_line
+    assert "+266.11%" in intc_line and "LOW CONFIDENCE" in intc_line
+
+
 def test_predict_v5_command_passes_predict_v5_feature_keys_and_fundamentals(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1461,6 +1490,9 @@ def test_predict_v5_command_passes_predict_v5_feature_keys_and_fundamentals(
     assert "trailing_pe" in captured_kwargs["feature_keys"]
     assert captured_kwargs["fundamentals_by_symbol"] == {"AAPL": []}
     assert requested_symbols == ["AAPL"]
+    # predict-v5's own (heavier) regularization from config/prediction_rules.yaml's
+    # predict_v5.gbm section must be passed explicitly, not the shared gbm section.
+    assert captured_kwargs["gbm_config"]["min_samples_leaf"] == 200
     captured = capsys.readouterr()
     assert "model=predict-v5" in captured.out
     assert "EXPERIMENTAL STATISTICAL FORECAST" in captured.err
