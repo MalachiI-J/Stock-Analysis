@@ -1854,6 +1854,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         latest_price_by_symbol[candidate_symbol] = price
 
                 model_probability_by_symbol: dict[str, float] = {}
+                predict_v5_excess_return_by_symbol: dict[str, float] = {}
+                predict_v5_low_confidence_by_symbol: dict[str, bool] = {}
                 if not args.no_model:
                     try:
                         prediction_rules = load_prediction_rules(base_dir)
@@ -1879,6 +1881,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                     except Exception:
                         # The experimental model is context only; never let it block a recommendation run.
                         model_probability_by_symbol = {}
+
+                    try:
+                        predict_v5_feature_keys = list(prediction_rules["predict_v5"]["feature_keys"])
+                        predict_v5_gbm_config = prediction_rules["predict_v5"].get("gbm")
+                        fundamentals_by_symbol = {symbol: fetch_fundamentals(conn, symbol) for symbol in symbols}
+                        v5_service = AnalysisService(conn, scoring_rules, roles["candidates"])
+                        v5_result = run_gbm_prediction(
+                            v5_service, symbols, histories, trading_dates,
+                            as_of_date=effective.isoformat(), rules=prediction_rules, benchmark_symbol=benchmark,
+                            feature_keys=predict_v5_feature_keys, fundamentals_by_symbol=fundamentals_by_symbol,
+                            gbm_config=predict_v5_gbm_config,
+                        )
+                        if v5_result.status == "ok":
+                            for item in v5_result.predictions:
+                                if item.predicted_excess_return is not None:
+                                    predict_v5_excess_return_by_symbol[item.symbol] = item.predicted_excess_return
+                                    predict_v5_low_confidence_by_symbol[item.symbol] = item.low_confidence
+                    except Exception:
+                        # Same rule as above: predict-v5 is displayed context only, never a gate.
+                        predict_v5_excess_return_by_symbol = {}
+                        predict_v5_low_confidence_by_symbol = {}
             finally:
                 conn.close()
 
@@ -1892,6 +1915,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 latest_price_by_symbol=latest_price_by_symbol,
                 rules=trading_rules,
                 model_probability_by_symbol=model_probability_by_symbol,
+                predict_v5_excess_return_by_symbol=predict_v5_excess_return_by_symbol,
+                predict_v5_low_confidence_by_symbol=predict_v5_low_confidence_by_symbol,
             )
             text = render_recommendations_text(outcome)
             print(text)
@@ -1914,6 +1939,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "estimated_dollars": rec.estimated_dollars,
                             "reason": rec.reason,
                             "model_probability": rec.model_probability,
+                            "predict_v5_excess_return": rec.predict_v5_excess_return,
+                            "predict_v5_low_confidence": rec.predict_v5_low_confidence,
                         }
                         for rec in outcome.recommendations
                     ],

@@ -11,10 +11,15 @@ combines two existing, independently-validated signals rather than inventing
 new ones: SELL recommendations reuse `evaluate_holding()` from
 `stock_scrapper/portfolio.py` (the exact rules a backtest would have exited
 on), and BUY candidates are score_v1's own `Strong Candidate`/`Candidate`
-classifications. The experimental `predict` model's probability is attached
-to each BUY as displayed context only ("model: 45% beats benchmark") — never
-as a gate — since its accuracy doesn't yet warrant driving a real trade
-decision.
+classifications. Both experimental prediction models are attached to each BUY
+as displayed context only — never as a gate, since neither's accuracy yet
+warrants driving a real trade decision: `predict`'s probability
+("model: 45% beats benchmark"), and `predict-v5`'s predicted excess-return
+magnitude ("predict-v5: +12.3% predicted excess return"), including its
+`[LOW CONFIDENCE]` suffix whenever that prediction is a statistically extreme,
+likely-extrapolated outlier (see "Evaluation honesty" below) — the same
+flag `predict-v5`'s own CLI output shows, now surfaced in the one command a
+user actually checks daily instead of only in the standalone diagnostic run.
 
 Position sizing follows the same weight-based approach as the backtester's
 `BacktestConfig` (`max_position_weight`, `cash_reserve`), configured in
@@ -294,6 +299,12 @@ than shown with the same apparent trustworthiness as an ordinary prediction — 
 raw value is never suppressed or altered, only flagged (`gbm_service.py`). On the
 real run above, INTC (+266.11%) is flagged; every other symbol, including TSLA's
 also-large +44.24%, is not.
+
+`predict-v5`'s prediction (and its `low_confidence` flag) is now also attached to
+`recommend`'s BUY output as displayed context (see "Phase 6a" above) — the same rule
+as `predict`'s probability: never a gate, always labeled, so the outlier-flagging
+mechanism protects the one command actually checked day-to-day, not only the
+standalone diagnostic run.
 
 **Read together, this is the strongest result in the whole project** — real,
 diagnosed, and honestly improved aggregate statistics — **but still not a validated

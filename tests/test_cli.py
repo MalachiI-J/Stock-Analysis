@@ -990,8 +990,66 @@ def test_recommend_command_writes_sized_buy_recommendation(
         {
             "symbol": "AAA", "action": "BUY", "shares": 10.0,
             "estimated_dollars": 500.0, "reason": "Strong trend", "model_probability": None,
+            "predict_v5_excess_return": None, "predict_v5_low_confidence": False,
         }
     ]
+
+
+def test_recommend_command_attaches_predict_v5_context_to_buy_recommendations(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from stock_scrapper.database import create_connection, initialize_database, upsert_price_history
+    from stock_scrapper.prediction.service import PredictionRunResult
+    from stock_scrapper.prediction.gbm_service import GbmPredictionRunResult, SymbolExcessReturnPrediction
+
+    _install_startup(monkeypatch, tmp_path)
+    _install_recommend_saved_run(monkeypatch)
+    _install_recommend_trading_rules(monkeypatch)
+    config = _config(tmp_path)
+    initialize_database(config["database_path"])
+    conn = create_connection(config["database_path"])
+    try:
+        upsert_price_history(conn, _seed_price_row("AAA", "2024-12-31", 50.0))
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(
+        cli, "load_prediction_rules",
+        lambda _base_dir: {"predict_v5": {"feature_keys": ["rsi_14"], "gbm": None}},
+    )
+    monkeypatch.setattr(cli, "load_universes", lambda _config: {
+        "candidates": ["AAA", "BBB"], "benchmark": "SPY", "market_context": ["SPY"], "defensive_context": [],
+    })
+    monkeypatch.setattr(cli, "load_scoring_rules", lambda _base_dir: {"scoring_version": "test"})
+    monkeypatch.setattr(cli, "AnalysisService", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        cli, "run_prediction",
+        lambda *_args, **_kwargs: PredictionRunResult(
+            status="ok", message=None, as_of_date="2024-12-31", horizon_days=21,
+        ),
+    )
+    monkeypatch.setattr(
+        cli, "run_gbm_prediction",
+        lambda *_args, **_kwargs: GbmPredictionRunResult(
+            status="ok", message=None, as_of_date="2024-12-31", horizon_days=21,
+            training_samples=10, holdout_samples=5,
+            predictions=[SymbolExcessReturnPrediction("AAA", 0.234, None, True)],
+        ),
+    )
+
+    assert cli.main(["recommend", "--run-id", "saved-run"]) == int(ExitCode.SUCCESS)
+
+    captured = capsys.readouterr()
+    assert "predict-v5: +23.4% predicted excess return" in captured.out
+    assert "[LOW CONFIDENCE]" in captured.out
+
+    summary_path = tmp_path / "reports" / "recommendations_2024-12-31.summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["recommendations"][0]["predict_v5_excess_return"] == 0.234
+    assert summary["recommendations"][0]["predict_v5_low_confidence"] is True
 
 
 def test_recommend_command_no_save_skips_file(
