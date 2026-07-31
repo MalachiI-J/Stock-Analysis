@@ -27,6 +27,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from stock_scrapper.analysis.service import AnalysisService
+from stock_scrapper.processing.fundamentals_features import fundamentals_features_as_of
 
 
 def _finite(value: Any) -> float | None:
@@ -75,13 +76,26 @@ def opportunity_percentiles(results: Sequence[Any]) -> dict[str, float]:
     return {symbol: index / denominator for index, (symbol, _) in enumerate(ordered)}
 
 
-def feature_value(result: Any, key: str, percentiles: Mapping[str, float]) -> float | None:
-    """Resolve one feature's value for a result, whether indicator-based or derived."""
+def feature_value(
+    result: Any, key: str, percentiles: Mapping[str, float],
+    fundamentals: Mapping[str, float | None] | None = None,
+) -> float | None:
+    """Resolve one feature's value for a result, whether indicator-based, derived,
+    or (for ``predict_v5``'s fundamental keys) point-in-time fundamentals — see
+    ``fundamentals_features_as_of`` in ``processing/fundamentals_features.py``.
+    ``result.indicators`` is checked first so a key can never mean two different
+    things; ``fundamentals`` is only consulted when the indicator lookup misses.
+    """
     if key == "market_regime_code":
         return _REGIME_CODES.get(getattr(result, "market_regime", None))
     if key == "opportunity_score_percentile":
         return percentiles.get(result.symbol)
-    return _finite(result.indicators.get(key))
+    indicator_value = _finite(result.indicators.get(key))
+    if indicator_value is not None:
+        return indicator_value
+    if fundamentals is not None and key in fundamentals:
+        return _finite(fundamentals[key])
+    return None
 
 
 def select_sample_dates(
@@ -115,11 +129,15 @@ def _assemble_dataset(
     feature_keys: Sequence[str],
     benchmark_symbol: str,
     target_fn: Any,
+    fundamentals_by_symbol: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, str]]]:
     """Shared row-assembly for both the binary (``build_training_dataset``) and
     continuous (``build_regression_dataset``) targets — identical eligibility,
     feature, and leakage-safety logic; only how the label/target number itself is
     computed from ``(symbol_return, benchmark_return)`` differs, via ``target_fn``.
+
+    ``fundamentals_by_symbol`` (raw SEC EDGAR fact records per symbol, ``predict_v5``
+    only) is optional and defaults to ``None`` — every other caller is unaffected.
     """
     service.prime_historical_features(histories, sample_dates, list(symbols))
     date_index: dict[str, dict[str, int]] = {
@@ -162,7 +180,13 @@ def _assemble_dataset(
             if benchmark_entry_close is None or benchmark_future_close is None or benchmark_entry_close <= 0:
                 continue
 
-            values = [feature_value(result, key, percentiles) for key in feature_keys]
+            fundamentals = (
+                fundamentals_features_as_of(
+                    fundamentals_by_symbol.get(result.symbol, ()), sample_date, price=entry_close,
+                )
+                if fundamentals_by_symbol is not None else None
+            )
+            values = [feature_value(result, key, percentiles, fundamentals) for key in feature_keys]
             if any(value is None for value in values):
                 continue
             symbol_return = (future_close - entry_close) / entry_close
@@ -212,15 +236,22 @@ def build_regression_dataset(
     horizon_days: int,
     feature_keys: Sequence[str],
     benchmark_symbol: str,
+    fundamentals_by_symbol: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, str]]]:
     """Assemble (features, continuous excess-return) rows for every eligible
     symbol/date — predict-v4's target, versus predict-v3's binarized version of the
     same underlying quantity. Keeping the magnitude (rather than just its sign)
     preserves information predict-v3 throws away, which matters for the
     non-monotonic, magnitude-driven patterns ``investigate-risk-inversion`` found
-    (see ``stock_scrapper/analysis/risk_diagnostics.py``)."""
+    (see ``stock_scrapper/analysis/risk_diagnostics.py``).
+
+    ``fundamentals_by_symbol`` lets ``predict_v5`` widen ``feature_keys`` with
+    point-in-time SEC EDGAR fundamentals (see ``feature_value``); every other
+    caller omits it and behavior is unchanged.
+    """
     return _assemble_dataset(
         service, symbols, histories, sample_dates,
         horizon_days=horizon_days, feature_keys=feature_keys, benchmark_symbol=benchmark_symbol,
         target_fn=lambda symbol_return, benchmark_return: symbol_return - benchmark_return,
+        fundamentals_by_symbol=fundamentals_by_symbol,
     )

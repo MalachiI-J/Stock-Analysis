@@ -21,6 +21,9 @@ class _Logger:
     def info(self, *args: Any, **kwargs: Any) -> None:
         pass
 
+    def warning(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
     def exception(self, *args: Any, **kwargs: Any) -> None:
         pass
 
@@ -1202,6 +1205,7 @@ def _install_predict_startup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     monkeypatch.setattr(cli, "initialize_database", lambda _path: None)
     monkeypatch.setattr(cli, "create_connection", lambda _path: _Connection())
     monkeypatch.setattr(cli, "fetch_price_history", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cli, "fetch_fundamentals", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cli, "AnalysisService", lambda *_args, **_kwargs: object())
 
 
@@ -1403,3 +1407,147 @@ def test_predict_v4_command_rejects_nonpositive_horizon_days(
     with pytest.raises(SystemExit) as exc_info:
         cli.main(["predict-v4", "--symbols", "AAPL", "--horizon-days", "0"])
     assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)
+
+
+def test_predict_v5_command_reports_insufficient_data(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from stock_scrapper.prediction.gbm_service import GbmPredictionRunResult
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cli, "run_gbm_prediction",
+        lambda *_args, **_kwargs: GbmPredictionRunResult(
+            status="insufficient_data", message="Not enough history.", as_of_date="2026-01-01", horizon_days=21,
+        ),
+    )
+
+    assert cli.main(["predict-v5", "--symbols", "AAPL"]) == int(ExitCode.MISSING_DATA)
+
+
+def test_predict_v5_command_passes_predict_v5_feature_keys_and_fundamentals(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from stock_scrapper.prediction.gbm_service import GbmPredictionRunResult, SymbolExcessReturnPrediction
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    requested_symbols: list[str] = []
+
+    def _fake_fetch_fundamentals(_conn: Any, symbol: str) -> list[Any]:
+        requested_symbols.append(symbol)
+        return []
+
+    monkeypatch.setattr(cli, "fetch_fundamentals", _fake_fetch_fundamentals)
+    captured_kwargs: dict[str, Any] = {}
+
+    def _fake_run_gbm_prediction(*_args: Any, **kwargs: Any) -> GbmPredictionRunResult:
+        captured_kwargs.update(kwargs)
+        return GbmPredictionRunResult(
+            status="ok", message=None, as_of_date="2026-01-01", horizon_days=21,
+            training_samples=10, holdout_samples=5,
+            predictions=[SymbolExcessReturnPrediction("AAPL", 0.01, None)],
+        )
+
+    monkeypatch.setattr(cli, "run_gbm_prediction", _fake_run_gbm_prediction)
+
+    exit_code = cli.main(["predict-v5", "--symbols", "AAPL"])
+
+    assert exit_code == int(ExitCode.SUCCESS)
+    # predict-v5's own widened feature list (from config/prediction_rules.yaml's
+    # predict_v5.feature_keys) must be passed explicitly, not the base feature_keys.
+    assert "trailing_pe" in captured_kwargs["feature_keys"]
+    assert captured_kwargs["fundamentals_by_symbol"] == {"AAPL": []}
+    assert requested_symbols == ["AAPL"]
+    captured = capsys.readouterr()
+    assert "model=predict-v5" in captured.out
+    assert "EXPERIMENTAL STATISTICAL FORECAST" in captured.err
+
+
+def test_predict_v5_command_horizon_days_override_replaces_config_value(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from stock_scrapper.prediction.gbm_service import GbmPredictionRunResult
+
+    _install_predict_startup(monkeypatch, tmp_path)
+    captured_rules: dict[str, Any] = {}
+
+    def _fake_run_gbm_prediction(*_args: Any, **kwargs: Any) -> GbmPredictionRunResult:
+        captured_rules.update(kwargs["rules"])
+        return GbmPredictionRunResult(
+            status="insufficient_data", message="x", as_of_date="2026-01-01",
+            horizon_days=kwargs["rules"]["horizon_days"],
+        )
+
+    monkeypatch.setattr(cli, "run_gbm_prediction", _fake_run_gbm_prediction)
+
+    cli.main(["predict-v5", "--symbols", "AAPL", "--horizon-days", "5"])
+
+    assert captured_rules["horizon_days"] == 5
+
+
+def test_predict_v5_command_rejects_nonpositive_horizon_days(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_predict_startup(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["predict-v5", "--symbols", "AAPL", "--horizon-days", "0"])
+    assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)
+
+
+def test_collect_fundamentals_command_persists_records_and_reports_partial_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from stock_scrapper.database import create_connection
+
+    config = _config(tmp_path)
+    config["edgar"] = {
+        "user_agent": "Stock Scraper Research test@example.com",
+        "timeout_seconds": 5, "max_retries": 1, "retry_delay_seconds": 0,
+    }
+    monkeypatch.setattr(cli, "load_config", lambda _base_dir: config)
+    monkeypatch.setattr(cli, "ensure_directories", lambda _config: None)
+    monkeypatch.setattr(cli, "load_watchlist", lambda _path: ["AAPL", "MSFT"])
+    monkeypatch.setattr(cli, "setup_logging", lambda _config, run_id: _Logger())
+
+    # AAPL resolves to a CIK and returns one usable fact; MSFT has no CIK on file
+    # (mirrors a real symbol SEC doesn't recognize) and must be counted as failed,
+    # not silently skipped.
+    monkeypatch.setattr(cli, "fetch_ticker_cik_map", lambda **_kwargs: {"AAPL": "0000320193"})
+
+    def fake_fetch_company_facts(cik: str, **_kwargs: Any) -> dict[str, Any]:
+        assert cik == "0000320193"
+        return {
+            "facts": {
+                "us-gaap": {
+                    "NetIncomeLoss": {"units": {"USD": [
+                        {
+                            "start": "2023-10-01", "end": "2023-12-30", "val": 1000.0,
+                            "fy": 2024, "fp": "Q1", "form": "10-Q", "filed": "2024-02-01",
+                        },
+                    ]}},
+                },
+            },
+        }
+
+    monkeypatch.setattr(cli, "fetch_company_facts", fake_fetch_company_facts)
+
+    exit_code = cli.main(["collect-fundamentals", "--symbols", "AAPL", "MSFT"])
+
+    assert exit_code == int(ExitCode.PARTIAL_FAILURE)
+    captured = capsys.readouterr()
+    assert "fundamentals_upserted=1 symbols=2 failed=1" in captured.out
+    assert "failed_symbols=MSFT" in captured.out
+
+    conn = create_connection(config["database_path"])
+    try:
+        row = conn.execute("SELECT symbol, concept, value FROM fundamentals").fetchone()
+        assert tuple(row) == ("AAPL", "net_income", 1000.0)
+    finally:
+        conn.close()

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-LATEST_SCHEMA_VERSION = 10
+LATEST_SCHEMA_VERSION = 11
 
 
 def _utc_now() -> str:
@@ -122,6 +122,10 @@ def apply_migrations(db_path: str | Path) -> None:
             _apply_v10(conn)
         else:
             _ensure_gbm_prediction_tables(conn)
+        if current_version < 11:
+            _apply_v11(conn)
+        else:
+            _ensure_fundamentals_tables(conn)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1128,3 +1132,38 @@ def _apply_v10(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO schema_metadata(schema_version,applied_at,description) VALUES(?,?,?)",
                  (10,_utc_now(),"Add gbm_prediction_runs/gbm_prediction_folds to track predict-v4 "
                   "(gradient-boosted regression) accuracy over time"))
+
+
+def _ensure_fundamentals_tables(conn: sqlite3.Connection) -> None:
+    """Add the ``fundamentals`` table storing point-in-time SEC EDGAR XBRL facts
+    (stock_scrapper/collectors/sec_edgar_fundamentals.py) — the one untried data
+    source after four negative price/volume-only edge attempts (see README's
+    "Evaluation honesty" section). ``filed_date`` is the raw lookahead-safety signal
+    every downstream point-in-time lookup (stock_scrapper/processing/
+    fundamentals_features.py) depends on: a fact is only usable as of dates on or
+    after its own ``filed_date``, never before.
+
+    Same single-vintage tradeoff ``price_history``/``upsert_price_history`` already
+    accepts: if SEC later restates a historical figure under a new ``filed_date``
+    and the same ``(symbol, concept, period_end, form)``, this table keeps only the
+    most recently collected row for that key going forward, not every historical
+    vintage that existed on a given day in the past. Restatements filed as their own
+    later ``form``/``filed_date`` (e.g. a 10-K/A) are unaffected and stored as a
+    distinct row, since the uniqueness key includes ``filed_date``.
+    """
+    conn.execute("""CREATE TABLE IF NOT EXISTS fundamentals (
+      symbol TEXT NOT NULL, concept TEXT NOT NULL, source_tag TEXT NOT NULL,
+      fiscal_year INTEGER, fiscal_period TEXT, form TEXT NOT NULL,
+      period_start TEXT, period_end TEXT NOT NULL, filed_date TEXT NOT NULL,
+      value REAL NOT NULL, unit TEXT NOT NULL, frame TEXT, collected_at TEXT NOT NULL,
+      UNIQUE(symbol, concept, period_end, form, filed_date))""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fundamentals_symbol_concept_filed "
+        "ON fundamentals(symbol, concept, filed_date)"
+    )
+
+
+def _apply_v11(conn: sqlite3.Connection) -> None:
+    _ensure_fundamentals_tables(conn)
+    conn.execute("INSERT INTO schema_metadata(schema_version,applied_at,description) VALUES(?,?,?)",
+                 (11,_utc_now(),"Add fundamentals table storing point-in-time SEC EDGAR XBRL facts"))

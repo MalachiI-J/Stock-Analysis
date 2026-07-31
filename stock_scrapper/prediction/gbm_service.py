@@ -27,6 +27,7 @@ from stock_scrapper.prediction.dataset import (
     opportunity_percentiles,
     select_sample_dates,
 )
+from stock_scrapper.processing.fundamentals_features import fundamentals_features_as_of
 from stock_scrapper.prediction.gbm import (
     GradientBoostedRegressor,
     evaluate_regression_holdout,
@@ -203,6 +204,17 @@ def _run_gbm_walk_forward(
     return results
 
 
+def _latest_price_on_or_before(history: Sequence[Mapping[str, Any]], as_of_date: str) -> float | None:
+    known = [row for row in history if str(row.get("trade_date", ""))[:10] <= as_of_date]
+    if not known:
+        return None
+    latest = max(known, key=lambda row: str(row.get("trade_date"))[:10])
+    try:
+        return float(latest["adjusted_close"])
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
 def run_gbm_prediction(
     service: AnalysisService,
     target_symbols: Sequence[str],
@@ -212,10 +224,22 @@ def run_gbm_prediction(
     as_of_date: str,
     rules: Mapping[str, Any],
     benchmark_symbol: str,
+    feature_keys: Sequence[str] | None = None,
+    gbm_config: Mapping[str, Any] | None = None,
+    fundamentals_by_symbol: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
 ) -> GbmPredictionRunResult:
     """Walk-forward evaluate, then fit a final model on all embargoed history, and
     predict today's excess return — the predict-v4 analogue of
-    ``service.py::run_prediction``."""
+    ``service.py::run_prediction``.
+
+    ``feature_keys``/``gbm_config`` default to ``rules["feature_keys"]``/
+    ``rules["gbm"]`` (predict-v4's exact behavior) but let a caller — namely
+    ``predict_v5``, which widens the feature list with point-in-time fundamentals —
+    pass its own, reusing this same walk-forward/fit/predict machinery rather than
+    forking it. ``fundamentals_by_symbol`` (raw SEC EDGAR fact records per symbol) is
+    threaded straight through to ``build_regression_dataset`` and to today's live
+    prediction step; omitted, this function's behavior is unchanged from predict-v4.
+    """
     horizon_days = int(rules["horizon_days"])
     sample_dates = select_sample_dates(
         trading_dates,
@@ -232,10 +256,11 @@ def run_gbm_prediction(
             horizon_days=horizon_days,
         )
 
-    feature_keys = list(rules["feature_keys"])
+    feature_keys = list(feature_keys) if feature_keys is not None else list(rules["feature_keys"])
     features, targets, meta = build_regression_dataset(
         service, target_symbols, histories, sample_dates,
         horizon_days=horizon_days, feature_keys=feature_keys, benchmark_symbol=benchmark_symbol,
+        fundamentals_by_symbol=fundamentals_by_symbol,
     )
     dataset_fingerprint = stable_sha256({"features": features.tolist(), "targets": targets.tolist()})
     symbol_universe_hash = stable_sha256(sorted(str(symbol).upper() for symbol in target_symbols))
@@ -258,7 +283,7 @@ def run_gbm_prediction(
             feature_set_hash=feature_set_hash,
         )
 
-    gbm_rules = rules["gbm"]
+    gbm_rules = gbm_config if gbm_config is not None else rules["gbm"]
     n_estimators = int(gbm_rules["n_estimators"])
     max_depth = int(gbm_rules["max_depth"])
     gbm_learning_rate = float(gbm_rules["learning_rate"])
@@ -317,7 +342,15 @@ def run_gbm_prediction(
                 SymbolExcessReturnPrediction(result.symbol, None, "Not eligible for scoring (insufficient or blocked data)")
             )
             continue
-        values = [feature_value(result, key, percentiles) for key in feature_keys]
+        fundamentals = (
+            fundamentals_features_as_of(
+                fundamentals_by_symbol.get(result.symbol, ()),
+                date.fromisoformat(as_of_date),
+                price=_latest_price_on_or_before(histories.get(result.symbol, []), as_of_date),
+            )
+            if fundamentals_by_symbol is not None else None
+        )
+        values = [feature_value(result, key, percentiles, fundamentals) for key in feature_keys]
         if any(value is None for value in values):
             predictions.append(
                 SymbolExcessReturnPrediction(result.symbol, None, "One or more required indicators are unavailable")

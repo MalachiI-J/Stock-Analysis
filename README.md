@@ -179,6 +179,43 @@ practice; feature importances (led by `trend_slope_200`, `sixty_day_volatility`,
 that alone isn't evidence of anything actionable given the overall negative result.
 See "Evaluation honesty" below.
 
+`predict-v5` is a third, separate experimental model asking the one question the
+other two couldn't: whether a genuinely new *data source* — not another reslice or
+remodel of price/volume history — recovers an edge. `collect-fundamentals` pulls
+point-in-time company financials directly from SEC EDGAR's free XBRL
+`companyfacts` API (`stock_scrapper/collectors/sec_edgar_fundamentals.py`), storing
+raw facts (net income, revenue, assets, liabilities, stockholders' equity, diluted
+EPS, shares outstanding) each tagged with its own `filed_date` — the day a value
+actually became public. `stock_scrapper/processing/fundamentals_features.py` turns
+these into point-in-time features strictly bounded by that date (a fact filed after
+an as-of date is never visible to it, mirroring price history's own no-lookahead
+discipline): trailing P/E, price-to-book, debt-to-equity, revenue/earnings growth
+(year-over-year, trailing-twelve-month), and return on equity. `predict-v5` reuses
+`predict-v4`'s exact gradient-boosted model and evaluation methodology unchanged,
+just with a wider `feature_keys` list (`config/prediction_rules.yaml`'s
+`predict_v5.feature_keys`) — the base technical indicators plus the six
+fundamentals above — so it stays directly comparable to predict-v4.
+
+The first real run against the full candidate universe
+(`predict-v5-20260731123026-dc54187d`, 23,400 training samples, 2010–2026 — a
+narrower window than predict-v4's because a fundamentals-derived feature needs
+several years of prior quarterly filings before it's usable) also came back
+negative, and more decisively so: holdout MSE (0.008533) is worse than the
+fold-specific baseline (0.007285) in **every one of the 5 folds** individually, and
+the information coefficient (-0.0500 overall) is, if anything, more negative than
+predict-v4's. What makes this result notable rather than a simple repeat: the two
+fundamentals features (`trailing_pe`, `price_to_book`) were the model's *most*
+important features by SSE-reduction gain (11.7% and 9.4%, ahead of every technical
+indicator), with `earnings_growth_yoy` and `debt_to_equity` also in the top eight.
+The model didn't ignore the new data — it leaned on it heavily — and still lost to
+a trivial baseline in every fold. That is evidence the fundamentals themselves
+don't carry real forward-return signal at this horizon (at least via this
+point-in-time TTM approach), not evidence the model failed to look. A known
+coverage gap: about a third of candidate symbols showed "unavailable" for today's
+live prediction because their revenue figures use XBRL tag variants outside the
+small alias list `sec_edgar_fundamentals.py` currently checks — a data-completeness
+limitation, not a lookahead or correctness bug. See "Evaluation honesty" below.
+
 `validate-signals` asks a complementary, higher-power question about
 `score_v1` itself: across every day a symbol was ever classified —
 independent of whether the portfolio backtester had room to act on it, which
@@ -284,17 +321,37 @@ answer for both signals:
   15) and lost the holdout too. Removing stop-loss/trailing-stop/regime-gate/
   early-exit rules made results *worse*, not better — evidence those rules
   are doing real protective work rather than suppressing a hidden edge.
+- **`predict-v5`** (23,400 samples, 2010–2026 — narrower than predict-v4's
+  window because point-in-time fundamentals require several years of prior
+  quarterly filings before a sample date has a usable trailing-twelve-month
+  figure): predict-v4's identical gradient-boosted model and evaluation
+  methodology, widened with point-in-time SEC EDGAR fundamentals (trailing
+  P/E, price-to-book, debt-to-equity, revenue/earnings growth, return on
+  equity — see "Fundamentals data" below). Holdout MSE 0.008533 against a
+  fold-specific baseline of 0.007285 — worse than baseline overall, and worse
+  in all 5 of 5 folds individually, the same clean negative pattern as
+  predict-v4. Information coefficient is weak and, on balance, more negative
+  than predict-v4's (-0.0500 overall; per-fold range -0.1505 to +0.0083).
+  Notably, this is *not* a case of the model ignoring the new features:
+  `trailing_pe` and `price_to_book` were its two most important features by
+  SSE-reduction gain (11.7% and 9.4%, ahead of every technical indicator), and
+  `earnings_growth_yoy`/`debt_to_equity` also ranked in the top eight. The
+  fundamentals were used heavily and still didn't produce a validated edge —
+  evidence against the data itself carrying real forward-return signal at this
+  horizon, not evidence the model failed to look. This closes off the last
+  remaining untried lever (a genuinely new data source) from this angle.
 
 Taken together, neither signal has demonstrated a validated edge, and the
-deeper, wider sample — plus two further, more targeted attempts to find one
+deeper, wider sample — plus three further, more targeted attempts to find one
 (a nonlinear model, a trading-rules-stripped direct capture of the
-classification edge) — makes that conclusion more solid than the earlier
-narrower one did. This is not a case where more data or a different model
-revealed a hidden edge; every additional check has removed ambiguity in the
-negative direction. This is stated plainly rather than glossed over. A future
-claim of validated edge would require a model or ranking to beat its own
-fold/window-specific baseline consistently across multiple non-overlapping
-periods, not on a rerun of the same data. See Limitations.
+classification edge, and a genuinely new fundamentals data source) — makes
+that conclusion more solid than the earlier narrower one did. This is not a
+case where more data, a different model, or a new data source revealed a
+hidden edge; every additional check has removed ambiguity in the negative
+direction. This is stated plainly rather than glossed over. A future claim of
+validated edge would require a model or ranking to beat its own fold/window-
+specific baseline consistently across multiple non-overlapping periods, not on
+a rerun of the same data. See Limitations.
 
 ### Investigating the High Risk inversion
 
@@ -687,6 +744,15 @@ python main.py signal-capture-test --horizon-days 21
 # score_v1 and predict-v3. See "Phase 5" above.
 python main.py predict-v4
 python main.py predict-v4 --symbols AAPL MSFT --as-of-date 2026-06-30
+
+# Collect point-in-time SEC EDGAR fundamentals for the candidate universe (manual/
+# periodic -- not part of daily `run`; fundamentals change quarterly, not daily).
+python main.py collect-fundamentals
+python main.py collect-fundamentals --symbols AAPL MSFT
+
+# EXPERIMENTAL: predict-v4 widened with point-in-time fundamentals. See "Phase 5" above.
+python main.py predict-v5
+python main.py predict-v5 --symbols AAPL MSFT --as-of-date 2026-06-30
 ```
 
 `digest` reads the same saved classifications as `scores`/`explain` and groups
@@ -882,7 +948,7 @@ Walk-forward validation uses fixed warm-up and development periods as preceding 
 
 ## Persistence and reports
 
-SQLite is the system of record. Safe migrations preserve existing prices and add analysis, regime, backtest, trade, fill, equity, metric, walk-forward, and experimental-prediction (`prediction_runs`/`prediction_folds`, with per-fold date ranges, symbol counts, purge counts, baselines, and evaluation provenance) tables with run identifiers, foreign keys, indexes, uniqueness rules, and transactional writes.
+SQLite is the system of record. Safe migrations preserve existing prices and add analysis, regime, backtest, trade, fill, equity, metric, walk-forward, experimental-prediction (`prediction_runs`/`prediction_folds`, `gbm_prediction_runs`/`gbm_prediction_folds` shared by predict-v4 and predict-v5 via a `prediction_version` column, with per-fold date ranges, symbol counts, purge counts, baselines, and evaluation provenance), and fundamentals (`fundamentals` — point-in-time SEC EDGAR facts, each row tagged with its own `filed_date`) tables with run identifiers, foreign keys, indexes, uniqueness rules, and transactional writes.
 
 Phase 2 reports contain run metadata, as-of/data-through dates, score version/hash, regime evidence, candidate/risk rankings, components, factors, limitations, quality issues, prior-run changes, methodology, and inline adjusted-price/SMA20/SMA50/SMA200 charts. If a `validate-signals` artifact exists in the reports directory, the report also surfaces the latest Strong Candidate / High Risk bucket's symbol-weighted historical excess return (with its confidence interval and a concentration-warning caveat when applicable) directly above the matching ranking table — dated to that artifact's run, not recomputed per report, and explicitly labeled as a descriptive historical pattern rather than a live prediction for the symbols currently ranked (see "Evaluation honesty" below).
 
@@ -895,9 +961,9 @@ main.py                         CLI entry point
 config/                         Settings, scoring, backtest rules, watchlist
 stock_scrapper/analysis/        Indicators-to-score research workflow
 stock_scrapper/backtesting/     Configuration, simulation, persistence, metrics, reports
-stock_scrapper/collectors/      Daily market-data collection
+stock_scrapper/collectors/      Daily market-data collection; SEC EDGAR fundamentals (manual/periodic)
 stock_scrapper/migrations/      Safe SQLite schema migrations
-stock_scrapper/processing/      Validation, indicators, relative strength
+stock_scrapper/processing/      Validation, indicators, relative strength, point-in-time fundamentals features
 stock_scrapper/reporting/       Phase 2 offline reporting and the daily digest
 stock_scrapper/portfolio.py     Real-holdings aggregation and hold/sell assessment
 stock_scrapper/prediction/      Experimental forward-return prediction (config, dataset, model, service, persistence)
@@ -925,10 +991,11 @@ python -m pytest -q
 - **Free-data limitations:** yfinance data may be delayed, revised, incomplete, rate-limited, or inconsistent across corporate actions.
 - **Daily bars:** OHLC data cannot reveal the exact intraday order of events.
 - **Historical simulation:** fills are modeled from stored bars and configured assumptions, not an exchange order book.
-- **Research scope:** technical evidence omits fundamentals, macroeconomic releases, news, taxes, borrowing constraints, and individual circumstances.
+- **Research scope:** `score_v1` itself is technical-only and omits fundamentals, macroeconomic releases, news, taxes, borrowing constraints, and individual circumstances. `predict-v5` (see below) experimentally adds point-in-time company fundamentals, but only as features for that one experimental model — it changes nothing about `score_v1`'s own scoring or classification logic.
 - **Screening universe:** `config/screening_universe.csv` is a hand-maintained illustrative list, not a live feed of any official index's constituents, and is not automatically kept current.
 - **Experimental prediction:** `predict` fits a small linear model on freely available technical indicators; its date-grouped, purged, sample-weighted walk-forward holdout accuracy/Brier score are reported next to their own fold-specific baselines precisely so a lack of real edge is visible rather than hidden — and, as of this project's current data, that is exactly what they show (see "Evaluation honesty" above). Past accuracy does not indicate future accuracy. It is not part of `score_v1`.
 - **Experimental nonlinear prediction:** `predict-v4` fits a gradient-boosted regression tree ensemble on the same evaluation methodology as `predict`, targeting continuous excess return instead of a binary label; as of this project's current data it is a consistent negative result, losing to its own fold-specific baseline in every fold (see "Evaluation honesty" above). It is not part of `score_v1` or `predict-v3`, and a single extreme prediction (an outlier tree-leaf estimate for a feature combination under-represented in training) should be treated with particular skepticism.
+- **Experimental fundamentals-augmented prediction:** `predict-v5` widens `predict-v4` with point-in-time SEC EDGAR fundamentals; as of this project's current data it is also a consistent negative result (worse than baseline in every fold), despite the fundamentals features ranking among the model's most important by gain — see "Evaluation honesty" above. `collect-fundamentals`'s concept-alias coverage is incomplete for some symbols' older or industry-specific revenue tag variants, which is a data-completeness gap, not a lookahead-safety issue (every fact used is still bounded by its own `filed_date`).
 - **Signal validation is descriptive, not inferential:** `validate-signals`' p-values are naive (they assume independent daily trials, which overlapping-horizon, symbol-clustered rows are not) and are labeled as such; the symbol-weighted mean and its confidence interval are the more defensible read, and buckets backed by fewer than four distinct symbols are flagged as concentration-prone rather than presented as population-level evidence.
 - **Risk-inversion diagnostics are exploratory:** `investigate-risk-inversion`'s quintile splits and Pearson correlations share `validate-signals`' overlapping-window, symbol-clustered non-independence, and testing several correlated indicators at once can look suggestive by chance. Treat its output as hypothesis generation, not a validated explanation, and it changes nothing about score_v1's scoring, thresholds, or classification logic.
 - **Signal-capture diagnostic is exploratory:** `signal-capture-test` is a maximally-permissive score_v1 variant (single-classification entry, no risk-management exits, fixed holding period) built to isolate one question — see "Can the Strong Candidate edge be captured directly?" above. It found removing score_v1's trading rules performs *worse*, not better, suggesting those rules do real protective work rather than suppressing an edge — but it is one exploratory read over one (overlapping-window) history, not a validated conclusion, and changes nothing about score_v1 itself.

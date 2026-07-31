@@ -7,7 +7,7 @@ import yaml
 from stock_scrapper.analysis.engine import analyze_symbol
 from stock_scrapper.analysis.opportunity_score import calculate_opportunity_score
 from stock_scrapper.analysis.scoring_config import validate_scoring_config
-from stock_scrapper.database import fetch_price_history, initialize_database, record_quality_issue
+from stock_scrapper.database import fetch_fundamentals, fetch_price_history, initialize_database, record_quality_issue
 
 
 def test_opportunity_configuration_validation_rejects_mismatches() -> None:
@@ -51,6 +51,34 @@ def test_fetch_price_history_honors_as_of_date(tmp_path: Path) -> None:
         conn.commit()
         rows = fetch_price_history(conn, "AAPL", end_date="2024-01-02")
         assert [row["trade_date"] for row in rows] == ["2024-01-01", "2024-01-02"]
+    finally:
+        conn.close()
+
+
+def test_fetch_fundamentals_returns_full_history_ordered_by_filed_date(tmp_path: Path) -> None:
+    db_path = tmp_path / "market.db"
+    initialize_database(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO fundamentals (symbol, concept, source_tag, form, period_end, filed_date, value, unit, collected_at) "
+            "VALUES ('AAPL', 'net_income', 'NetIncomeLoss', '10-Q', '2023-12-31', '2024-02-01', 1000.0, 'USD', '2024-02-02T00:00:00+00:00')"
+        )
+        conn.execute(
+            "INSERT INTO fundamentals (symbol, concept, source_tag, form, period_end, filed_date, value, unit, collected_at) "
+            "VALUES ('AAPL', 'net_income', 'NetIncomeLoss', '10-Q', '2023-09-30', '2023-10-15', 900.0, 'USD', '2023-10-16T00:00:00+00:00')"
+        )
+        conn.execute(
+            "INSERT INTO fundamentals (symbol, concept, source_tag, form, period_end, filed_date, value, unit, collected_at) "
+            "VALUES ('MSFT', 'net_income', 'NetIncomeLoss', '10-Q', '2023-12-31', '2024-02-01', 5000.0, 'USD', '2024-02-02T00:00:00+00:00')"
+        )
+        conn.commit()
+
+        rows = fetch_fundamentals(conn, "aapl")
+
+        assert [row["filed_date"] for row in rows] == ["2023-10-15", "2024-02-01"]
+        assert all(row["symbol"] == "AAPL" for row in rows)
+        assert rows[1]["value"] == 1000.0
     finally:
         conn.close()
 

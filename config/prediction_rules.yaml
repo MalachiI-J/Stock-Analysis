@@ -38,3 +38,35 @@ gbm:
   min_samples_leaf: 50
   min_samples_split: 100
   l2_lambda: 1.0
+
+# predict-v5: reuses predict-v4's exact gradient-boosted model/hyperparameters (the
+# "gbm" section above) and evaluation methodology, widening only the feature list with
+# point-in-time SEC EDGAR fundamentals (stock_scrapper/processing/fundamentals_features.py)
+# -- the one data-source lever not yet tried after four negative price/volume-only
+# attempts. See README's "Evaluation honesty" for the actual result once run.
+predict_v5:
+  feature_keys:
+    - rsi_14
+    - distance_from_sma200
+    - distance_from_sma50
+    - trend_slope_50
+    - trend_slope_200
+    - one_month_return
+    - three_month_return
+    - six_month_return
+    - twenty_day_volatility
+    - sixty_day_volatility
+    - benchmark_relative_return_63
+    - benchmark_relative_return_252
+    - beta
+    - correlation
+    - atr_percentage
+    - volume_relative_to_average
+    - market_regime_code
+    - opportunity_score_percentile
+    - trailing_pe
+    - price_to_book
+    - debt_to_equity
+    - revenue_growth_yoy
+    - earnings_growth_yoy
+    - return_on_equity

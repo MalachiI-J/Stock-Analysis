@@ -28,6 +28,9 @@ def _valid_rules(**overrides: object) -> dict[str, object]:
             "min_samples_split": 100,
             "l2_lambda": 1.0,
         },
+        "predict_v5": {
+            "feature_keys": ["rsi_14", "trailing_pe"],
+        },
     }
     base.update(overrides)
     return base
@@ -92,6 +95,32 @@ def test_validate_prediction_config_accepts_zero_gbm_l2_lambda() -> None:
     result = validate_prediction_config(rules)
 
     assert result["gbm"]["l2_lambda"] == 0.0
+
+
+def test_validate_prediction_config_rejects_missing_predict_v5_section() -> None:
+    rules = _valid_rules()
+    del rules["predict_v5"]
+
+    with pytest.raises(ValueError, match="predict_v5 must be a mapping"):
+        validate_prediction_config(rules)
+
+
+@pytest.mark.parametrize("feature_keys", [None, [], "trailing_pe", [123], ["", "trailing_pe"]])
+def test_validate_prediction_config_rejects_invalid_predict_v5_feature_keys(feature_keys: object) -> None:
+    rules = _valid_rules()
+    rules["predict_v5"] = {"feature_keys": feature_keys}
+
+    with pytest.raises(ValueError, match="predict_v5.feature_keys"):
+        validate_prediction_config(rules)
+
+
+def test_validate_prediction_config_accepts_widened_predict_v5_feature_keys() -> None:
+    rules = _valid_rules()
+    rules["predict_v5"] = {"feature_keys": ["rsi_14", "trailing_pe", "price_to_book"]}
+
+    result = validate_prediction_config(rules)
+
+    assert result["predict_v5"]["feature_keys"] == ["rsi_14", "trailing_pe", "price_to_book"]
 
 
 def test_validate_prediction_config_rejects_non_dict_input() -> None:

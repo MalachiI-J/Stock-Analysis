@@ -72,6 +72,20 @@ def validate_prediction_config(rules: dict[str, Any]) -> dict[str, Any]:
     if isinstance(gbm_l2_lambda, bool) or not isinstance(gbm_l2_lambda, (int, float)) or gbm_l2_lambda < 0:
         raise ValueError("gbm.l2_lambda must be a nonnegative number")
 
+    # predict-v5 reuses predict-v4's "gbm" hyperparameters above unchanged and only
+    # widens the feature list (base technical keys + fundamentals) -- its own nested
+    # section carries just that one override, not a duplicate hyperparameter set.
+    predict_v5_raw = rules.get("predict_v5")
+    if not isinstance(predict_v5_raw, dict):
+        raise ValueError("predict_v5 must be a mapping")
+    predict_v5_feature_keys = predict_v5_raw.get("feature_keys")
+    if (
+        not isinstance(predict_v5_feature_keys, list)
+        or not predict_v5_feature_keys
+        or not all(isinstance(key, str) and key.strip() for key in predict_v5_feature_keys)
+    ):
+        raise ValueError("predict_v5.feature_keys must be a non-empty list of indicator/fundamental names")
+
     return {
         "prediction_version": prediction_version,
         "horizon_days": horizon_days,
@@ -90,5 +104,8 @@ def validate_prediction_config(rules: dict[str, Any]) -> dict[str, Any]:
             "min_samples_leaf": gbm_min_samples_leaf,
             "min_samples_split": gbm_min_samples_split,
             "l2_lambda": float(gbm_l2_lambda),
+        },
+        "predict_v5": {
+            "feature_keys": [str(key) for key in predict_v5_feature_keys],
         },
     }

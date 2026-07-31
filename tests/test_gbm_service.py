@@ -288,3 +288,65 @@ def test_run_gbm_prediction_exposes_provenance_hashes_and_reruns_match() -> None
     )
     assert result_c.symbol_universe_hash != result_a.symbol_universe_hash
     assert result_c.feature_set_hash == result_a.feature_set_hash
+
+
+def test_run_gbm_prediction_supports_predict_v5_feature_keys_and_fundamentals() -> None:
+    """predict_v5 passes its own feature_keys (overriding rules["feature_keys"]) and
+    fundamentals_by_symbol through the same function predict-v4 already uses."""
+    trading_dates = _dates("2024-01-01", 20)
+    prices = [100.0 + index for index in range(20)]
+    history = {"AAA": [{"trade_date": d, "adjusted_close": p} for d, p in zip(trading_dates, prices)]}
+    history.update(_flat_benchmark(trading_dates))
+    as_of = trading_dates[-1]
+    results_by_date = {d: {"AAA": _result("AAA", d, rsi=None)} for d in trading_dates}
+    service = _FakeService(results_by_date)
+    fundamentals_by_symbol = {
+        "AAA": [
+            {"concept": "eps_diluted", "period_start": "2022-10-01", "period_end": "2022-12-31", "filed_date": "2023-01-15", "value": 1.0},
+            {"concept": "eps_diluted", "period_start": "2023-01-01", "period_end": "2023-03-31", "filed_date": "2023-04-15", "value": 1.0},
+            {"concept": "eps_diluted", "period_start": "2023-04-01", "period_end": "2023-06-30", "filed_date": "2023-07-15", "value": 1.0},
+            {"concept": "eps_diluted", "period_start": "2023-07-01", "period_end": "2023-09-30", "filed_date": "2023-10-15", "value": 1.0},
+        ],
+    }
+    # rules["feature_keys"] deliberately differs from the explicit feature_keys=
+    # argument below, to prove the explicit argument wins rather than rules'.
+    rules = dict(_RULES, feature_keys=["rsi_14"])
+
+    result = run_gbm_prediction(
+        service, ["AAA"], history, trading_dates,
+        as_of_date=as_of, rules=rules, benchmark_symbol="SPY",
+        feature_keys=["trailing_pe"], fundamentals_by_symbol=fundamentals_by_symbol,
+    )
+
+    assert result.status == "ok"
+    assert result.feature_importances and result.feature_importances[0][0] == "trailing_pe"
+    prediction = next(p for p in result.predictions if p.symbol == "AAA")
+    assert prediction.predicted_excess_return is not None
+
+
+def test_run_gbm_prediction_without_predict_v5_params_matches_predict_v4_exactly() -> None:
+    """Omitting feature_keys/gbm_config/fundamentals_by_symbol must reproduce
+    predict-v4's existing behavior byte-for-byte -- these are additive, optional
+    parameters, not a change to any existing caller."""
+    trading_dates = _dates("2024-01-01", 20)
+    prices = [100.0 + index for index in range(20)]
+    history = {"AAA": [{"trade_date": d, "adjusted_close": p} for d, p in zip(trading_dates, prices)]}
+    history.update(_flat_benchmark(trading_dates))
+    as_of = trading_dates[-1]
+    results_by_date = {d: {"AAA": _result("AAA", d, rsi=40.0 + index)} for index, d in enumerate(trading_dates)}
+
+    baseline = run_gbm_prediction(
+        _FakeService(results_by_date), ["AAA"], history, trading_dates,
+        as_of_date=as_of, rules=_RULES, benchmark_symbol="SPY",
+    )
+    explicit = run_gbm_prediction(
+        _FakeService(results_by_date), ["AAA"], history, trading_dates,
+        as_of_date=as_of, rules=_RULES, benchmark_symbol="SPY",
+        feature_keys=None, gbm_config=None, fundamentals_by_symbol=None,
+    )
+
+    assert baseline.dataset_fingerprint == explicit.dataset_fingerprint
+    assert baseline.feature_importances == explicit.feature_importances
+    assert (
+        baseline.predictions[0].predicted_excess_return == explicit.predictions[0].predicted_excess_return
+    )

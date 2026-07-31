@@ -36,12 +36,19 @@ from stock_scrapper.backtesting.walk_forward import (
 )
 from stock_scrapper.collectors.yahoo_prices import YahooPriceCollector
 from stock_scrapper.collectors.corporate_actions import action_records, upsert_actions, record_action_coverage
+from stock_scrapper.collectors.sec_edgar_fundamentals import (
+    fetch_company_facts,
+    fetch_ticker_cik_map,
+    normalize_company_facts,
+    upsert_fundamentals,
+)
 from stock_scrapper.market_calendar import SessionResolver
 from stock_scrapper.config import load_config, load_watchlist, load_universes, validate_universes
 from stock_scrapper.data_health import assess_data_health
 from stock_scrapper.database import (
     close_portfolio_lots_fifo,
     create_connection,
+    fetch_fundamentals,
     fetch_price_history,
     fetch_quality_issues,
     get_analysis_run,
@@ -361,6 +368,11 @@ def build_parser() -> argparse.ArgumentParser:
     action_refresh = subparsers.add_parser("corporate-actions-refresh", help="Refresh explicit corporate actions and checked coverage")
     action_refresh.add_argument("--symbols", nargs="+")
     action_refresh.add_argument("--full", action="store_true")
+    fundamentals_parser = subparsers.add_parser(
+        "collect-fundamentals",
+        help="Collect point-in-time SEC EDGAR fundamentals for the candidate universe (see README's 'Evaluation honesty')",
+    )
+    fundamentals_parser.add_argument("--symbols", nargs="+", help="Optional candidate symbol list")
     subparsers.add_parser("universe-show", help="Show role-aware symbol universes")
     subparsers.add_parser("universe-validate", help="Validate symbol universe roles")
     subparsers.add_parser("provenance", help="Show current software provenance")
@@ -388,6 +400,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override config/prediction_rules.yaml's horizon_days, so this stays comparable to predict/validate-signals",
     )
     _add_as_of_argument(predict_v4)
+
+    predict_v5 = subparsers.add_parser(
+        "predict-v5",
+        help="EXPERIMENTAL: predict-v4's model widened with point-in-time SEC EDGAR fundamentals (not score_v1)",
+    )
+    predict_v5.add_argument("--symbols", nargs="+", help="Optional symbol list")
+    predict_v5.add_argument(
+        "--horizon-days", type=int,
+        help="Override config/prediction_rules.yaml's horizon_days, so this stays comparable to predict/predict-v4",
+    )
+    _add_as_of_argument(predict_v5)
     return parser
 
 
@@ -1473,6 +1496,120 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(f"  {prediction.symbol:<6} {prediction.predicted_excess_return:+.2%}")
             return int(ExitCode.SUCCESS)
 
+        if args.command == "predict-v5":
+            print(
+                "EXPERIMENTAL STATISTICAL FORECAST — not part of score_v1, not a trading signal, not "
+                "predict-v3/predict-v4. Same gradient-boosted regression on continuous forward excess "
+                "return as predict-v4, widened with point-in-time SEC EDGAR fundamentals (trailing P/E, "
+                "price-to-book, debt-to-equity, revenue/earnings growth, return on equity) — the one "
+                "genuinely new data source left untried after price/volume-only signals repeatedly "
+                "failed to show a validated edge. Run `collect-fundamentals` first, or symbols will show "
+                "as unavailable. Read the holdout MSE/information coefficient below before trusting any "
+                "prediction, and compare against predict-v4's own recorded numbers (README's 'Evaluation "
+                "honesty' section) to see whether fundamentals actually moved the needle.",
+                file=sys.stderr,
+            )
+            effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
+            prediction_rules = load_prediction_rules(base_dir)
+            if args.horizon_days is not None:
+                if args.horizon_days <= 0:
+                    parser.error("--horizon-days must be positive")
+                prediction_rules = dict(prediction_rules, horizon_days=args.horizon_days)
+            predict_v5_feature_keys = list(prediction_rules["predict_v5"]["feature_keys"])
+            scoring_rules = load_scoring_rules(base_dir)
+            roles = load_universes(config)
+            benchmark = roles["benchmark"]
+            load_symbols = sorted(set(symbols) | {benchmark} | set(roles["market_context"]) | set(roles["defensive_context"]))
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                histories = {symbol: fetch_price_history(conn, symbol, end_date=effective) for symbol in load_symbols}
+                trading_dates = [str(row["trade_date"])[:10] for row in histories.get(benchmark, [])]
+                fundamentals_by_symbol = {symbol: fetch_fundamentals(conn, symbol) for symbol in symbols}
+                service = AnalysisService(conn, scoring_rules, roles["candidates"])
+                result = run_gbm_prediction(
+                    service, symbols, histories, trading_dates,
+                    as_of_date=effective.isoformat(), rules=prediction_rules, benchmark_symbol=benchmark,
+                    feature_keys=predict_v5_feature_keys, fundamentals_by_symbol=fundamentals_by_symbol,
+                )
+                prediction_run_id = f"predict-v5-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
+                run_provenance = collect_provenance(
+                    base_dir, strategy_name="predict-v5", strategy_version="predict-v5",
+                )
+                conn.execute("BEGIN")
+                try:
+                    persist_gbm_prediction_run(
+                        conn, prediction_run_id, result,
+                        prediction_version="predict-v5",
+                        benchmark_symbol=benchmark,
+                        configuration_snapshot=prediction_rules,
+                        configuration_hash=stable_sha256(prediction_rules),
+                        git_commit_hash=run_provenance.get("git_commit_hash"),
+                        git_dirty=run_provenance.get("git_dirty"),
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+            finally:
+                conn.close()
+            if result.status == "insufficient_data":
+                print(f"prediction run: {prediction_run_id}", file=sys.stderr)
+                print(f"Missing data: {result.message}", file=sys.stderr)
+                return int(ExitCode.MISSING_DATA)
+            print(f"prediction run: {prediction_run_id}")
+            print(f"Prediction as of {result.as_of_date} | horizon={result.horizon_days} session(s) | model=predict-v5")
+            print(
+                f"Trained on {result.training_samples} sample(s) ({result.training_start_date} to "
+                f"{result.training_end_date})"
+            )
+            if result.message:
+                print(f"Note: {result.message}", file=sys.stderr)
+            mse_text = "n/a" if result.holdout_mse is None else f"{result.holdout_mse:.6f}"
+            baseline_mse_text = "n/a" if result.baseline_mse is None else f"{result.baseline_mse:.6f}"
+            mae_text = "n/a" if result.holdout_mean_absolute_error is None else f"{result.holdout_mean_absolute_error:.4f}"
+            ic_text = "n/a" if result.holdout_information_coefficient is None else f"{result.holdout_information_coefficient:+.4f}"
+            print(
+                f"Walk-forward holdout MSE: {mse_text} (sample-weighted baseline {baseline_mse_text}, "
+                "each fold's own test-period target variance — the minimum achievable MSE for always "
+                f"predicting that fold's own mean) over {result.holdout_samples} held-out sample(s) "
+                f"across {len(result.walk_forward_folds)} fold(s)"
+            )
+            print(f"Holdout mean absolute error: {mae_text} | information coefficient: {ic_text}")
+            for fold in result.walk_forward_folds:
+                fold_mse = "n/a" if fold.mse is None else f"{fold.mse:.6f}"
+                fold_baseline_mse = "n/a" if fold.baseline_mse is None else f"{fold.baseline_mse:.6f}"
+                fold_mae = "n/a" if fold.mean_absolute_error is None else f"{fold.mean_absolute_error:.4f}"
+                fold_ic = "n/a" if fold.information_coefficient is None else f"{fold.information_coefficient:+.4f}"
+                print(
+                    f"  fold {fold.fold}: train [{fold.training_start_date}..{fold.training_end_date}] "
+                    f"({fold.training_samples} samples, {fold.training_symbol_count} symbols, "
+                    f"{fold.purged_samples} purged for label/test-period overlap)"
+                )
+                print(
+                    f"    -> test [{fold.test_start_date}..{fold.test_end_date}] "
+                    f"({fold.test_samples} samples, {fold.test_symbol_count} symbols)"
+                )
+                print(
+                    f"    mse {fold_mse} vs. fold baseline {fold_baseline_mse} | mae {fold_mae} | "
+                    f"information coefficient {fold_ic}"
+                )
+            print("Feature importances (share of total SSE-reduction gain across every tree):")
+            for name, share in result.feature_importances[:10]:
+                print(f"  {name:<32} {share:.1%}")
+            print(f"Symbol predictions (predicted forward excess return vs. {benchmark}):")
+            ranked = sorted(
+                result.predictions,
+                key=lambda item: item.predicted_excess_return if item.predicted_excess_return is not None else float("-inf"),
+                reverse=True,
+            )
+            for prediction in ranked:
+                if prediction.predicted_excess_return is None:
+                    print(f"  {prediction.symbol:<6} unavailable — {prediction.reason}")
+                else:
+                    print(f"  {prediction.symbol:<6} {prediction.predicted_excess_return:+.2%}")
+            return int(ExitCode.SUCCESS)
+
         if args.command in {"data-health", "data-health-report"}:
             initialize_database(config["database_path"]); conn = create_connection(config["database_path"])
             try: health = assess_data_health(conn, symbols, int(config.get("market_data", {}).get("provider_delay_minutes", 30)))
@@ -1514,6 +1651,43 @@ def main(argv: Sequence[str] | None = None) -> int:
                         record_action_coverage(conn,symbol,"yfinance",start.isoformat(),end.isoformat(),[],status="failed",error=str(exc)); conn.commit()
             finally: conn.close()
             print(f"actions_upserted={total} symbols={len(symbols)} failed={len(failures)}")
+            return int(ExitCode.PARTIAL_FAILURE if failures else ExitCode.SUCCESS)
+
+        if args.command == "collect-fundamentals":
+            initialize_database(config["database_path"]); conn = create_connection(config["database_path"])
+            edgar_config = config.get("edgar") or {}
+            user_agent = str(edgar_config.get("user_agent", "")).strip()
+            timeout_seconds = int(edgar_config.get("timeout_seconds", 20))
+            max_retries = int(edgar_config.get("max_retries", 3))
+            retry_delay_seconds = float(edgar_config.get("retry_delay_seconds", 2))
+            failures: list[str] = []; total = 0
+            try:
+                cik_map = fetch_ticker_cik_map(
+                    user_agent=user_agent, timeout_seconds=timeout_seconds,
+                    max_retries=max_retries, retry_delay_seconds=retry_delay_seconds,
+                )
+                for symbol in symbols:
+                    cik = cik_map.get(symbol)
+                    if cik is None:
+                        failures.append(symbol)
+                        logger.warning(f"No SEC CIK found for {symbol}")
+                        continue
+                    try:
+                        facts = fetch_company_facts(
+                            cik, user_agent=user_agent, timeout_seconds=timeout_seconds,
+                            max_retries=max_retries, retry_delay_seconds=retry_delay_seconds,
+                        )
+                        records = normalize_company_facts(symbol, facts)
+                        total += upsert_fundamentals(conn, records)
+                        conn.commit()
+                    except Exception as exc:
+                        conn.rollback(); failures.append(symbol)
+                        logger.warning(f"Fundamentals collection failed for {symbol}: {exc}")
+            finally:
+                conn.close()
+            print(f"fundamentals_upserted={total} symbols={len(symbols)} failed={len(failures)}")
+            if failures:
+                print(f"failed_symbols={','.join(failures)}")
             return int(ExitCode.PARTIAL_FAILURE if failures else ExitCode.SUCCESS)
 
         if args.command == "revisions-classify":
