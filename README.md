@@ -721,8 +721,22 @@ PowerShell's native `2>&1`/`*>>`, which otherwise wraps every stderr line
 from a Python process (the app logger writes `INFO` to stderr) in a
 spurious `NativeCommandError` and can emit UTF-16 log files.
 
+If `run`, `digest`, or `recommend` exits nonzero, the script shows a distinct
+"Stock Scrapper daily run FAILED" toast (exit codes plus which log file to check)
+instead of the usual summary. This exists because a failure previously looked
+identical to "nothing to report" — no toast at all — which is easy to miss for
+days. A clean run still gets exactly the combined summary toast described above;
+only a genuine failure gets the separate alert.
+
 A Windows Task Scheduler task (`\StockScrapper\DailyRun`) runs this script
-Monday–Friday. Inspect or change it with:
+Monday–Friday. Its configuration is defined in source at
+`scripts/register_task.ps1` (weekday trigger time, `StartWhenAvailable` so a
+missed run — e.g. the machine was asleep — catches up once it's next on, and a
+retry policy of 2 attempts 5 minutes apart for transient failures like a flaky
+network request) rather than existing only as manually-clicked, undocumented
+state on one machine; re-run it any time after changing its parameters to apply
+them (`Unregister-ScheduledTask` then `Register-ScheduledTask` under the hood, so
+it's always safe to re-run). Inspect or change the live task with:
 
 ```powershell
 Get-ScheduledTask -TaskPath "\StockScrapper\" -TaskName "DailyRun"
@@ -1066,7 +1080,7 @@ stock_scrapper/reporting/       Phase 2 offline reporting and the daily digest
 stock_scrapper/portfolio.py     Real-holdings aggregation and hold/sell assessment
 stock_scrapper/prediction/      Experimental forward-return prediction (config, dataset, model, service, persistence)
 stock_scrapper/trading/         Advisory trade recommendations, sizing, and hindsight review (config, recommendations, review)
-scripts/                        Daily automation wrapper, toast notification (Task Scheduler entry point)
+scripts/                        Daily automation wrapper, toast notification, reproducible Task Scheduler registration
 tools/                          Clean source-archive tooling
 data/                           Local SQLite and caches; not source-controlled
 reports/                        Generated offline reports; not source-controlled

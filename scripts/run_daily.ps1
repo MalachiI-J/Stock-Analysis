@@ -11,6 +11,12 @@ tied to a saved run) older than the configured retention window
 Scheduler once per day, after the market close plus the configured provider delay
 (see market_data.provider_delay_minutes in config/settings.yaml).
 
+If `run`, `digest`, or `recommend` exits nonzero, a distinct "Stock Scrapper daily
+run FAILED" toast fires instead of the usual summary — a silent absence of the usual
+toast is easy to miss and is exactly how a prior pipeline interruption went unnoticed
+for a while; a failure now always produces its own visible notification, listing each
+step's exit code and the log file to check.
+
 The toast notification and report auto-open both require an interactive logon
 session, which is why this task is registered with LogonType=Interactive rather
 than running detached. The report is located by its documented canonical filename
@@ -55,7 +61,23 @@ $recommendExit = $LASTEXITCODE
 $today = Get-Date -Format "yyyy-MM-dd"
 $summaryPath = Join-Path $RepoRoot "reports\digest_$today.summary.json"
 $recommendPath = Join-Path $RepoRoot "reports\recommendations_$today.summary.json"
-if (Test-Path $summaryPath) {
+
+# A nonzero exit from run/digest/recommend must never pass silently: without this, a
+# failure just looks like "no toast appeared today" (the digest summary for today's date
+# was never written), which is easy to miss and is exactly how the pipeline previously
+# went uninterrupted-but-unnoticed. This check fires regardless of whether either
+# summary file exists, so a failure is always its own distinct, visible notification.
+$pipelineFailed = ($runExit -ne 0) -or ($digestExit -ne 0) -or ($recommendExit -ne 0)
+
+if ($pipelineFailed) {
+    $failureTitle = "Stock Scrapper daily run FAILED"
+    $failureMessage = "run=$runExit digest=$digestExit recommend=$recommendExit`nSee $(Split-Path $logFile -Leaf) in logs\"
+    try {
+        & (Join-Path $PSScriptRoot "send_toast.ps1") -Title $failureTitle -Message $failureMessage *>> $logFile
+    } catch {
+        Add-Content -Path $logFile -Value "Failure toast skipped: $_"
+    }
+} elseif (Test-Path $summaryPath) {
     try {
         $summary = Get-Content $summaryPath -Raw | ConvertFrom-Json
         $sellSymbols = @($summary.holdings_sell_symbols)
@@ -77,7 +99,7 @@ if (Test-Path $summaryPath) {
         Add-Content -Path $logFile -Value "Toast notification skipped: $_"
     }
 } else {
-    Add-Content -Path $logFile -Value "Toast notification skipped: summary file not found at $summaryPath"
+    Add-Content -Path $logFile -Value "Toast notification skipped: summary file not found at $summaryPath, but all steps reported exit code 0"
 }
 
 $openReportsSetting = (& $pythonExe -c "from stock_scrapper.config import load_config; print(bool(load_config().get('open_reports_automatically', False)))").Trim()
