@@ -88,7 +88,13 @@ from stock_scrapper.prediction.persistence import persist_prediction_run
 from stock_scrapper.prediction.service import run_prediction
 from stock_scrapper.processing.validation import validate_price_records
 from stock_scrapper.trading.config import validate_trading_rules
-from stock_scrapper.trading.recommendations import build_recommendations, render_recommendations_text
+from stock_scrapper.trading.recommendations import (
+    RecommendationRunResult,
+    TradeRecommendation,
+    build_recommendations,
+    render_recommendations_text,
+)
+from stock_scrapper.reporting.dashboard_builder import render_dashboard_html
 from stock_scrapper.trading.review import evaluate_recommendation_outcomes, render_review_text
 from stock_scrapper.reporting.report_builder import write_phase2_reports
 from stock_scrapper.reporting.risk_diagnostics_report import write_risk_diagnostics_html_report
@@ -226,6 +232,17 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_parser.add_argument("--no-save", action="store_true", help="Print only; do not write a report file to reports_dir")
     recommend_parser.add_argument("--no-model", action="store_true", help="Skip the experimental prediction model's confidence context")
     _add_as_of_argument(recommend_parser)
+
+    dashboard_parser = subparsers.add_parser(
+        "dashboard", help="Write a combined local HTML view of today's digest, recommendations, and holdings"
+    )
+    dashboard_parser.add_argument("--symbols", nargs="+", help="Optional saved symbols")
+    dashboard_source = dashboard_parser.add_mutually_exclusive_group()
+    dashboard_source.add_argument("--run-id", help="Read one exact saved run")
+    dashboard_source.add_argument("--recalculate", action="store_true")
+    dashboard_source.add_argument("--latest-any", action="store_true")
+    dashboard_parser.add_argument("--scope", choices=("candidate_universe", "all_data_symbols", "custom"))
+    _add_as_of_argument(dashboard_parser)
 
     recommend_review = subparsers.add_parser(
         "recommend-review", help="Check how a past `recommend` run's suggestions actually performed"
@@ -457,6 +474,33 @@ def _parse_date(value: str | None, *, field: str, default: date | None = None) -
         return date.fromisoformat(value)
     except ValueError as exc:
         raise InvalidDateError(f"{field} must use YYYY-MM-DD: {value}") from exc
+
+
+def _warn_if_screening_universe_stale(config: dict[str, Any]) -> None:
+    """Surface config/screening_universe.csv's staleness instead of letting a
+    hand-maintained, non-live-feed list silently rot with no visible signal (see
+    README's Limitations: "not automatically kept current"). Best-effort only —
+    a missing or malformed `screening.universe_last_verified` skips the check
+    rather than failing the whole `screen` run over an optional setting."""
+    screening_settings = config.get("screening") or {}
+    last_verified_raw = screening_settings.get("universe_last_verified")
+    if not last_verified_raw:
+        return
+    try:
+        last_verified = date.fromisoformat(str(last_verified_raw))
+    except ValueError:
+        return
+    threshold_days = int(screening_settings.get("staleness_warning_days", 180))
+    age_days = (date.today() - last_verified).days
+    if age_days > threshold_days:
+        print(
+            f"WARNING: config/screening_universe.csv was last verified {age_days} day(s) ago "
+            f"({last_verified.isoformat()}), past the {threshold_days}-day staleness threshold. "
+            "It is a hand-maintained, illustrative list, not a live index feed -- review it against "
+            "current large-cap listings, then update screening.universe_last_verified in "
+            "config/settings.yaml.",
+            file=sys.stderr,
+        )
 
 
 def _symbols_from_args(args: argparse.Namespace, watchlist: Sequence[str]) -> list[str]:
@@ -807,6 +851,7 @@ _UNREFERENCED_REPORT_PATTERNS: tuple[str, ...] = (
     "digest_*.summary.json",
     "recommendations_*.txt",
     "recommendations_*.summary.json",
+    "dashboard_*.html",
     "data_health_*.json",
     "data_health_*.html",
     "stock_summary_*_screen-*.csv",
@@ -1218,6 +1263,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             universe_path = Path(args.universe_path) if args.universe_path else base_dir / "config" / "screening_universe.csv"
             if not universe_path.exists():
                 raise InvalidConfigurationError(f"Screening universe file does not exist: {universe_path}")
+            _warn_if_screening_universe_stale(config)
             screening_symbols = load_watchlist(universe_path)
             new_symbols = _new_screening_symbols(screening_symbols, load_universes(config)["candidates"])
             if not new_symbols:
@@ -1948,6 +1994,90 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
                 summary_target.write_text(json.dumps(summary_payload, indent=2, sort_keys=True), encoding="utf-8")
                 print(f"Summary: {summary_target}")
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "dashboard":
+            explicit = bool(getattr(args, "symbols", None))
+            if args.recalculate:
+                effective = _parse_date(args.as_of_date, field="as-of date", default=date.today())
+                batch = _analysis_batch(config, base_dir, symbols, effective, persist=True, universe=universe)
+                results = batch.results
+                as_of_date, data_through_date = batch.as_of_date, batch.data_through_date
+                regime, regime_confidence = batch.market_context.regime, batch.market_context.confidence
+            else:
+                saved, results = _load_saved_results(
+                    config, args.run_id, symbols if explicit else None,
+                    latest_any=args.latest_any, scope=args.scope,
+                )
+                as_of_date, data_through_date = saved.get("as_of_date"), saved.get("data_through_date")
+                regime = saved.get("market_regime") or (results[0].market_regime if results else "Insufficient Market Data")
+                regime_confidence = saved.get("market_regime_confidence")
+            as_of_text = str(as_of_date)[:10]
+            initialize_database(config["database_path"])
+            conn = create_connection(config["database_path"])
+            try:
+                previous = _previous_analysis(conn, as_of_text)
+                results_by_symbol = {result.symbol: result for result in results}
+                holdings = _assess_open_holdings(
+                    conn, base_dir, _parse_date(as_of_text, field="as-of date"), results_by_symbol
+                )
+            finally:
+                conn.close()
+            digest_payload = build_digest(
+                as_of_date=as_of_text,
+                data_through_date=str(data_through_date)[:10] if data_through_date else None,
+                market_regime=str(regime),
+                market_regime_confidence=regime_confidence,
+                results=results,
+                previous_results=previous,
+                holdings=holdings,
+            )
+
+            # Read, not recompute: `recommend` trains predict/predict-v5 from scratch,
+            # which is comparatively slow, and this page's job is to combine what the
+            # daily pipeline already produced, not double that cost for no new data.
+            recommend_outcome: RecommendationRunResult | None = None
+            recommend_summary_path = Path(config["reports_dir"]) / f"recommendations_{as_of_text}.summary.json"
+            if recommend_summary_path.exists():
+                recommend_data = json.loads(recommend_summary_path.read_text(encoding="utf-8"))
+                recommend_outcome = RecommendationRunResult(
+                    as_of_date=str(recommend_data.get("as_of_date", as_of_text)),
+                    account_value=float(recommend_data.get("account_value", 0.0)),
+                    available_cash=float(recommend_data.get("available_cash", 0.0)),
+                    open_position_count=int(recommend_data.get("open_position_count", 0)),
+                    recommendations=[
+                        TradeRecommendation(
+                            symbol=str(item["symbol"]), action=str(item["action"]), shares=float(item["shares"]),
+                            estimated_dollars=float(item["estimated_dollars"]), reason=str(item["reason"]),
+                            model_probability=item.get("model_probability"),
+                            predict_v5_excess_return=item.get("predict_v5_excess_return"),
+                            predict_v5_low_confidence=bool(item.get("predict_v5_low_confidence", False)),
+                        )
+                        for item in recommend_data.get("recommendations", [])
+                    ],
+                    skipped=list(recommend_data.get("skipped", [])),
+                )
+
+            phase2_report_href = None
+            candidate_reports = sorted(
+                Path(config["reports_dir"]).glob(f"stock_summary_{as_of_text}_candidates_*.html"),
+                key=lambda path: path.stat().st_mtime, reverse=True,
+            )
+            if candidate_reports:
+                phase2_report_href = candidate_reports[0].name
+
+            html_content = render_dashboard_html(
+                as_of_date=as_of_text,
+                market_regime=str(regime),
+                market_regime_confidence=regime_confidence,
+                digest=digest_payload,
+                recommend=recommend_outcome,
+                phase2_report_href=phase2_report_href,
+            )
+            target = Path(config["reports_dir"]) / f"dashboard_{as_of_text}.html"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(html_content, encoding="utf-8")
+            print(f"Dashboard: {target}")
             return int(ExitCode.SUCCESS)
 
         if args.command == "recommend-review":

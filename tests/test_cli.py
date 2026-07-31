@@ -4,7 +4,7 @@ import json
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator
@@ -640,6 +640,81 @@ def test_digest_command_no_save_skips_file(
     assert not (tmp_path / "reports" / "digest_2024-12-31.summary.json").exists()
 
 
+def test_dashboard_command_writes_html_without_recommend_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    _install_digest_saved_run(monkeypatch)
+
+    assert cli.main(["dashboard", "--run-id", "saved-run"]) == int(ExitCode.SUCCESS)
+
+    target = tmp_path / "reports" / "dashboard_2024-12-31.html"
+    assert target.exists()
+    html = target.read_text(encoding="utf-8")
+    assert "AAA" in html and "BBB" in html
+    assert "python main.py recommend</span> first" in html
+    captured = capsys.readouterr()
+    assert "Dashboard:" in captured.out
+
+
+def test_dashboard_command_reads_existing_recommend_summary_without_recomputing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    _install_digest_saved_run(monkeypatch)
+
+    def _fail_if_called(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("dashboard must not recompute recommend/predict-v5")
+
+    monkeypatch.setattr(cli, "build_recommendations", _fail_if_called)
+    monkeypatch.setattr(cli, "run_gbm_prediction", _fail_if_called)
+
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    summary_payload = {
+        "as_of_date": "2024-12-31", "account_value": 10000.0, "available_cash": 8500.0,
+        "open_position_count": 1,
+        "recommendations": [
+            {
+                "symbol": "NVDA", "action": "BUY", "shares": 10.0, "estimated_dollars": 500.0,
+                "reason": "Strong trend", "model_probability": 0.6,
+                "predict_v5_excess_return": 0.234, "predict_v5_low_confidence": True,
+            }
+        ],
+        "skipped": [],
+    }
+    (reports_dir / "recommendations_2024-12-31.summary.json").write_text(
+        json.dumps(summary_payload), encoding="utf-8"
+    )
+
+    assert cli.main(["dashboard", "--run-id", "saved-run"]) == int(ExitCode.SUCCESS)
+
+    html = (reports_dir / "dashboard_2024-12-31.html").read_text(encoding="utf-8")
+    assert "NVDA" in html
+    assert "predict-v5 +23.4%" in html
+    assert "LOW CONFIDENCE" in html
+
+
+def test_dashboard_command_links_to_existing_phase2_report(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    _install_digest_saved_run(monkeypatch)
+
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "stock_summary_2024-12-31_candidates_abc123.html").write_text("<html></html>", encoding="utf-8")
+
+    assert cli.main(["dashboard", "--run-id", "saved-run"]) == int(ExitCode.SUCCESS)
+
+    html = (reports_dir / "dashboard_2024-12-31.html").read_text(encoding="utf-8")
+    assert 'href="stock_summary_2024-12-31_candidates_abc123.html"' in html
+
+
 def test_digest_command_includes_holdings_section(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -795,6 +870,7 @@ def test_cleanup_logs_include_reports_deletes_only_unreferenced_patterns(
         reports_dir / "digest_2024-01-01.summary.json",
         reports_dir / "recommendations_2024-01-01.txt",
         reports_dir / "recommendations_2024-01-01.summary.json",
+        reports_dir / "dashboard_2024-01-01.html",
         reports_dir / "data_health_2024-01-01.json",
         reports_dir / "data_health_2024-01-01.html",
         reports_dir / "stock_summary_2024-01-01_screen-abc12345.csv",
@@ -825,7 +901,7 @@ def test_cleanup_logs_include_reports_deletes_only_unreferenced_patterns(
         assert path.exists(), f"{path} must never be deleted"
     assert recent_digest.exists()
     captured = capsys.readouterr()
-    assert "Deleted 8 unreferenced report file(s)" in captured.out
+    assert "Deleted 9 unreferenced report file(s)" in captured.out
 
 
 def test_cleanup_logs_without_include_reports_leaves_reports_alone(
@@ -1157,7 +1233,7 @@ def _install_startup_with_real_watchlist(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     watchlist: list[str],
-) -> None:
+) -> dict[str, Any]:
     # Unlike _install_startup, this leaves load_watchlist unstubbed so a
     # separately loaded screening-universe CSV is read for real too (the
     # blanket stub would otherwise intercept both calls identically).
@@ -1168,6 +1244,7 @@ def _install_startup_with_real_watchlist(
     monkeypatch.setattr(cli, "load_config", lambda _base_dir: config)
     monkeypatch.setattr(cli, "ensure_directories", lambda _config: None)
     monkeypatch.setattr(cli, "setup_logging", lambda _config, run_id: _Logger())
+    return config
 
 
 def test_screen_command_reports_no_new_symbols(
@@ -1225,6 +1302,63 @@ def test_screen_command_reports_new_candidates(
     assert "New Candidate/Strong Candidate symbol(s): 1" in captured.out
     assert "UNH" in captured.out and "Strong Candidate" in captured.out
     assert "Screener report: s.html" in captured.out
+
+
+def test_warn_if_screening_universe_stale_warns_past_threshold(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stale_date = (date.today() - timedelta(days=200)).isoformat()
+    cli._warn_if_screening_universe_stale(
+        {"screening": {"universe_last_verified": stale_date, "staleness_warning_days": 180}}
+    )
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert "screening_universe.csv" in captured.err
+    assert stale_date in captured.err
+
+
+def test_warn_if_screening_universe_stale_silent_within_threshold(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    recent_date = (date.today() - timedelta(days=10)).isoformat()
+    cli._warn_if_screening_universe_stale(
+        {"screening": {"universe_last_verified": recent_date, "staleness_warning_days": 180}}
+    )
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_warn_if_screening_universe_stale_silent_when_setting_missing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli._warn_if_screening_universe_stale({})
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_warn_if_screening_universe_stale_silent_when_malformed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli._warn_if_screening_universe_stale({"screening": {"universe_last_verified": "not-a-date"}})
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_screen_command_prints_staleness_warning_when_configured_stale(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = _install_startup_with_real_watchlist(monkeypatch, tmp_path, ["AAPL", "MSFT"])
+    stale_date = (date.today() - timedelta(days=200)).isoformat()
+    config["screening"] = {"universe_last_verified": stale_date, "staleness_warning_days": 180}
+
+    universe_path = tmp_path / "screening_universe.csv"
+    universe_path.write_text("symbol\nAAPL\nMSFT\n", encoding="utf-8")
+
+    assert cli.main(["screen", "--universe-path", str(universe_path)]) == int(ExitCode.SUCCESS)
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err and "screening_universe.csv" in captured.err
 
 
 def test_screen_command_update_failure_raises_operation_failed(

@@ -63,6 +63,14 @@ routine screening never clutters `analysis-list`), and reports any that
 qualify as Candidate/Strong Candidate plus a full report for the rest. Pass
 `--update` to explicitly collect data for the screening universe first.
 
+Because that list is hand-maintained rather than a live feed, `screen` also checks
+`screening.universe_last_verified` in `config/settings.yaml` and prints a stderr
+warning (never a failure) once more than `staleness_warning_days` (default 180) have
+passed since it was last actually reviewed — a way to surface "this list is stale"
+instead of letting it silently drift with no signal at all. Update
+`universe_last_verified` whenever you've reviewed the CSV against current large-cap
+listings.
+
 `scripts/run_daily.ps1` shows the digest as a native Windows toast
 notification (`scripts/send_toast.ps1`, using PowerShell's own registered
 AppUserModelID rather than requiring a module install). This is why the
@@ -706,20 +714,33 @@ No API key or paid account is required. Runtime settings come from YAML; see [Co
 ## Daily automation
 
 `scripts/run_daily.ps1` runs `python main.py run` (collect → validate →
-analyze → report), `python main.py digest`, and `python main.py recommend`,
-in that order, logging combined output to `logs/daily_run_<timestamp>.log`.
-The Windows toast notification combines the digest and recommendation
-summaries into one message, with the recommendation line explicitly marked
-"advisory, unproven model" so it never reads as a stronger signal than it
-is. After the notification, the script opens that day's canonical Phase 2
-HTML report (`stock_summary_<date>_candidates_<hash>.html`, located by its
-documented filename pattern) in the default browser, gated by
+analyze → report), `python main.py digest`, `python main.py recommend`, and
+`python main.py dashboard`, in that order, logging combined output to
+`logs/daily_run_<timestamp>.log`. The Windows toast notification combines the
+digest and recommendation summaries into one message, with the recommendation
+line explicitly marked "advisory, unproven model" so it never reads as a
+stronger signal than it is. After the notification, the script opens the
+dashboard (`reports/dashboard_<date>.html` — falling back to that day's raw
+canonical Phase 2 HTML report if the dashboard step didn't produce a file, so
+this is never a regression) in the default browser, gated by
 `open_reports_automatically` in `config/settings.yaml` (default `true`); if
-no report was produced for today, this is skipped and noted in the log
-rather than treated as a failure. It uses `cmd.exe` for output redirection rather than
+neither exists for today, opening is skipped and noted in the log rather than
+treated as a failure. It uses `cmd.exe` for output redirection rather than
 PowerShell's native `2>&1`/`*>>`, which otherwise wraps every stderr line
 from a Python process (the app logger writes `INFO` to stderr) in a
 spurious `NativeCommandError` and can emit UTF-16 log files.
+
+`dashboard` combines today's digest, `recommend`'s sized suggestions, and real
+portfolio holdings into one local HTML page (`stock_scrapper/reporting/
+dashboard_builder.py`, reusing the same dark/light report theme as the
+canonical Phase 2 report) with a link out to that full report for anyone who
+wants the underlying per-symbol detail. It reads `recommend`'s own saved
+`recommendations_<date>.summary.json` rather than recomputing predict/
+predict-v5 itself — that training is the slow part of the pipeline, and
+re-running it a second time just to build this page would roughly double the
+daily run's cost for no new information. If that file doesn't exist yet (e.g.
+`dashboard` is run standalone before `recommend`), the recommendations section
+shows a note instead of failing.
 
 If `run`, `digest`, or `recommend` exits nonzero, the script shows a distinct
 "Stock Scrapper daily run FAILED" toast (exit codes plus which log file to check)
@@ -821,6 +842,11 @@ python main.py recommend --run-id <analysis-run-id> --no-save
 # Check how a past recommend run's suggestions actually performed
 python main.py recommend-review --recommendation-date 2026-07-27
 python main.py recommend-review --recommendation-date 2026-07-27 --as-of-date 2026-08-17
+
+# Combined local HTML view of today's digest, recommendations, and holdings
+# (reads recommend's saved summary rather than retraining predict/predict-v5)
+python main.py dashboard
+python main.py dashboard --recalculate
 
 # Delete old log files; --include-reports also removes old digest/data-health/screener files
 python main.py cleanup-logs
@@ -1066,6 +1092,8 @@ Phase 2 reports contain run metadata, as-of/data-through dates, score version/ha
 
 Backtest reports contain assumptions, date/warm-up ranges, universe/exclusions, execution and cost rules, metrics and SPY comparison, inline equity/drawdown charts, period returns, complete trades/rejections, symbol/regime performance, and bias warnings. Separate CSVs cover summary, trades, all signals, rejected candidates, orders/fills, equity, monthly returns, and annual returns. Reports are self-contained and use no CDN.
 
+`reports/dashboard_<date>.html` is not persisted anywhere else — it is rebuilt fresh each time `dashboard` runs from whatever `digest`/`recommend` data is currently available (recomputing the digest side directly, reading `recommend`'s saved summary rather than retraining its model), and is cleaned up by `cleanup-logs --include-reports` like the other unreferenced daily report files.
+
 ## Project structure
 
 ```text
@@ -1076,7 +1104,7 @@ stock_scrapper/backtesting/     Configuration, simulation, persistence, metrics,
 stock_scrapper/collectors/      Daily market-data collection; SEC EDGAR fundamentals (manual/periodic)
 stock_scrapper/migrations/      Safe SQLite schema migrations
 stock_scrapper/processing/      Validation, indicators, relative strength, point-in-time fundamentals features
-stock_scrapper/reporting/       Phase 2 offline reporting and the daily digest
+stock_scrapper/reporting/       Phase 2 offline reporting, the daily digest, and the combined dashboard
 stock_scrapper/portfolio.py     Real-holdings aggregation and hold/sell assessment
 stock_scrapper/prediction/      Experimental forward-return prediction (config, dataset, model, service, persistence)
 stock_scrapper/trading/         Advisory trade recommendations, sizing, and hindsight review (config, recommendations, review)
@@ -1098,8 +1126,8 @@ python -m pytest -q
 
 ## Limitations
 
-- **Static watchlist:** the configured universe is not reconstructed historically.
-- **Survivorship bias:** delisted, merged, bankrupt, or otherwise unavailable securities may be absent, which can overstate robustness.
+- **Static watchlist:** the configured candidate universe and `config/screening_universe.csv` are both hand-maintained, not reconstructed historically or kept current by any live feed. `screen` now warns once the screening list hasn't been reviewed in a while (`screening.universe_last_verified`/`staleness_warning_days` in `config/settings.yaml`, default 180 days), so staleness is at least a visible, actionable caveat instead of silent drift — but a genuinely current or historically-accurate universe would need a real index-constituents data source, which conflicts with this project's free/no-API-key design and was deliberately not attempted (a scraped/unofficial source would be fragile and could silently go wrong).
+- **Survivorship bias:** delisted, merged, bankrupt, or otherwise unavailable securities may be absent from both the candidate universe and any historical backtest, which can overstate robustness. This is a structural limitation of building on free daily-bar data, not a fixable code gap: correcting it needs a historical point-in-time constituents dataset (which symbols were actually in the investable universe on each past date, including ones since delisted), and no free, reliable source of that exists.
 - **Free-data limitations:** yfinance data may be delayed, revised, incomplete, rate-limited, or inconsistent across corporate actions.
 - **Daily bars:** OHLC data cannot reveal the exact intraday order of events.
 - **Historical simulation:** fills are modeled from stored bars and configured assumptions, not an exchange order book.
