@@ -343,6 +343,11 @@ _REPORT_STYLES = """\
          to match that old composited appearance, so nothing else needed to
          be re-tuned to compensate. */
       --page:#10130f; --surface:#1c1f1b; --border:rgba(255,255,255,0.14);
+      /* Raised-card background only (.card/.stock) -- a barely-there diagonal
+         gradient for depth, not a visibly "colored" card. Both stops stay close
+         to --surface on purpose; see [data-theme="light"] for why light mode's
+         version is even more restrained. */
+      --card-surface:linear-gradient(160deg, #20241e 0%, #191c16 100%);
       --ink:#e7e5df; --ink-2:#8a8d87; --muted:#8a8d87;
       --line:rgba(255,255,255,0.10); --th-bg:rgba(255,255,255,0.035);
       --page-grid-a:rgba(150,180,200,0.05); --page-grid-b:rgba(150,180,200,0.04);
@@ -377,6 +382,9 @@ _REPORT_STYLES = """\
     [data-theme="light"] {
       color-scheme: light;
       --page:#F7F6F2; --surface:#FFFFFF; --border:rgba(0,0,0,0.10);
+      /* Light surfaces have far less headroom before a gradient reads as a
+         smudge rather than depth -- keep this stop pair tighter than dark mode's. */
+      --card-surface:linear-gradient(160deg, #FFFFFF 0%, #FBFAF7 100%);
       --ink:#1a1c18; --ink-2:#6b6f68; --muted:#6b6f68;
       --line:rgba(0,0,0,0.08); --th-bg:rgba(0,0,0,0.025);
       --page-grid-a:rgba(90,110,130,0.05); --page-grid-b:rgba(90,110,130,0.04);
@@ -479,10 +487,12 @@ _REPORT_STYLES = """\
        elements (.stat, .lists section, details.raw, .notice, the chart)
        deliberately don't get it — they should read as set INTO the page,
        not floating above it. */
-    .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px 18px; margin:14px 0 22px;
+    .card { background:var(--card-surface); border:1px solid var(--border); border-radius:10px; padding:16px 18px; margin:14px 0 22px;
       box-shadow:var(--card-shadow); }
     .card > table { margin:0; }
-    .notice { padding:14px 16px; border:1px solid var(--border); border-left:3px solid var(--muted);
+    /* border-left bumped 3px -> 4px so the neutral/status accent still reads
+       clearly now that nearby .card/.stock surfaces carry a gradient. */
+    .notice { padding:14px 16px; border:1px solid var(--border); border-left:4px solid var(--muted);
       background:var(--surface); color:var(--ink-2); border-radius:8px; margin:18px 0; }
     .notice-good { border-left-color:var(--good-border); }
     .notice-critical { border-left-color:var(--critical-border); }
@@ -568,7 +578,7 @@ _REPORT_STYLES = """\
     .delta-good { color:var(--good-fg); } .delta-critical { color:var(--critical-fg); } .delta-neutral { color:var(--muted); }
     .chip { display:inline-flex; align-items:center; padding:2px 9px; border-radius:999px; font-size:11.5px;
       color:var(--ink-2); background:var(--chip-bg); border:1px solid var(--border); white-space:nowrap; }
-    .stock { border:1px solid var(--border); background:var(--surface); border-radius:10px; padding:20px; margin:20px 0; scroll-margin-top:52px;
+    .stock { border:1px solid var(--border); background:var(--card-surface); border-radius:10px; padding:20px; margin:20px 0; scroll-margin-top:52px;
       box-shadow:var(--card-shadow); }
     .stock-head { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
     .stock-head h3 { margin:0; font-family:var(--mono); }
