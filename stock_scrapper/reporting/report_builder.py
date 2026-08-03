@@ -485,6 +485,14 @@ _REPORT_STYLES = """\
       background:var(--surface); color:var(--ink-2); border-radius:8px; margin:18px 0; }
     .notice-good { border-left-color:var(--good-border); }
     .notice-critical { border-left-color:var(--critical-border); }
+    /* Collapsed-by-default detail inside a .notice — same ▸/▾ marker convention
+       as details.raw, but inline text-sized rather than a boxed panel. */
+    .notice details { margin-top:6px; font-size:12.5px; }
+    .notice details > summary { cursor:pointer; color:var(--muted); list-style:none; user-select:none; }
+    .notice details > summary::-webkit-details-marker { display:none; }
+    .notice details > summary::before { content:"▸ "; }
+    .notice details[open] > summary::before { content:"▾ "; }
+    .notice details p { margin:6px 0 0; }
     .regime-head { display:flex; align-items:center; gap:12px; }
     .regime-confidence { color:var(--ink-2); font-size:13px; font-family:var(--mono); }
     .card ul { list-style:none; margin:6px 0 0; padding:0; }
@@ -532,7 +540,9 @@ _REPORT_STYLES = """\
        without comparing two numbers by eye. */
     .gauge-row { display:inline-flex; align-items:center; gap:8px; }
     .gauge { position:relative; width:56px; height:5px; border-radius:999px; background:var(--track-bg); overflow:hidden; flex:0 0 auto; }
-    .gauge.gauge-lg { width:100%; height:7px; }
+    /* Compact variant for inside a .stat box: full width of the box, slimmer
+       than the old full-size gauge it replaces (see .scores below). */
+    .gauge.gauge-stat { width:100%; height:4px; margin-top:7px; }
     .gauge .gauge-fill { position:absolute; top:0; left:0; bottom:0; border-radius:999px; }
     .gauge-good .gauge-fill { background:var(--good-fg); }
     .gauge-warning .gauge-fill { background:var(--warning-fg); }
@@ -548,6 +558,7 @@ _REPORT_STYLES = """\
       box-shadow:var(--card-shadow); }
     .stock-head { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
     .stock-head h3 { margin:0; font-family:var(--mono); }
+    .stock-rank-line { margin:2px 0 0; font-size:12px; }
     .scores { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:14px 0; }
     .stat { background:var(--inset-surface); border:1px solid var(--border); border-top:2px solid var(--border); border-radius:8px; padding:12px 14px; }
     .stat.stat-good { border-top-color:var(--good-accent-bar); }
@@ -556,10 +567,6 @@ _REPORT_STYLES = """\
     .stat .stat-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
     .stat .stat-value { font-size:1.5rem; font-weight:600; margin-top:3px; }
     .stat .stat-sub { margin-top:5px; }
-    .primary-gauges { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; margin:14px 0 18px; }
-    .primary-gauges .gauge-label { display:flex; justify-content:space-between; font-size:12px; color:var(--muted);
-      text-transform:uppercase; letter-spacing:.05em; margin-bottom:5px; }
-    .primary-gauges .gauge-label .mono { font-size:13px; color:var(--ink); text-transform:none; letter-spacing:normal; }
     .chart-wrap { overflow-x:auto; }
     .price-chart { width:100%; min-width:660px; height:auto; background:var(--inset-surface); }
     .legend { font-size:12px; font-family:var(--mono); } .muted { color:var(--muted); }
@@ -578,9 +585,11 @@ _REPORT_STYLES = """\
     details.raw .raw-body { padding:0 14px 14px; }
     details.raw table { margin:8px 0 14px; }
 
-    /* Footer run-details disclosure: a hairline rule + generous top margin so
-       it reads as trailing metadata, not part of the Research Disclaimer text
-       above it. Chevron rotates via a plain CSS transform on [open] — no JS. */
+    /* Footer run-details disclosure: a hairline rule + generous top margin so it
+       reads as trailing, optional content set apart from the symbol cards above
+       it. Chevron rotates via a plain CSS transform on [open] — no JS. Also
+       houses the Methodology note (see _render_phase2_html), folded in here
+       rather than given its own always-visible section. */
     details.run-footer { margin-top:52px; padding-top:20px; border-top:1px solid var(--line); scroll-margin-top:52px; }
     details.run-footer > summary { cursor:pointer; list-style:none; user-select:none;
       display:inline-flex; align-items:center; gap:6px; color:var(--muted);
@@ -589,6 +598,9 @@ _REPORT_STYLES = """\
     details.run-footer > summary .chevron { display:inline-block; transition:transform .2s ease; }
     details.run-footer[open] > summary .chevron { transform:rotate(180deg); }
     details.run-footer .run-footer-body { margin-top:12px; max-width:480px; }
+    details.run-footer .run-footer-body h5 { margin:0 0 6px; font-size:11px; text-transform:uppercase;
+      letter-spacing:.05em; color:var(--muted); }
+    details.run-footer .run-footer-body p { margin:0 0 12px; font-size:13px; }
     details.run-footer table.metadata { margin:0; }
 
     /* Sticky jump nav — CSS-only "current section" cue via :target on the
@@ -1267,13 +1279,16 @@ def _signal_validation_notice_html(summary: Mapping[str, Any] | None, classifica
         )
     return (
         f'<div class="notice {status}">'
-        f"<strong>Historical signal validation ({_escape(classification)}):</strong> across "
-        f"{bucket.get('sample_size')} classified instance(s) ({bucket.get('distinct_symbols')} distinct symbol(s)) "
-        f"in the full backtested history, mean symbol-weighted forward {_escape(str(horizon))}-session excess "
-        f"return vs {_escape(str(benchmark))} was {symbol_mean:+.2%} ({ci_text})."
+        f"<strong>Historical signal validation ({_escape(classification)}):</strong> mean symbol-weighted "
+        f"forward {_escape(str(horizon))}-session excess return vs {_escape(str(benchmark))} was "
+        f"{symbol_mean:+.2%}."
+        '<details><summary>details</summary><p>'
+        f"Across {bucket.get('sample_size')} classified instance(s) ({bucket.get('distinct_symbols')} distinct "
+        f"symbol(s)) in the full backtested history ({ci_text})."
         f"{concentration_note} This is a descriptive historical pattern across the whole dataset, from "
         f"<span class=\"mono\">{_escape(str(run_id))}</span> — not a live prediction for the symbols ranked "
         "below, and not a recommendation. See README's \"Evaluation honesty\" section."
+        "</p></details>"
         "</div>"
     )
 
@@ -1594,7 +1609,9 @@ def _render_phase2_html(
     risk_validation_html = _signal_validation_notice_html(signal_validation, "High Risk")
     detail_html = "".join(_result_section(entry) for entry in entries)
     changes_html = _changes_table(entries)
-    quality_html = _quality_table(quality_issues)
+    quality_section_html = (
+        f"<h2>Data-Quality Concerns</h2>{_quality_table(quality_issues)}" if quality_issues else ""
+    )
     regime_badge = _badge(metadata.get("market_regime"), _REGIME_STATUS)
 
     return f"""<!DOCTYPE html>
@@ -1630,9 +1647,9 @@ def _render_phase2_html(
   <h2 id="market-regime">Market Regime</h2>
   <div class="card regime"><div class="regime-head">{regime_badge}<span class="regime-confidence">confidence {_score(metadata.get('market_regime_confidence'))}</span></div><h4>Market-regime reasons</h4>{regime_reasons}</div>
   <h2 id="recommendations">Today's Recommendations</h2>
-  <div class="notice"><strong>Advisory only.</strong> Sized suggestions only — nothing here has been bought or
-  sold. Model context (<span class="mono">predict</span> / <span class="mono">predict-v5</span>) is displayed
-  information only, never a gate on any recommendation. See <span class="mono">python main.py recommend</span>.</div>
+  <div class="notice"><strong>Advisory only.</strong> Nothing here has been bought or sold, and model context
+  (<span class="mono">predict</span> / <span class="mono">predict-v5</span>) is informational only — never a
+  gate on any recommendation. <span class="muted mono">python main.py recommend</span></div>
   {recommendations_html}
   <h2 id="candidates">Candidate Ranking</h2>
   {candidate_validation_html}
@@ -1642,18 +1659,17 @@ def _render_phase2_html(
   <div class="card">{risk_html}</div>
   <h2 id="changes">Changes From Previous Stored Analysis</h2>
   <div class="card">{changes_html}</div>
-  <h2>Data-Quality Concerns</h2>
-  {quality_html}
+  {quality_section_html}
   <h2 id="symbols">Symbol Analysis</h2>
   {detail_html or '<p>No symbol results were available.</p>'}
-  <h2>Methodology</h2>
-  <p>This report presents deterministic, explainable Phase 2 classifications using data available through the stated as-of date. Opportunity, measured risk, and confidence are separate 0–100 scales. Missing inputs remain unavailable rather than being silently treated as zero.</p>
-  <p>Charts use adjusted closing prices supplied to the report and trailing, non-centered 20-, 50-, and 200-session simple moving averages. Rows later than the report/as-of date are excluded from charts. Candidate ranking uses higher opportunity, then higher confidence, lower risk, and symbol as a deterministic tie-breaker. Highest-risk ranking is descending by measured risk.</p>
-  <h2>Research Disclaimer</h2>
-  <p>This software is for educational and research use only. It does not provide personalized financial advice or recommend trades. Historical analysis does not guarantee future performance. Free market data may be delayed, revised, incomplete, or affected by survivorship and static-watchlist bias.</p>
   <details class="run-footer" id="run-details">
   <summary><span class="chevron">&#9662;</span> Run details</summary>
-  <div class="run-footer-body"><table class="metadata"><tbody>{footer_html}</tbody></table></div>
+  <div class="run-footer-body">
+  <h5>Methodology</h5>
+  <p>This report presents deterministic, explainable Phase 2 classifications using data available through the stated as-of date. Opportunity, measured risk, and confidence are separate 0–100 scales. Missing inputs remain unavailable rather than being silently treated as zero.</p>
+  <p>Charts use adjusted closing prices supplied to the report and trailing, non-centered 20-, 50-, and 200-session simple moving averages. Rows later than the report/as-of date are excluded from charts. Candidate ranking uses higher opportunity, then higher confidence, lower risk, and symbol as a deterministic tie-breaker. Highest-risk ranking is descending by measured risk.</p>
+  <table class="metadata"><tbody>{footer_html}</tbody></table>
+  </div>
   </details>
   </div>
 </body>
@@ -1750,18 +1766,13 @@ def _result_section(entry: dict[str, Any]) -> str:
     flags_html = "".join(f'<span class="chip">{_escape(flag)}</span>' for flag in _as_list(result.get("flags")))
     return f"""<article class="stock" id="{_symbol_anchor_id(symbol)}">
 <div class="stock-head"><h3>{_escape(symbol)}</h3>{classification_badge}{flags_html}</div>
+<p class="stock-rank-line muted">rank {_display(entry.get('candidate_rank'))} of candidates &middot; risk rank {_display(entry.get('risk_rank'))}</p>
 <p><strong>Primary reason:</strong> {_display(result.get('primary_reason'))}<br />
 <strong>Data through:</strong> {_display(result.get('data_through_date'))} &nbsp; <strong>Trend state:</strong> {_display(result.get('trend_state'))}</p>
 <div class="scores">
-<div class="stat stat-{classification_status}"><div class="stat-label">Opportunity</div><div class="stat-value">{_score(result.get('opportunity_score'))}</div></div>
-<div class="stat stat-{risk_status}"><div class="stat-label">Measured risk</div><div class="stat-value">{_score(result.get('risk_score'))}</div><div class="stat-sub">{risk_level_badge}</div></div>
+<div class="stat stat-{classification_status}"><div class="stat-label">Opportunity</div><div class="stat-value">{_score(result.get('opportunity_score'))}</div>{_gauge_html(result.get('opportunity_score'), classification_status, stat=True)}</div>
+<div class="stat stat-{risk_status}"><div class="stat-label">Measured risk</div><div class="stat-value">{_score(result.get('risk_score'))}</div>{_gauge_html(result.get('risk_score'), risk_status, stat=True)}<div class="stat-sub">{risk_level_badge}</div></div>
 <div class="stat"><div class="stat-label">Confidence</div><div class="stat-value">{_score(result.get('confidence_score'))}</div></div>
-<div class="stat"><div class="stat-label">Candidate rank</div><div class="stat-value">{_display(entry.get('candidate_rank'))}</div></div>
-<div class="stat"><div class="stat-label">Risk rank</div><div class="stat-value">{_display(entry.get('risk_rank'))}</div></div>
-</div>
-<div class="primary-gauges">
-<div><div class="gauge-label"><span>Opportunity</span><span class="mono">{_score(result.get('opportunity_score'))}</span></div>{_gauge_html(result.get('opportunity_score'), classification_status, large=True)}</div>
-<div><div class="gauge-label"><span>Measured risk</span><span class="mono">{_score(result.get('risk_score'))}</span></div>{_gauge_html(result.get('risk_score'), risk_status, large=True)}</div>
 </div>
 <h4>Adjusted Price and Moving Averages</h4>{chart}
 <div class="lists">{list_html}</div>
@@ -2275,13 +2286,17 @@ def _badge(value: Any, status_map: Mapping[str, str]) -> str:
     return f'<span class="badge badge-{status}">{_escape(label)}</span>'
 
 
-def _gauge_html(value: Any, status: str, large: bool = False) -> str:
-    """A thin 0-100 bar so relative strength reads without comparing two numbers by eye."""
+def _gauge_html(value: Any, status: str, stat: bool = False) -> str:
+    """A thin 0-100 bar so relative strength reads without comparing two numbers by eye.
+
+    ``stat=True`` renders the full-width compact variant meant to sit inside a
+    ``.stat`` box, directly under the number it illustrates.
+    """
     number = _finite_number(value)
     if number is None:
         return ""
     pct = max(0.0, min(100.0, number))
-    classes = f"gauge gauge-{status}" + (" gauge-lg" if large else "")
+    classes = f"gauge gauge-{status}" + (" gauge-stat" if stat else "")
     return f'<span class="{classes}"><span class="gauge-fill" style="width:{pct:.1f}%"></span></span>'
 
 
