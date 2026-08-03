@@ -109,7 +109,6 @@ def build_recommendations(
 
     open_position_count = len(positions)
     cash_reserve = float(rules["cash_reserve"])
-    max_position_dollars = account_value * float(rules["max_position_weight"])
     max_trade_dollar_amount = float(rules["max_trade_dollar_amount"])
     min_trade_dollar_amount = float(rules["min_trade_dollar_amount"])
     max_open_positions = int(rules["max_open_positions"])
@@ -119,7 +118,21 @@ def build_recommendations(
         if rules["require_strong_candidate_for_buy"]
         else _BUY_ELIGIBLE_CLASSIFICATIONS_RELAXED
     )
-    spendable = max(0.0, available_cash - account_value * cash_reserve)
+    # Position-weight and cash-reserve are both *soft* caps: they reduce what's
+    # spendable, but neither can push the affordable size below min_trade_dollar_amount
+    # for the first trade a run considers, provided available_cash covers at least
+    # one min-size trade. Without this, a $100 account (account-set's own floor)
+    # could never buy anything under the shipped defaults: 15% of $100 is $15, and a
+    # 5% cash reserve already drops $100 of cash to $95 -- both under a $100 minimum
+    # trade. The same floor applies uniformly regardless of account size (e.g. an
+    # aggressive cash_reserve on a large account can hit the same wall) -- once that
+    # first trade is taken, spendable is genuine and later candidates are sized (or
+    # skipped) against the real remaining cash, with no further floor applied. These
+    # floors are no-ops for any account comfortably above $667 (position weight) or
+    # $105 (cash reserve) at the shipped defaults, where the normal caps already clear
+    # min_trade_dollar_amount on their own.
+    max_position_dollars = max(account_value * float(rules["max_position_weight"]), min_trade_dollar_amount)
+    spendable = max(available_cash - account_value * cash_reserve, min(available_cash, min_trade_dollar_amount))
 
     candidates = sorted(
         (

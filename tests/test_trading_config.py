@@ -45,6 +45,22 @@ def test_validate_trading_rules_accepts_zero_available_cash() -> None:
     assert validated["available_cash"] == 0.0
 
 
+def test_validate_trading_rules_rejects_account_value_below_the_minimum() -> None:
+    with pytest.raises(ValueError, match=r"account_value must be at least \$100.00"):
+        validate_trading_rules(_rules(account_value=50.0, available_cash=50.0))
+
+
+def test_validate_trading_rules_rejects_nonzero_available_cash_below_the_minimum() -> None:
+    with pytest.raises(ValueError, match=r"available_cash must be \$0 or at least \$100.00"):
+        validate_trading_rules(_rules(available_cash=50.0))
+
+
+def test_validate_trading_rules_accepts_account_value_at_the_minimum() -> None:
+    validated = validate_trading_rules(_rules(account_value=100.0, available_cash=100.0))
+    assert validated["account_value"] == 100.0
+    assert validated["available_cash"] == 100.0
+
+
 def test_validate_trading_rules_rejects_auto_execute_true() -> None:
     with pytest.raises(ValueError, match="not supported yet"):
         validate_trading_rules(_rules(auto_execute=True))

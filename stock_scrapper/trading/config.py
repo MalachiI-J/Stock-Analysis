@@ -4,6 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
+# Floor for account_value/available_cash (main.py account-set, and here as the
+# backstop). Coupled to min_trade_dollar_amount's default only by coincidence --
+# raising min_trade_dollar_amount later doesn't move this floor, but a $100
+# account is the smallest this tool is designed to size a $100 minimum trade
+# against at all (see build_recommendations()'s reserve/position-cap overrides).
+MIN_ACCOUNT_DOLLARS = 100.0
+
 
 def validate_trading_rules(rules: dict[str, Any]) -> dict[str, Any]:
     """Validate the trade-recommendation sizing/restriction configuration."""
@@ -36,6 +43,13 @@ def validate_trading_rules(rules: dict[str, Any]) -> dict[str, Any]:
 
     account_value = _nonnegative_number("account_value")
     available_cash = _nonnegative_number("available_cash")
+    if account_value < MIN_ACCOUNT_DOLLARS:
+        raise ValueError(f"account_value must be at least ${MIN_ACCOUNT_DOLLARS:,.2f}")
+    # $0 stays legal (no cash to invest right now, e.g. fully deployed elsewhere) --
+    # it's specifically a *nonzero but unusably small* amount that's rejected, since
+    # nothing below the floor could ever clear min_trade_dollar_amount anyway.
+    if 0.0 < available_cash < MIN_ACCOUNT_DOLLARS:
+        raise ValueError(f"available_cash must be $0 or at least ${MIN_ACCOUNT_DOLLARS:,.2f}")
     if available_cash > account_value:
         raise ValueError("available_cash must not exceed account_value")
     max_position_weight = _fraction("max_position_weight")

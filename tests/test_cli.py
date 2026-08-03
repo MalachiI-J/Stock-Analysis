@@ -1360,6 +1360,48 @@ def test_account_set_command_rejects_available_cash_exceeding_account_value() ->
     assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)
 
 
+def test_account_set_command_rejects_account_value_below_the_minimum() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["account-set", "--account-value", "50", "--available-cash", "50"])
+    assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)
+
+
+def test_account_set_command_rejects_nonzero_available_cash_below_the_minimum() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["account-set", "--account-value", "1000", "--available-cash", "50"])
+    assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)
+
+
+def test_account_set_command_accepts_zero_available_cash(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_args: dict[str, Any] = {}
+
+    def _fake_account_set(path: Path, account_value: float, available_cash: float) -> None:
+        captured_args.update(account_value=account_value, available_cash=available_cash)
+
+    monkeypatch.setattr(cli, "_account_set", _fake_account_set)
+
+    assert cli.main(
+        ["account-set", "--account-value", "1000", "--available-cash", "0"]
+    ) == int(ExitCode.SUCCESS)
+    assert captured_args == {"account_value": 1000.0, "available_cash": 0.0}
+
+
+def test_account_set_command_accepts_the_minimum_account_value_and_cash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_args: dict[str, Any] = {}
+
+    def _fake_account_set(path: Path, account_value: float, available_cash: float) -> None:
+        captured_args.update(account_value=account_value, available_cash=available_cash)
+
+    monkeypatch.setattr(cli, "_account_set", _fake_account_set)
+
+    assert cli.main(
+        ["account-set", "--account-value", "100", "--available-cash", "100"]
+    ) == int(ExitCode.SUCCESS)
+    assert captured_args == {"account_value": 100.0, "available_cash": 100.0}
+
+
 def test_account_set_command_calls_account_set_and_prints_confirmation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
