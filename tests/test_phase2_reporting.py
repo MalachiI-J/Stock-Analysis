@@ -4,6 +4,7 @@ import csv
 import json
 from datetime import date, timedelta
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 
@@ -232,6 +233,21 @@ def test_phase2_report_contains_complete_offline_research_content(tmp_path: Path
     assert "Reviewed &lt;adjusted close&gt;" in content
     assert "Future issue must not leak" not in content
     assert "9999" not in content
+
+
+def test_phase2_report_includes_inline_svg_favicon(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    head = content.split("</head>")[0]
+    assert '<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,' in head
+    href = head.split('href="')[1].split('"')[0]
+    decoded = unquote(href)
+    assert decoded.startswith("data:image/svg+xml,<svg ")
+    assert "#5CF08A" in decoded
+    assert "<rect" in decoded and "<polyline" in decoded
 
 
 def _signal_validation_payload(**bucket_overrides: dict[str, object]) -> dict[str, object]:

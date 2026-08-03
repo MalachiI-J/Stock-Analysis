@@ -12,6 +12,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
 PHASE2_CSV_FIELDS: tuple[str, ...] = (
@@ -1222,6 +1223,23 @@ _THEME_SCRIPT = """\
   </script>
 """
 
+# A trend-line mark on a dark backdrop, in the same bull-phase green used by the
+# hero and `good`-status accents elsewhere. Inlined as a data URI so the report
+# stays a single self-contained file -- no sidecar .ico/.png to ship alongside it.
+# The dark backdrop is fixed (not theme-reactive): a <link rel="icon"> loads once
+# and doesn't re-run on the in-page theme toggle, so it should look right against
+# either a light or dark browser tab bar regardless of which report theme is active.
+_FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<rect width="24" height="24" rx="6" fill="#10130f"/>'
+    '<polyline points="4,18 10,11 13,14 21,4" fill="none" stroke="#5CF08A" '
+    'stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>'
+    '<polyline points="15,4 21,4 21,9" fill="none" stroke="#5CF08A" '
+    'stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>'
+    "</svg>"
+)
+_FAVICON_DATA_URI = "data:image/svg+xml," + quote(_FAVICON_SVG)
+
 
 def _latest_signal_validation_summary(reports_dir: Path) -> dict[str, Any] | None:
     """Best-effort load of the most recent ``signal_validation_*.json`` artifact
@@ -1634,6 +1652,7 @@ def _render_phase2_html(
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Stock Analyzer — {_escape(report_date)}</title>
+  <link rel="icon" type="image/svg+xml" href="{_FAVICON_DATA_URI}" />
   <style>
 {_REPORT_STYLES}
   </style>
