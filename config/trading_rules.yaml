@@ -1,5 +1,10 @@
 trading_rules_version: "trade-v1"
-starting_capital: 10000.0
+# Two independent numbers you set directly (see `main.py account-set`) -- not
+# derived from portfolio_lots/portfolio_sales. recommend sizes every suggestion
+# against these, regardless of what positions (if any) you've separately recorded
+# via portfolio-buy/portfolio-sell.
+account_value: 10000.0
+available_cash: 10000.0
 max_position_weight: 0.15
 cash_reserve: 0.05
 max_open_positions: 10

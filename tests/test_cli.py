@@ -12,7 +12,7 @@ from typing import Any, Iterator
 import pytest
 
 import main as cli
-from stock_scrapper.exceptions import ExitCode, MissingDataError
+from stock_scrapper.exceptions import ExitCode, InvalidConfigurationError, MissingDataError
 from stock_scrapper.backtesting.walk_forward import InsufficientWalkForwardDataError
 from stock_scrapper.models.analysis_models import AnalysisResult
 
@@ -698,6 +698,39 @@ def test_dashboard_command_reads_existing_recommend_summary_without_recomputing(
     assert "LOW CONFIDENCE" in html
 
 
+def test_dashboard_command_includes_resize_widget_when_summary_has_sizing_rules(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    _install_digest_saved_run(monkeypatch)
+
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    summary_payload = {
+        "as_of_date": "2024-12-31", "account_value": 10000.0, "available_cash": 8500.0,
+        "open_position_count": 1,
+        "cash_reserve": 0.05, "max_position_weight": 0.15,
+        "max_trade_dollar_amount": 2000.0, "min_trade_dollar_amount": 100.0,
+        "recommendations": [
+            {
+                "symbol": "NVDA", "action": "BUY", "shares": 10.0, "estimated_dollars": 500.0,
+                "reason": "Strong trend",
+            }
+        ],
+        "skipped": [],
+    }
+    (reports_dir / "recommendations_2024-12-31.summary.json").write_text(
+        json.dumps(summary_payload), encoding="utf-8"
+    )
+
+    assert cli.main(["dashboard", "--run-id", "saved-run"]) == int(ExitCode.SUCCESS)
+
+    html = (reports_dir / "dashboard_2024-12-31.html").read_text(encoding="utf-8")
+    assert 'id="rec-adjust-toggle"' in html
+    assert 'data-price="50.000000"' in html
+
+
 def test_dashboard_command_links_to_existing_phase2_report(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1016,7 +1049,8 @@ def _install_recommend_saved_run(monkeypatch: pytest.MonkeyPatch) -> dict[str, A
 def _install_recommend_trading_rules(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> dict[str, Any]:
     rules = {
         "trading_rules_version": "test",
-        "starting_capital": 1000.0,
+        "account_value": 1000.0,
+        "available_cash": 1000.0,
         "max_position_weight": 0.5,
         "cash_reserve": 0.0,
         "max_open_positions": 10,
@@ -1069,6 +1103,11 @@ def test_recommend_command_writes_sized_buy_recommendation(
             "predict_v5_excess_return": None, "predict_v5_low_confidence": False,
         }
     ]
+    # Sizing-rule constants a report needs for its client-side "what if" resize widget.
+    assert summary["cash_reserve"] == 0.0
+    assert summary["max_position_weight"] == 0.5
+    assert summary["max_trade_dollar_amount"] == 1000.0
+    assert summary["min_trade_dollar_amount"] == 10.0
 
 
 def test_recommend_command_attaches_predict_v5_context_to_buy_recommendations(
@@ -1222,6 +1261,128 @@ def test_recommend_review_reports_missing_data_when_no_file_exists(
     assert cli.main(
         ["recommend-review", "--recommendation-date", "2024-12-31"]
     ) == int(ExitCode.MISSING_DATA)
+
+
+def test_update_trading_rules_file_patches_matching_lines_preserving_comments(tmp_path: Path) -> None:
+    path = tmp_path / "trading_rules.yaml"
+    path.write_text(
+        "trading_rules_version: \"trade-v1\"\n"
+        "account_value: 10000.0\n"
+        "available_cash: 10000.0\n"
+        "max_position_weight: 0.15\n"
+        "# Placeholder comment that must survive.\n"
+        "auto_execute: false\n",
+        encoding="utf-8",
+    )
+
+    cli._update_trading_rules_file(path, {"account_value": 5000.0, "available_cash": 2000.0})
+
+    text = path.read_text(encoding="utf-8")
+    assert "account_value: 5000.0" in text
+    assert "available_cash: 2000.0" in text
+    assert "# Placeholder comment that must survive." in text
+    assert "max_position_weight: 0.15" in text
+    assert "auto_execute: false" in text
+
+
+def test_update_trading_rules_file_appends_keys_that_do_not_exist_yet(tmp_path: Path) -> None:
+    path = tmp_path / "trading_rules.yaml"
+    path.write_text("trading_rules_version: \"trade-v1\"\n", encoding="utf-8")
+
+    cli._update_trading_rules_file(path, {"account_value": 5000.0})
+
+    assert "account_value: 5000.0" in path.read_text(encoding="utf-8")
+
+
+def test_account_set_writes_valid_values_and_keeps_other_fields(tmp_path: Path) -> None:
+    path = tmp_path / "trading_rules.yaml"
+    path.write_text(
+        "trading_rules_version: \"trade-v1\"\n"
+        "account_value: 10000.0\n"
+        "available_cash: 10000.0\n"
+        "max_position_weight: 0.15\n"
+        "cash_reserve: 0.05\n"
+        "max_open_positions: 10\n"
+        "max_trade_dollar_amount: 2000.0\n"
+        "min_trade_dollar_amount: 100.0\n"
+        "max_new_buys_per_run: 3\n"
+        "require_strong_candidate_for_buy: true\n"
+        "auto_execute: false\n",
+        encoding="utf-8",
+    )
+
+    cli._account_set(path, 20000.0, 5000.0)
+
+    text = path.read_text(encoding="utf-8")
+    assert "account_value: 20000.0" in text
+    assert "available_cash: 5000.0" in text
+    assert "max_position_weight: 0.15" in text  # untouched
+
+
+def test_account_set_rejects_available_cash_exceeding_account_value(tmp_path: Path) -> None:
+    path = tmp_path / "trading_rules.yaml"
+    path.write_text(
+        "trading_rules_version: \"trade-v1\"\n"
+        "account_value: 10000.0\n"
+        "available_cash: 10000.0\n"
+        "max_position_weight: 0.15\n"
+        "cash_reserve: 0.05\n"
+        "max_open_positions: 10\n"
+        "max_trade_dollar_amount: 2000.0\n"
+        "min_trade_dollar_amount: 100.0\n"
+        "max_new_buys_per_run: 3\n"
+        "require_strong_candidate_for_buy: true\n"
+        "auto_execute: false\n",
+        encoding="utf-8",
+    )
+    original = path.read_text(encoding="utf-8")
+
+    with pytest.raises(InvalidConfigurationError, match="must not exceed account_value"):
+        cli._account_set(path, 1000.0, 5000.0)
+
+    assert path.read_text(encoding="utf-8") == original  # rejected before any write
+
+
+def test_account_set_raises_when_trading_rules_file_is_missing(tmp_path: Path) -> None:
+    with pytest.raises(InvalidConfigurationError, match="missing"):
+        cli._account_set(tmp_path / "does-not-exist.yaml", 10000.0, 5000.0)
+
+
+def test_account_set_command_rejects_negative_account_value() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["account-set", "--account-value", "-1", "--available-cash", "0"])
+    assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)
+
+
+def test_account_set_command_rejects_available_cash_exceeding_account_value() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["account-set", "--account-value", "1000", "--available-cash", "2000"])
+    assert exc_info.value.code == int(ExitCode.INVALID_ARGUMENTS)
+
+
+def test_account_set_command_calls_account_set_and_prints_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_startup(monkeypatch, tmp_path)
+    captured_args: dict[str, Any] = {}
+
+    def _fake_account_set(path: Path, account_value: float, available_cash: float) -> None:
+        captured_args.update(path=path, account_value=account_value, available_cash=available_cash)
+
+    monkeypatch.setattr(cli, "_account_set", _fake_account_set)
+
+    assert cli.main(
+        ["account-set", "--account-value", "20000", "--available-cash", "5000"]
+    ) == int(ExitCode.SUCCESS)
+
+    assert captured_args["account_value"] == 20000.0
+    assert captured_args["available_cash"] == 5000.0
+    assert captured_args["path"].name == "trading_rules.yaml"
+    captured = capsys.readouterr()
+    assert "account_value=$20,000.00" in captured.out
+    assert "available_cash=$5,000.00" in captured.out
 
 
 def test_new_screening_symbols_excludes_tracked_and_dedupes() -> None:

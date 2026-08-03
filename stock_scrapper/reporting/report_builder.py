@@ -499,6 +499,28 @@ _REPORT_STYLES = """\
     .rec-symbol { font-size:15px; font-weight:600; }
     .rec-reason { color:var(--muted); margin-top:4px; }
     .rec-context { font-size:12.5px; margin-top:6px; }
+    /* Client-side "what if" resize of the already-chosen BUY list only — never a
+       server round-trip, never re-runs candidate selection, never saves anything.
+       See _account_adjust_widget_html() in report_builder.py. */
+    .rec-adjust { margin:10px 0 4px; }
+    .rec-adjust-toggle, .rec-adjust-btn {
+      font-family:var(--sans); font-size:13px; font-weight:600; cursor:pointer;
+      border:1px solid var(--border); border-radius:8px; padding:7px 14px;
+      background:var(--surface); color:var(--ink); transition:background 0.15s ease;
+    }
+    .rec-adjust-toggle:hover, .rec-adjust-btn:hover { background:var(--hover-bg); }
+    .rec-adjust-btn-secondary { color:var(--ink-2); }
+    .rec-adjust-panel { margin-top:10px; padding:14px 16px; border:1px solid var(--border);
+      border-radius:10px; background:var(--inset-surface); display:flex; flex-wrap:wrap;
+      gap:16px; align-items:flex-end; }
+    .rec-adjust-field { display:flex; flex-direction:column; gap:5px; }
+    .rec-adjust-field label { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+    .rec-adjust-field input { font-family:var(--mono); font-size:14px; background:var(--surface);
+      border:1px solid var(--border); border-radius:6px; padding:7px 10px; color:var(--ink); width:150px; }
+    .rec-adjust-field input:focus-visible { outline:2px solid var(--good-fg); outline-offset:1px; }
+    .rec-adjust-actions { display:flex; gap:8px; }
+    .rec-adjust-note { margin-top:8px; font-size:12.5px; }
+    .rec-item-excluded { opacity:0.5; border-style:dashed; }
     .badge { display:inline-flex; align-items:center; gap:5px; padding:3px 11px; border-radius:999px;
       font-size:13px; font-weight:600; border:1px solid transparent; white-space:nowrap; }
     .badge-good { color:var(--good-fg); background:var(--good-bg); border-color:var(--good-border); }
@@ -1273,6 +1295,167 @@ def _latest_recommendations_summary(reports_dir: Path, report_date: str) -> dict
         return None
 
 
+def _account_adjust_widget_html(
+    *,
+    account_value: float,
+    available_cash: float,
+    open_position_count: Any,
+    cash_reserve: float | None,
+    max_position_weight: float | None,
+    max_trade_dollar_amount: float | None,
+    min_trade_dollar_amount: float | None,
+    has_buys: bool,
+) -> str:
+    """The account-value/cash subtitle line, plus (when the sizing-rule constants are
+    available and there is at least one BUY to resize) a button opening a small panel
+    that recalculates each already-chosen BUY's shares/dollars entirely client-side.
+
+    This is a preview only: it never re-runs candidate selection (that needs the full
+    scoring/eligibility pipeline this static file doesn't have), and it never persists
+    anything — closing the page forgets the edit. Making that change for real requires
+    ``main.py account-set``, which is what the note under the panel points to. The rule
+    constants are ``None`` for older ``recommendations_<date>.summary.json`` files that
+    predate this feature; the widget silently degrades to a plain, non-interactive
+    subtitle in that case rather than guessing.
+    """
+    # A real "·" character throughout (never an &middot;/&nbsp; entity): this same
+    # string is later restored verbatim via JS textContent (see data-original below),
+    # which does not decode HTML entities — using one plain-text representation
+    # everywhere avoids that mismatch entirely rather than requiring two variants.
+    open_positions_text = "Unavailable" if open_position_count is None else str(open_position_count)
+    summary_line = (
+        f"Account value ${account_value:,.2f}  ·  "
+        f"Available cash ${available_cash:,.2f}  ·  "
+        f"Open positions {open_positions_text}"
+    )
+    can_resize = (
+        has_buys
+        and cash_reserve is not None
+        and max_position_weight is not None
+        and max_trade_dollar_amount is not None
+        and min_trade_dollar_amount is not None
+    )
+    if not can_resize:
+        return f'<p class="subtitle">{_escape(summary_line)}</p>'
+
+    subtitle = (
+        f'<p class="subtitle" id="rec-summary-line" data-original="{_escape(summary_line)}" '
+        f'data-open-positions="{_escape(open_positions_text)}">{_escape(summary_line)}</p>'
+    )
+    widget = f"""\
+  <div class="rec-adjust">
+    <button type="button" class="rec-adjust-toggle" id="rec-adjust-toggle" aria-expanded="false" aria-controls="rec-adjust-panel">Adjust account value / cash</button>
+    <div class="rec-adjust-panel" id="rec-adjust-panel" hidden>
+      <div class="rec-adjust-field">
+        <label for="rec-account-value">Account value</label>
+        <input type="number" id="rec-account-value" value="{account_value:.2f}" step="0.01" min="0" />
+      </div>
+      <div class="rec-adjust-field">
+        <label for="rec-available-cash">Available cash</label>
+        <input type="number" id="rec-available-cash" value="{available_cash:.2f}" step="0.01" min="0" />
+      </div>
+      <div class="rec-adjust-actions">
+        <button type="button" class="rec-adjust-btn" id="rec-adjust-apply">Apply</button>
+        <button type="button" class="rec-adjust-btn rec-adjust-btn-secondary" id="rec-adjust-reset">Reset</button>
+      </div>
+    </div>
+    <p class="muted rec-adjust-note" id="rec-adjust-note" hidden>Resized preview only — recalculates today's
+    already-chosen candidates, does not change which symbols are recommended, and nothing here is saved.
+    Run <span class="mono">python main.py account-set --account-value &lt;amount&gt; --available-cash
+    &lt;amount&gt;</span> to persist a change for real.</p>
+  </div>
+  <script>
+  (function () {{
+    var accountValueInput = document.getElementById("rec-account-value");
+    var availableCashInput = document.getElementById("rec-available-cash");
+    var toggle = document.getElementById("rec-adjust-toggle");
+    var panel = document.getElementById("rec-adjust-panel");
+    var note = document.getElementById("rec-adjust-note");
+    var applyBtn = document.getElementById("rec-adjust-apply");
+    var resetBtn = document.getElementById("rec-adjust-reset");
+    var summaryLine = document.getElementById("rec-summary-line");
+    if (!toggle || !panel || !accountValueInput || !availableCashInput || !applyBtn || !resetBtn) return;
+
+    var rules = {{
+      cashReserve: {cash_reserve!r},
+      maxPositionWeight: {max_position_weight!r},
+      maxTradeDollarAmount: {max_trade_dollar_amount!r},
+      minTradeDollarAmount: {min_trade_dollar_amount!r}
+    }};
+
+    function money(value) {{
+      return "$" + value.toLocaleString("en-US", {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+    }}
+
+    function applyResize() {{
+      var accountValue = parseFloat(accountValueInput.value);
+      var availableCash = parseFloat(availableCashInput.value);
+      if (!isFinite(accountValue) || accountValue < 0 || !isFinite(availableCash) || availableCash < 0) return;
+      var maxPositionDollars = accountValue * rules.maxPositionWeight;
+      var spendable = Math.max(0, availableCash - accountValue * rules.cashReserve);
+      var exhausted = false;
+      var items = document.querySelectorAll("[data-price]");
+      items.forEach(function (item) {{
+        var valueSpan = item.querySelector(".rec-sizing-value");
+        if (!valueSpan) return;
+        var price = parseFloat(item.getAttribute("data-price"));
+        item.classList.remove("rec-item-excluded");
+        if (exhausted) {{
+          item.classList.add("rec-item-excluded");
+          valueSpan.textContent = "Not sized — no cash left at this level";
+          return;
+        }}
+        var targetDollars = Math.min(rules.maxTradeDollarAmount, maxPositionDollars, spendable);
+        if (targetDollars < rules.minTradeDollarAmount) {{
+          item.classList.add("rec-item-excluded");
+          valueSpan.textContent = "Not sized — below the " + money(rules.minTradeDollarAmount) + " minimum trade";
+          if (spendable < rules.minTradeDollarAmount) exhausted = true;
+          return;
+        }}
+        var shares = Math.floor(targetDollars / price);
+        if (shares < 1) {{
+          item.classList.add("rec-item-excluded");
+          valueSpan.textContent = "Not sized — price too high for the affordable size";
+          return;
+        }}
+        var estimatedDollars = shares * price;
+        valueSpan.textContent = shares + " sh \\u00B7 " + money(estimatedDollars);
+        spendable -= estimatedDollars;
+      }});
+      if (summaryLine) {{
+        summaryLine.textContent = "Account value " + money(accountValue) + "  \\u00B7  Available cash " +
+          money(availableCash) + "  \\u00B7  Open positions " + summaryLine.getAttribute("data-open-positions");
+      }}
+      note.hidden = false;
+    }}
+
+    function reset() {{
+      accountValueInput.value = {account_value!r};
+      availableCashInput.value = {available_cash!r};
+      document.querySelectorAll("[data-price]").forEach(function (item) {{
+        item.classList.remove("rec-item-excluded");
+        var valueSpan = item.querySelector(".rec-sizing-value");
+        if (valueSpan) {{
+          var original = valueSpan.getAttribute("data-original");
+          if (original !== null) valueSpan.textContent = original;
+        }}
+      }});
+      if (summaryLine) summaryLine.textContent = summaryLine.getAttribute("data-original");
+      note.hidden = true;
+    }}
+
+    toggle.addEventListener("click", function () {{
+      var expanded = toggle.getAttribute("aria-expanded") === "true";
+      toggle.setAttribute("aria-expanded", String(!expanded));
+      panel.hidden = expanded;
+    }});
+    applyBtn.addEventListener("click", applyResize);
+    resetBtn.addEventListener("click", reset);
+  }})();
+  </script>"""
+    return subtitle + widget
+
+
 def _recommendations_section_html(summary: Mapping[str, Any] | None) -> str:
     """Today's sized BUY/SELL suggestions from the latest ``recommend`` run, if one is
     on file for this report date. Advisory only — nothing here has been bought or
@@ -1285,7 +1468,7 @@ def _recommendations_section_html(summary: Mapping[str, Any] | None) -> str:
             'run <span class="mono">python main.py recommend</span> first.</p>'
         )
 
-    def rows(items: list[Mapping[str, Any]]) -> str:
+    def rows(items: list[Mapping[str, Any]], *, resizable: bool = False) -> str:
         if not items:
             return "<p>None today.</p>"
         cards = []
@@ -1313,11 +1496,19 @@ def _recommendations_section_html(summary: Mapping[str, Any] | None) -> str:
                 f'<div class="rec-context mono delta-{context_status}">{" &middot; ".join(context)}</div>'
                 if context else ""
             )
+            # A real "·" (not &middot;) and a data-original attribute: the client-side
+            # resize widget restores this exact text via JS textContent on Reset, which
+            # does not decode HTML entities, so the displayed and restorable forms must
+            # already be identical plain text.
+            sizing_text = f"{shares_text} sh · {dollars_text}"
+            price_attr = ""
+            if resizable and shares is not None and dollars is not None and shares > 0:
+                price_attr = f' data-price="{dollars / shares:.6f}"'
             cards.append(
-                '<div class="rec-card">'
+                f'<div class="rec-card"{price_attr}>'
                 '<div class="rec-card-head">'
                 f'<span class="mono rec-symbol">{_display(item.get("symbol"))}</span>'
-                f'<span class="mono">{shares_text} sh &middot; {dollars_text}</span>'
+                f'<span class="mono rec-sizing-value" data-original="{_escape(sizing_text)}">{_escape(sizing_text)}</span>'
                 "</div>"
                 f'<div class="rec-reason">{_display(item.get("reason"))}</div>'
                 f"{context_html}"
@@ -1338,14 +1529,21 @@ def _recommendations_section_html(summary: Mapping[str, Any] | None) -> str:
     account_value = _finite_number(summary.get("account_value"))
     available_cash = _finite_number(summary.get("available_cash"))
     subtitle = (
-        f'<p class="subtitle">Account value ${account_value:,.2f} &nbsp;&middot;&nbsp; '
-        f"Available cash ${available_cash:,.2f} &nbsp;&middot;&nbsp; "
-        f"Open positions {_display(summary.get('open_position_count'))}</p>"
+        _account_adjust_widget_html(
+            account_value=account_value,
+            available_cash=available_cash,
+            open_position_count=summary.get("open_position_count"),
+            cash_reserve=_finite_number(summary.get("cash_reserve")),
+            max_position_weight=_finite_number(summary.get("max_position_weight")),
+            max_trade_dollar_amount=_finite_number(summary.get("max_trade_dollar_amount")),
+            min_trade_dollar_amount=_finite_number(summary.get("min_trade_dollar_amount")),
+            has_buys=bool(buys),
+        )
         if account_value is not None and available_cash is not None else ""
     )
     return (
         subtitle
-        + f'<h3>Buy — {len(buys)}</h3><div class="card">{rows(buys)}</div>'
+        + f'<h3>Buy — {len(buys)}</h3><div class="card">{rows(buys, resizable=True)}</div>'
         + f'<h3>Sell — {len(sells)}</h3><div class="card">{rows(sells)}</div>'
         + skipped_html
     )

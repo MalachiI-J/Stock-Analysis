@@ -25,6 +25,7 @@ from stock_scrapper.reporting.report_builder import (
     _REGIME_STATUS,
     _REPORT_STYLES,
     _THEME_SCRIPT,
+    _account_adjust_widget_html,
     _badge,
     _market_hero_html,
     _score,
@@ -44,7 +45,7 @@ def _pct(value: float | None) -> str:
     return '<span class="muted">Unavailable</span>' if value is None else f"{value:+.1%}"
 
 
-def _recommend_rows(recs: Sequence[TradeRecommendation]) -> str:
+def _recommend_rows(recs: Sequence[TradeRecommendation], *, resizable: bool = False) -> str:
     if not recs:
         return "<p>None today.</p>"
     rows = []
@@ -56,17 +57,21 @@ def _recommend_rows(recs: Sequence[TradeRecommendation]) -> str:
             flag = ' <span class="badge badge-warning">LOW CONFIDENCE</span>' if rec.predict_v5_low_confidence else ""
             context.append(f"predict-v5 {rec.predict_v5_excess_return:+.1%}{flag}")
         context_html = " &middot; ".join(context)
+        # A real "·" (not &middot;) and a data-original attribute: the client-side
+        # resize widget restores this exact text via JS textContent on Reset, which
+        # does not decode HTML entities, so displayed and restorable text must match.
+        sizing_text = f"{rec.shares:g} sh · {_money(rec.estimated_dollars)}"
+        price_attr = f' data-price="{rec.estimated_dollars / rec.shares:.6f}"' if resizable and rec.shares > 0 else ""
         rows.append(
-            "<tr>"
+            f"<tr{price_attr}>"
             f'<td class="mono">{_escape(rec.symbol)}</td>'
-            f'<td class="num">{rec.shares:g}</td>'
-            f'<td class="num">{_money(rec.estimated_dollars)}</td>'
+            f'<td class="num rec-sizing-value" data-original="{_escape(sizing_text)}">{_escape(sizing_text)}</td>'
             f"<td>{_escape(rec.reason)}</td>"
             f"<td>{context_html}</td>"
             "</tr>"
         )
     return (
-        '<table><thead><tr><th>Symbol</th><th class="num">Shares</th><th class="num">Est. $</th>'
+        '<table><thead><tr><th>Symbol</th><th class="num">Shares / Est. $</th>'
         "<th>Reason</th><th>Model context</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
     )
 
@@ -160,13 +165,21 @@ def render_dashboard_html(
             + "</ul>"
             if recommend.skipped else ""
         )
+        subtitle = _account_adjust_widget_html(
+            account_value=recommend.account_value,
+            available_cash=recommend.available_cash,
+            open_position_count=recommend.open_position_count,
+            cash_reserve=recommend.cash_reserve,
+            max_position_weight=recommend.max_position_weight,
+            max_trade_dollar_amount=recommend.max_trade_dollar_amount,
+            min_trade_dollar_amount=recommend.min_trade_dollar_amount,
+            has_buys=bool(buys),
+        )
         recommend_section = (
-            f'<p class="subtitle">Account value {_money(recommend.account_value)} &nbsp;&middot;&nbsp; '
-            f"Available cash {_money(recommend.available_cash)} &nbsp;&middot;&nbsp; "
-            f"Open positions {recommend.open_position_count}</p>"
-            f"<h3>Buy — {len(buys)}</h3><div class=\"card\">{_recommend_rows(buys)}</div>"
-            f"<h3>Sell — {len(sells)}</h3><div class=\"card\">{_recommend_rows(sells)}</div>"
-            f"{skipped_html}"
+            subtitle
+            + f"<h3>Buy — {len(buys)}</h3><div class=\"card\">{_recommend_rows(buys, resizable=True)}</div>"
+            + f"<h3>Sell — {len(sells)}</h3><div class=\"card\">{_recommend_rows(sells)}</div>"
+            + skipped_html
         )
 
     return f"""<!DOCTYPE html>

@@ -8,7 +8,8 @@ from stock_scrapper.trading.config import validate_trading_rules
 def _rules(**overrides: object) -> dict[str, object]:
     base = dict(
         trading_rules_version="trade-v1",
-        starting_capital=10000.0,
+        account_value=10000.0,
+        available_cash=10000.0,
         max_position_weight=0.15,
         cash_reserve=0.05,
         max_open_positions=10,
@@ -24,8 +25,24 @@ def _rules(**overrides: object) -> dict[str, object]:
 
 def test_validate_trading_rules_accepts_a_valid_config() -> None:
     validated = validate_trading_rules(_rules())
-    assert validated["starting_capital"] == 10000.0
+    assert validated["account_value"] == 10000.0
+    assert validated["available_cash"] == 10000.0
     assert validated["auto_execute"] is False
+
+
+def test_validate_trading_rules_rejects_available_cash_exceeding_account_value() -> None:
+    with pytest.raises(ValueError, match="must not exceed account_value"):
+        validate_trading_rules(_rules(account_value=1000.0, available_cash=2000.0))
+
+
+def test_validate_trading_rules_rejects_negative_account_value() -> None:
+    with pytest.raises(ValueError, match="account_value must be a nonnegative number"):
+        validate_trading_rules(_rules(account_value=-1.0))
+
+
+def test_validate_trading_rules_accepts_zero_available_cash() -> None:
+    validated = validate_trading_rules(_rules(available_cash=0.0))
+    assert validated["available_cash"] == 0.0
 
 
 def test_validate_trading_rules_rejects_auto_execute_true() -> None:

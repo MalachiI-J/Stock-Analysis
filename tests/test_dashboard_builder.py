@@ -81,6 +81,41 @@ def test_render_dashboard_html_renders_buy_recommendation_with_model_context() -
     assert "AAPL: no current price available" in html
 
 
+def test_render_dashboard_html_includes_resize_widget_when_sizing_rules_present() -> None:
+    outcome = RecommendationRunResult(
+        as_of_date="2026-01-15", account_value=10000.0, available_cash=8000.0, open_position_count=1,
+        recommendations=[
+            TradeRecommendation(symbol="NVDA", action="BUY", shares=10.0, estimated_dollars=500.0, reason="Strong trend"),
+        ],
+        cash_reserve=0.05, max_position_weight=0.15, max_trade_dollar_amount=2000.0, min_trade_dollar_amount=100.0,
+    )
+    html = render_dashboard_html(
+        as_of_date="2026-01-15", market_regime="Neutral", market_regime_confidence=None,
+        digest=_digest(), recommend=outcome, phase2_report_href=None,
+    )
+    assert 'id="rec-adjust-toggle"' in html
+    assert "cashReserve: 0.05" in html
+    assert 'data-price="50.000000"' in html
+    assert 'class="num rec-sizing-value" data-original="10 sh · $500.00"' in html
+
+
+def test_render_dashboard_html_omits_resize_widget_when_sizing_rules_missing() -> None:
+    """RecommendationRunResult built from an older summary.json predating these
+    fields leaves them None -- the widget must degrade gracefully, not error."""
+    outcome = RecommendationRunResult(
+        as_of_date="2026-01-15", account_value=10000.0, available_cash=8000.0, open_position_count=1,
+        recommendations=[
+            TradeRecommendation(symbol="NVDA", action="BUY", shares=10.0, estimated_dollars=500.0, reason="Strong trend"),
+        ],
+    )
+    html = render_dashboard_html(
+        as_of_date="2026-01-15", market_regime="Neutral", market_regime_confidence=None,
+        digest=_digest(), recommend=outcome, phase2_report_href=None,
+    )
+    assert 'id="rec-adjust-toggle"' not in html
+    assert "Account value $10,000.00" in html
+
+
 def test_render_dashboard_html_renders_digest_buckets_and_holdings() -> None:
     holding = HoldingAssessment(
         symbol="AAPL", shares=10.0, average_cost_basis=100.0, latest_price=90.0,
