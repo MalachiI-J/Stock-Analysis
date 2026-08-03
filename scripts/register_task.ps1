@@ -16,7 +16,16 @@ notification and report auto-open both need an interactive desktop session).
 
 param(
     [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot),
-    [string]$StartTime = "06:00",
+    # 08:10, not the original 06:00 -- \MediaIntelligenceDailyReport (a separate
+    # program) triggers at 08:00, also LogonType=Interactive with its own
+    # start-when-available catch-up. On 2026-08-03 the machine wasn't in an
+    # interactive session at either task's normal trigger time, so both queued as
+    # "missed" and fired at the exact same instant once the session became
+    # available, which killed this task's process mid-run (STATUS_CONTROL_C_EXIT)
+    # before recommend/dashboard/the toast could run. A ten-minute gap keeps the
+    # two tasks' *normal* trigger times apart so they don't collide on an ordinary
+    # day where the session is already active by 08:00.
+    [string]$StartTime = "08:10",
     # Retry policy: a single transient failure (a flaky network request during
     # collection, a momentarily locked file) previously meant waiting a full day for
     # the next scheduled run. Two retries five minutes apart gives a same-morning

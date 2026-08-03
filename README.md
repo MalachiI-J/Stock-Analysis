@@ -750,14 +750,28 @@ days. A clean run still gets exactly the combined summary toast described above;
 only a genuine failure gets the separate alert.
 
 A Windows Task Scheduler task (`\StockScrapper\DailyRun`) runs this script
-Monday–Friday. Its configuration is defined in source at
+Monday–Friday at 08:10. Its configuration is defined in source at
 `scripts/register_task.ps1` (weekday trigger time, `StartWhenAvailable` so a
 missed run — e.g. the machine was asleep — catches up once it's next on, and a
 retry policy of 2 attempts 5 minutes apart for transient failures like a flaky
 network request) rather than existing only as manually-clicked, undocumented
 state on one machine; re-run it any time after changing its parameters to apply
 them (`Unregister-ScheduledTask` then `Register-ScheduledTask` under the hood, so
-it's always safe to re-run). Inspect or change the live task with:
+it's always safe to re-run).
+
+08:10 (not the original 06:00) is deliberately offset from a separate program's own
+`LogonType=Interactive` scheduled task, which triggers at 08:00. Two independent
+`StartWhenAvailable`-catch-up tasks under the same interactive session can queue as
+"missed" and then fire at the literal same instant once that session becomes
+available — which is exactly what happened on 2026-08-03: both tasks' `LastRunTime`
+recorded the identical second, and this task's process was killed mid-run
+(`STATUS_CONTROL_C_EXIT`) before `recommend`/`dashboard`/the toast could run. A
+ten-minute gap keeps the two tasks' normal trigger times apart so they don't
+collide on an ordinary day when the session is already active by 08:00; it does not
+fully rule out a collision on a day when the session isn't available until after
+08:10 either, but it removes the everyday risk.
+
+Inspect or change the live task with:
 
 ```powershell
 Get-ScheduledTask -TaskPath "\StockScrapper\" -TaskName "DailyRun"
