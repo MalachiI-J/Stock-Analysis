@@ -1447,8 +1447,12 @@ def _account_adjust_widget_html(
       var accountValue = parseFloat(accountValueInput.value);
       var availableCash = parseFloat(availableCashInput.value);
       if (!isFinite(accountValue) || accountValue < 0 || !isFinite(availableCash) || availableCash < 0) return;
-      var maxPositionDollars = accountValue * rules.maxPositionWeight;
-      var spendable = Math.max(0, availableCash - accountValue * rules.cashReserve);
+      // Mirrors build_recommendations()'s own floors (see recommendations.py):
+      // one trade may cross the position-weight cap or the cash reserve, but
+      // never past minTradeDollarAmount, and only when the account is otherwise
+      // too small to clear them at all.
+      var maxPositionDollars = Math.max(accountValue * rules.maxPositionWeight, rules.minTradeDollarAmount);
+      var spendable = Math.max(availableCash - accountValue * rules.cashReserve, Math.min(availableCash, rules.minTradeDollarAmount));
       var exhausted = false;
       var items = document.querySelectorAll("[data-price]");
       items.forEach(function (item) {{

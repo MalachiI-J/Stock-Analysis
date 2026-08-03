@@ -33,10 +33,19 @@ independent numbers you set directly — `main.py account-set --account-value
 numbers regardless of what positions (if any) you've separately recorded via
 `portfolio-buy`/`portfolio-sell`, which still drive SELL signals and the
 already-held exclusion but play no part in the cash/account-value math.
-`account-set` validates (`available_cash` cannot exceed `account_value`) and
-rewrites only those two lines in `config/trading_rules.yaml`, preserving every
-comment and other setting untouched — a full YAML re-serialize would silently
-strip them. `recommend` writes
+`account-set` validates (`available_cash` cannot exceed `account_value`; both
+must be at least `$100` — `available_cash` may also be exactly `$0`, meaning no
+cash to invest right now) and rewrites only those two lines in
+`config/trading_rules.yaml`, preserving every comment and other setting
+untouched — a full YAML re-serialize would silently strip them. This tool is
+meant to work at any account size down to that `$100` floor: `max_position_weight`
+and `cash_reserve` normally cap and reserve a percentage of the account, but
+`build_recommendations()` never lets either push the first affordable trade
+below `min_trade_dollar_amount` when `available_cash` covers at least one
+minimum-size trade — without that, the shipped defaults (15% position cap, 5%
+reserve, $100 minimum trade) would make a $100 account unable to ever buy
+anything. Once that first trade is taken, later candidates are sized against
+what's genuinely left, with no further floor applied. `recommend` writes
 `reports/recommendations_<date>.txt` plus a `.summary.json`, following the
 same pattern as `digest`, and now runs as part of the daily automation loop
 alongside it (see Daily automation below) — the toast notification includes

@@ -87,7 +87,7 @@ from stock_scrapper.prediction.gbm_service import run_gbm_prediction
 from stock_scrapper.prediction.persistence import persist_prediction_run
 from stock_scrapper.prediction.service import run_prediction
 from stock_scrapper.processing.validation import validate_price_records
-from stock_scrapper.trading.config import validate_trading_rules
+from stock_scrapper.trading.config import MIN_ACCOUNT_DOLLARS, validate_trading_rules
 from stock_scrapper.trading.recommendations import (
     RecommendationRunResult,
     TradeRecommendation,
@@ -297,9 +297,13 @@ def build_parser() -> argparse.ArgumentParser:
         "account-set",
         help="Set the account value and available cash recommend sizes trade suggestions against",
     )
-    account_set.add_argument("--account-value", type=float, required=True, help="Total account value, in dollars")
     account_set.add_argument(
-        "--available-cash", type=float, required=True, help="Cash currently available to spend, in dollars"
+        "--account-value", type=float, required=True,
+        help=f"Total account value, in dollars (minimum ${MIN_ACCOUNT_DOLLARS:,.2f})",
+    )
+    account_set.add_argument(
+        "--available-cash", type=float, required=True,
+        help=f"Cash currently available to spend, in dollars ($0, or at least ${MIN_ACCOUNT_DOLLARS:,.2f})",
     )
 
     portfolio_buy = subparsers.add_parser("portfolio-buy", help="Record a real buy as a new open lot")
@@ -2168,10 +2172,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return int(ExitCode.SUCCESS)
 
         if args.command == "account-set":
-            if args.account_value < 0:
-                parser.error("--account-value must be nonnegative")
-            if args.available_cash < 0:
-                parser.error("--available-cash must be nonnegative")
+            if args.account_value < MIN_ACCOUNT_DOLLARS:
+                parser.error(f"--account-value must be at least ${MIN_ACCOUNT_DOLLARS:,.2f}")
+            if 0.0 < args.available_cash < MIN_ACCOUNT_DOLLARS:
+                parser.error(f"--available-cash must be $0 or at least ${MIN_ACCOUNT_DOLLARS:,.2f}")
             if args.available_cash > args.account_value:
                 parser.error("--available-cash must not exceed --account-value")
             trading_rules_path = base_dir / "config" / "trading_rules.yaml"

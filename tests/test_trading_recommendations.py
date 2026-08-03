@@ -155,13 +155,43 @@ def test_build_recommendations_respects_max_open_positions() -> None:
     assert any("max_open_positions" in entry for entry in result.skipped)
 
 
-def test_build_recommendations_stops_when_cash_is_exhausted() -> None:
+def test_build_recommendations_stops_when_cash_is_truly_exhausted() -> None:
     results = {
         symbol: _result(symbol, "Strong Candidate", opportunity_score=score)
         for symbol, score in [("AAA", 90.0), ("BBB", 85.0)]
     }
     prices = {"AAA": 50.0, "BBB": 50.0}
-    # Only $50 of spendable cash after the reserve -> below min_trade_dollar_amount for both.
+    # $210 account: reserve-adjusted spendable ($199.50) and the position cap ($199.50)
+    # both already clear min_trade_dollar_amount on their own -- the floor described
+    # below never engages here, so this is genuine exhaustion, not a floor rescue.
+    rules = _rules(
+        account_value=210.0, available_cash=210.0, cash_reserve=0.05,
+        min_trade_dollar_amount=100.0, max_position_weight=0.95,
+    )
+
+    result = build_recommendations(
+        as_of_date="2026-01-15", results_by_symbol=results, holdings=[], positions=[],
+        latest_price_by_symbol=prices, rules=rules,
+    )
+
+    assert [rec.symbol for rec in result.recommendations] == ["AAA"]
+    assert result.recommendations[0].estimated_dollars == 150.0
+    assert len(result.skipped) == 1  # breaks after the first once cash is confirmed exhausted
+    assert "BBB" in result.skipped[0] and "spendable cash" in result.skipped[0]
+
+
+def test_build_recommendations_reserve_never_blocks_the_first_min_size_trade() -> None:
+    """At account-set's own $100 floor, a 5%-style cash reserve would otherwise drop
+    every account below min_trade_dollar_amount and permanently block all buying (see
+    the floor in build_recommendations()). The first affordable candidate still gets
+    sized up to min_trade_dollar_amount; once that's spent, the next candidate is
+    sized (or skipped) against what's genuinely left -- no further floor applied.
+    """
+    results = {
+        symbol: _result(symbol, "Strong Candidate", opportunity_score=score)
+        for symbol, score in [("AAA", 90.0), ("BBB", 85.0)]
+    }
+    prices = {"AAA": 50.0, "BBB": 50.0}
     rules = _rules(
         account_value=100.0, available_cash=100.0, cash_reserve=0.5,
         min_trade_dollar_amount=100.0, max_position_weight=0.95,
@@ -172,8 +202,10 @@ def test_build_recommendations_stops_when_cash_is_exhausted() -> None:
         latest_price_by_symbol=prices, rules=rules,
     )
 
-    assert result.recommendations == []
-    assert len(result.skipped) == 1  # breaks after the first once cash is confirmed exhausted
+    assert [rec.symbol for rec in result.recommendations] == ["AAA"]
+    assert result.recommendations[0].estimated_dollars == 100.0
+    assert len(result.skipped) == 1
+    assert "BBB" in result.skipped[0] and "spendable cash ($0.00)" in result.skipped[0]
 
 
 def test_build_recommendations_attaches_model_probability_to_buys() -> None:
