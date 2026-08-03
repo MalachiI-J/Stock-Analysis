@@ -1,10 +1,18 @@
 trading_rules_version: "trade-v1"
-starting_capital: 10000.0
+# Two independent numbers you set directly (see `main.py account-set`) -- not
+# derived from portfolio_lots/portfolio_sales. recommend sizes every suggestion
+# against these, regardless of what positions (if any) you've separately recorded
+# via portfolio-buy/portfolio-sell.
+account_value: 10000.0
+available_cash: 10000.0
 max_position_weight: 0.15
 cash_reserve: 0.05
 max_open_positions: 10
 max_trade_dollar_amount: 2000.0
-min_trade_dollar_amount: 100.0
+# Lowered from 100.0 -- at 15% max_position_weight, a $100 floor made every account
+# under ~$667 unable to size any buy at all (15% of $667 == $100), even with cash
+# to spare. $50 lets accounts down to ~$334 still get sized suggestions.
+min_trade_dollar_amount: 50.0
 max_new_buys_per_run: 3
 require_strong_candidate_for_buy: true
 # Placeholder for a future, separately-approved auto-execution phase. Left false

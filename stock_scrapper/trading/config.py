@@ -16,6 +16,12 @@ def validate_trading_rules(rules: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{key} must be a positive number")
         return float(value)
 
+    def _nonnegative_number(key: str) -> float:
+        value = rules.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ValueError(f"{key} must be a nonnegative number")
+        return float(value)
+
     def _positive_int(key: str) -> int:
         value = rules.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -28,7 +34,10 @@ def validate_trading_rules(rules: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{key} must be a number in [0, 1)")
         return float(value)
 
-    starting_capital = _positive_number("starting_capital")
+    account_value = _nonnegative_number("account_value")
+    available_cash = _nonnegative_number("available_cash")
+    if available_cash > account_value:
+        raise ValueError("available_cash must not exceed account_value")
     max_position_weight = _fraction("max_position_weight")
     if max_position_weight <= 0.0:
         raise ValueError("max_position_weight must be greater than 0")
@@ -61,7 +70,8 @@ def validate_trading_rules(rules: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "trading_rules_version": trading_rules_version,
-        "starting_capital": starting_capital,
+        "account_value": account_value,
+        "available_cash": available_cash,
         "max_position_weight": max_position_weight,
         "cash_reserve": cash_reserve,
         "max_open_positions": max_open_positions,

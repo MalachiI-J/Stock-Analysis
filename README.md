@@ -26,9 +26,17 @@ Position sizing follows the same weight-based approach as the backtester's
 `config/trading_rules.yaml` alongside hard dollar caps
 (`max_trade_dollar_amount`, `min_trade_dollar_amount`), a position-count cap
 (`max_open_positions`), and a per-run cap on new buys
-(`max_new_buys_per_run`). Available cash is derived, not stored: starting
-capital minus every dollar ever committed to a lot, plus every dollar a sale
-ever returned — no new database table was needed. `recommend` writes
+(`max_new_buys_per_run`). `account_value` and `available_cash` are two
+independent numbers you set directly — `main.py account-set --account-value
+<amount> --available-cash <amount>` — not derived from the
+`portfolio_lots`/`portfolio_sales` tables; sizing uses exactly those two
+numbers regardless of what positions (if any) you've separately recorded via
+`portfolio-buy`/`portfolio-sell`, which still drive SELL signals and the
+already-held exclusion but play no part in the cash/account-value math.
+`account-set` validates (`available_cash` cannot exceed `account_value`) and
+rewrites only those two lines in `config/trading_rules.yaml`, preserving every
+comment and other setting untouched — a full YAML re-serialize would silently
+strip them. `recommend` writes
 `reports/recommendations_<date>.txt` plus a `.summary.json`, following the
 same pattern as `digest`, and now runs as part of the daily automation loop
 alongside it (see Daily automation below) — the toast notification includes
@@ -40,6 +48,23 @@ future Part 3 (the program placing orders itself, opted into explicitly,
 against a paper-trading broker first) — it is rejected as unsupported if set
 to `true`. No broker integration exists yet; building one is a deliberate
 later step, not a silent default.
+
+Both the dashboard and the Stock Analyzer report's Recommendations section carry an
+**"Adjust account value / cash" button** — a client-side, JavaScript-only "what if"
+resize of the already-chosen BUY list, not a live re-run. Editing the two numbers and
+clicking Apply recalculates each BUY's shares/estimated dollars against the new
+figures using the exact same sizing arithmetic as `build_recommendations` (position-
+weight cap, cash reserve, per-trade dollar caps, in original ranked order — a BUY that
+would no longer be affordable is shown struck-through/dimmed with the reason why,
+rather than silently vanishing). It deliberately does **not** re-run candidate
+selection (that needs the full scoring/eligibility pipeline a static HTML file
+doesn't have) and does **not** persist anything — closing the page forgets the edit,
+and the panel's own note says as much, pointing at `account-set` as the way to make a
+change stick for real. The four sizing-rule constants it needs
+(`cash_reserve`/`max_position_weight`/`max_trade_dollar_amount`/`min_trade_dollar_amount`)
+ride along in `recommendations_<date>.summary.json` for exactly this purpose; the
+button is silently omitted for older summary files written before this existed, or
+when there are no BUYs to resize, rather than rendering a broken widget.
 
 `recommend-review` closes the accountability loop: the backtester and the
 predictor's walk-forward folds both validate the underlying rules against
@@ -750,14 +775,28 @@ days. A clean run still gets exactly the combined summary toast described above;
 only a genuine failure gets the separate alert.
 
 A Windows Task Scheduler task (`\StockScrapper\DailyRun`) runs this script
-Monday–Friday. Its configuration is defined in source at
+Monday–Friday at 08:10. Its configuration is defined in source at
 `scripts/register_task.ps1` (weekday trigger time, `StartWhenAvailable` so a
 missed run — e.g. the machine was asleep — catches up once it's next on, and a
 retry policy of 2 attempts 5 minutes apart for transient failures like a flaky
 network request) rather than existing only as manually-clicked, undocumented
 state on one machine; re-run it any time after changing its parameters to apply
 them (`Unregister-ScheduledTask` then `Register-ScheduledTask` under the hood, so
-it's always safe to re-run). Inspect or change the live task with:
+it's always safe to re-run).
+
+08:10 (not the original 06:00) is deliberately offset from a separate program's own
+`LogonType=Interactive` scheduled task, which triggers at 08:00. Two independent
+`StartWhenAvailable`-catch-up tasks under the same interactive session can queue as
+"missed" and then fire at the literal same instant once that session becomes
+available — which is exactly what happened on 2026-08-03: both tasks' `LastRunTime`
+recorded the identical second, and this task's process was killed mid-run
+(`STATUS_CONTROL_C_EXIT`) before `recommend`/`dashboard`/the toast could run. A
+ten-minute gap keeps the two tasks' normal trigger times apart so they don't
+collide on an ordinary day when the session is already active by 08:00; it does not
+fully rule out a collision on a day when the session isn't available until after
+08:10 either, but it removes the everyday risk.
+
+Inspect or change the live task with:
 
 ```powershell
 Get-ScheduledTask -TaskPath "\StockScrapper\" -TaskName "DailyRun"
@@ -833,6 +872,9 @@ python main.py portfolio-show --symbol AAPL --closed
 # Compare your real P&L with a same-dollars-same-days SPY shadow portfolio
 python main.py portfolio-compare
 python main.py portfolio-compare --symbol AAPL --as-of-date 2026-06-30
+
+# Set the account value / available cash recommend sizes trades against
+python main.py account-set --account-value 25000 --available-cash 12000
 
 # Sized buy/sell recommendations from the latest saved run and your real holdings (advisory only)
 python main.py recommend
@@ -1141,7 +1183,7 @@ python -m pytest -q
 - **Signal validation is descriptive, not inferential:** `validate-signals`' p-values are naive (they assume independent daily trials, which overlapping-horizon, symbol-clustered rows are not) and are labeled as such; the symbol-weighted mean and its confidence interval are the more defensible read, and buckets backed by fewer than four distinct symbols are flagged as concentration-prone rather than presented as population-level evidence.
 - **Risk-inversion diagnostics are exploratory:** `investigate-risk-inversion`'s quintile splits and Pearson correlations share `validate-signals`' overlapping-window, symbol-clustered non-independence, and testing several correlated indicators at once can look suggestive by chance. Treat its output as hypothesis generation, not a validated explanation, and it changes nothing about score_v1's scoring, thresholds, or classification logic.
 - **Signal-capture diagnostic is exploratory:** `signal-capture-test` is a maximally-permissive score_v1 variant (single-classification entry, no risk-management exits, fixed holding period) built to isolate one question — see "Can the Strong Candidate edge be captured directly?" above. It found removing score_v1's trading rules performs *worse*, not better, suggesting those rules do real protective work rather than suppressing an edge — but it is one exploratory read over one (overlapping-window) history, not a validated conclusion, and changes nothing about score_v1 itself.
-- **Advisory recommendations only:** `recommend` sizes suggestions but never places an order — there is no broker integration, and `auto_execute` in `config/trading_rules.yaml` is rejected if set to `true`. Sizing assumes a single account with no existing outside positions, ignores taxes/fees, and derives available cash from `starting_capital` plus recorded lots/sales rather than a real brokerage balance.
+- **Advisory recommendations only:** `recommend` sizes suggestions but never places an order — there is no broker integration, and `auto_execute` in `config/trading_rules.yaml` is rejected if set to `true`. Sizing uses whatever `account_value`/`available_cash` you last set via `account-set` (see "Phase 6a" above) — it is on you to keep those numbers reasonably current against your real brokerage balance; the tool has no way to verify them, ignores taxes/fees, and does not reconcile them against recorded `portfolio-buy`/`portfolio-sell` lots.
 
 ## Financial and historical-results disclaimer
 

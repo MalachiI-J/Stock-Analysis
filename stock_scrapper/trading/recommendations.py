@@ -10,10 +10,13 @@ real trade decision (see stock_scrapper/prediction/): predict's probability of b
 the benchmark, and predict-v5's predicted excess-return magnitude plus its
 ``low_confidence`` flag for statistically extreme, likely-extrapolated predictions.
 
-There is no persisted cash ledger. Available cash is derived from the existing
-portfolio_lots/portfolio_sales tables plus one user-set "starting_capital" figure:
-capital in, minus every dollar ever committed to a lot, plus every dollar a sale ever
-returned. This intentionally does not need a new migration or a new table.
+Account value and available cash are two independent numbers you set directly
+(``main.py account-set``, persisted in ``config/trading_rules.yaml``) — not derived
+from the portfolio_lots/portfolio_sales tables. Sizing uses exactly those two
+numbers regardless of what positions (if any) you've separately recorded via
+``portfolio-buy``/``portfolio-sell``; those still drive SELL signals and the
+already-held exclusion below, since that reflects real positions this tool tracks,
+but they play no part in account_value/available_cash math.
 """
 
 from __future__ import annotations
@@ -27,18 +30,6 @@ from stock_scrapper.portfolio import HoldingAssessment, PortfolioPosition
 
 _BUY_ELIGIBLE_CLASSIFICATIONS_STRICT = ("Strong Candidate",)
 _BUY_ELIGIBLE_CLASSIFICATIONS_RELAXED = ("Strong Candidate", "Candidate")
-
-
-def compute_available_cash(
-    lots: Sequence[Mapping[str, Any]],
-    sales: Sequence[Mapping[str, Any]],
-    *,
-    starting_capital: float,
-) -> float:
-    """Derive spendable cash without a ledger: capital minus lots' cost basis plus sale proceeds."""
-    invested = sum(float(lot["shares"]) * float(lot["cost_basis_per_share"]) for lot in lots)
-    proceeds = sum(float(sale["shares"]) * float(sale["sale_price"]) for sale in sales)
-    return starting_capital - invested + proceeds
 
 
 @dataclass(slots=True)
@@ -57,7 +48,16 @@ class TradeRecommendation:
 
 @dataclass(slots=True)
 class RecommendationRunResult:
-    """Complete outcome of one recommendation run: sizing context plus every suggestion."""
+    """Complete outcome of one recommendation run: sizing context plus every suggestion.
+
+    The four sizing-rule fields (``cash_reserve``, ``max_position_weight``,
+    ``max_trade_dollar_amount``, ``min_trade_dollar_amount``) are carried through so a
+    report can offer a client-side "what if my account/cash were different" resize of
+    the already-chosen BUY list without a server round-trip. They default to ``None``
+    so older persisted ``recommendations_<date>.summary.json`` files (written before
+    this existed) still deserialize; a report should treat ``None`` as "no resize
+    widget available for this file," not fail.
+    """
 
     as_of_date: str
     account_value: float
@@ -65,11 +65,10 @@ class RecommendationRunResult:
     open_position_count: int
     recommendations: list[TradeRecommendation] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
-
-
-def _holding_value(holding: HoldingAssessment) -> float:
-    value = holding.market_value
-    return value if value is not None else holding.shares * holding.average_cost_basis
+    cash_reserve: float | None = None
+    max_position_weight: float | None = None
+    max_trade_dollar_amount: float | None = None
+    min_trade_dollar_amount: float | None = None
 
 
 def build_recommendations(
@@ -78,8 +77,6 @@ def build_recommendations(
     results_by_symbol: Mapping[str, AnalysisResult],
     holdings: Sequence[HoldingAssessment],
     positions: Sequence[PortfolioPosition],
-    lots: Sequence[Mapping[str, Any]],
-    sales: Sequence[Mapping[str, Any]],
     latest_price_by_symbol: Mapping[str, float],
     rules: Mapping[str, Any],
     model_probability_by_symbol: Mapping[str, float] | None = None,
@@ -91,9 +88,8 @@ def build_recommendations(
     predict_v5_excess_return_by_symbol = predict_v5_excess_return_by_symbol or {}
     predict_v5_low_confidence_by_symbol = predict_v5_low_confidence_by_symbol or {}
     held_symbols = {position.symbol for position in positions}
-    available_cash = compute_available_cash(lots, sales, starting_capital=float(rules["starting_capital"]))
-    holdings_value = sum(_holding_value(holding) for holding in holdings)
-    account_value = available_cash + holdings_value
+    account_value = float(rules["account_value"])
+    available_cash = float(rules["available_cash"])
 
     recommendations: list[TradeRecommendation] = []
     skipped: list[str] = []
@@ -151,9 +147,17 @@ def build_recommendations(
             continue
         target_dollars = min(max_trade_dollar_amount, max_position_dollars, spendable)
         if target_dollars < min_trade_dollar_amount:
+            if target_dollars == max_position_dollars:
+                bottleneck = (
+                    f"{rules['max_position_weight']:.0%} position cap "
+                    f"(${max_position_dollars:,.2f} of ${account_value:,.2f} account value)"
+                )
+            elif target_dollars == spendable:
+                bottleneck = f"spendable cash (${spendable:,.2f})"
+            else:
+                bottleneck = f"max_trade_dollar_amount (${max_trade_dollar_amount:,.2f})"
             skipped.append(
-                f"{result.symbol}: affordable size (${target_dollars:,.2f}) is below "
-                f"min_trade_dollar_amount (${min_trade_dollar_amount:,.2f})"
+                f"{result.symbol}: {bottleneck} is below min_trade_dollar_amount (${min_trade_dollar_amount:,.2f})"
             )
             if spendable < min_trade_dollar_amount:
                 break  # no cash left for anyone further down the list either
@@ -183,6 +187,10 @@ def build_recommendations(
         open_position_count=len(positions),
         recommendations=recommendations,
         skipped=skipped,
+        cash_reserve=cash_reserve,
+        max_position_weight=float(rules["max_position_weight"]),
+        max_trade_dollar_amount=max_trade_dollar_amount,
+        min_trade_dollar_amount=min_trade_dollar_amount,
     )
 
 

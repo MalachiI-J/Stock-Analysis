@@ -156,6 +156,46 @@ def load_trading_rules(base_dir: Path) -> dict[str, Any]:
         raise InvalidConfigurationError(str(exc)) from exc
 
 
+def _update_trading_rules_file(path: Path, updates: Mapping[str, float]) -> None:
+    """Rewrite only the given top-level ``key: value`` lines in trading_rules.yaml,
+    leaving every comment and everything else in the file untouched. A full
+    yaml.safe_dump round-trip would silently strip all comments (including the
+    auto_execute placeholder note), so this patches matching lines in place instead."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    remaining = dict(updates)
+    for index, line in enumerate(lines):
+        for key in list(remaining):
+            if line.lstrip().startswith(f"{key}:"):
+                lines[index] = f"{key}: {remaining.pop(key)}"
+                break
+    for key, value in remaining.items():
+        lines.append(f"{key}: {value}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _account_set(trading_rules_path: Path, account_value: float, available_cash: float) -> None:
+    """Validate and persist a new account_value/available_cash pair into trading_rules.yaml.
+
+    A separate, directly-callable function (rather than inlined in the CLI handler) so it
+    can be exercised against a throwaway file in tests without touching the real repo's
+    config/trading_rules.yaml or depending on main()'s hardcoded base_dir.
+    """
+    if not trading_rules_path.exists():
+        raise InvalidConfigurationError(f"Trading rules configuration is missing: {trading_rules_path}")
+    with trading_rules_path.open("r", encoding="utf-8") as handle:
+        raw_rules = yaml.safe_load(handle)
+    if not isinstance(raw_rules, dict):
+        raise InvalidConfigurationError("trading_rules.yaml must contain a mapping")
+    candidate_rules = dict(raw_rules, account_value=account_value, available_cash=available_cash)
+    try:
+        validate_trading_rules(candidate_rules)
+    except ValueError as exc:
+        raise InvalidConfigurationError(str(exc)) from exc
+    _update_trading_rules_file(
+        trading_rules_path, {"account_value": account_value, "available_cash": available_cash}
+    )
+
+
 def _add_as_of_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--as-of-date",
@@ -252,6 +292,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Date of the recommendations_<date>.summary.json file to review (YYYY-MM-DD)",
     )
     _add_as_of_argument(recommend_review)  # the review/evaluation date; defaults to today
+
+    account_set = subparsers.add_parser(
+        "account-set",
+        help="Set the account value and available cash recommend sizes trade suggestions against",
+    )
+    account_set.add_argument("--account-value", type=float, required=True, help="Total account value, in dollars")
+    account_set.add_argument(
+        "--available-cash", type=float, required=True, help="Cash currently available to spend, in dollars"
+    )
 
     portfolio_buy = subparsers.add_parser("portfolio-buy", help="Record a real buy as a new open lot")
     portfolio_buy.add_argument("--symbol", required=True)
@@ -1887,8 +1936,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             conn = create_connection(config["database_path"])
             try:
                 results_by_symbol = {result.symbol: result for result in results}
-                lots = list_portfolio_lots(conn)
-                sales = list_portfolio_sales(conn)
                 positions = aggregate_open_lots(list_portfolio_lots(conn, status="open"))
                 holdings = _assess_open_holdings(conn, base_dir, effective, results_by_symbol)
 
@@ -1956,8 +2003,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 results_by_symbol=results_by_symbol,
                 holdings=holdings,
                 positions=positions,
-                lots=lots,
-                sales=sales,
                 latest_price_by_symbol=latest_price_by_symbol,
                 rules=trading_rules,
                 model_probability_by_symbol=model_probability_by_symbol,
@@ -1977,6 +2022,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "account_value": outcome.account_value,
                     "available_cash": outcome.available_cash,
                     "open_position_count": outcome.open_position_count,
+                    "cash_reserve": outcome.cash_reserve,
+                    "max_position_weight": outcome.max_position_weight,
+                    "max_trade_dollar_amount": outcome.max_trade_dollar_amount,
+                    "min_trade_dollar_amount": outcome.min_trade_dollar_amount,
                     "recommendations": [
                         {
                             "symbol": rec.symbol,
@@ -2056,6 +2105,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         for item in recommend_data.get("recommendations", [])
                     ],
                     skipped=list(recommend_data.get("skipped", [])),
+                    cash_reserve=recommend_data.get("cash_reserve"),
+                    max_position_weight=recommend_data.get("max_position_weight"),
+                    max_trade_dollar_amount=recommend_data.get("max_trade_dollar_amount"),
+                    min_trade_dollar_amount=recommend_data.get("min_trade_dollar_amount"),
                 )
 
             phase2_report_href = None
@@ -2112,6 +2165,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             finally:
                 conn.close()
             print(render_review_text(review))
+            return int(ExitCode.SUCCESS)
+
+        if args.command == "account-set":
+            if args.account_value < 0:
+                parser.error("--account-value must be nonnegative")
+            if args.available_cash < 0:
+                parser.error("--available-cash must be nonnegative")
+            if args.available_cash > args.account_value:
+                parser.error("--available-cash must not exceed --account-value")
+            trading_rules_path = base_dir / "config" / "trading_rules.yaml"
+            _account_set(trading_rules_path, args.account_value, args.available_cash)
+            print(
+                f"Updated {trading_rules_path}: account_value=${args.account_value:,.2f}, "
+                f"available_cash=${args.available_cash:,.2f}"
+            )
             return int(ExitCode.SUCCESS)
 
         if args.command == "portfolio-buy":

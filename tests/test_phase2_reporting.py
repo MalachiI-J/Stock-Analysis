@@ -409,10 +409,10 @@ def test_phase2_report_recommendations_render_as_cards_not_a_table(tmp_path: Pat
     content = paths["html"].read_text(encoding="utf-8")
     section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
     assert '<div class="rec-list">' in section
-    assert '<div class="rec-card">' in section
+    assert 'class="rec-card"' in section
     assert "<table>" not in section
     assert "NVDA" in section.split('<span class="mono rec-symbol">')[1].split("</span>")[0]
-    assert "10 sh &middot; $500.00" in section
+    assert "10 sh · $500.00" in section
 
 
 def test_phase2_report_recommendations_context_line_colored_by_predict_v5_sign(tmp_path: Path) -> None:
@@ -440,6 +440,61 @@ def test_phase2_report_recommendations_context_line_colored_by_predict_v5_sign(t
     assert 'class="rec-context mono delta-good">predict-v5 +5.0%' in section
     assert 'class="rec-context mono delta-critical">predict-v5 -3.0%' in section
     assert 'class="rec-context mono delta-neutral">model 55% beats benchmark' in section
+
+
+def test_phase2_report_includes_resize_widget_when_sizing_rules_are_present(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    payload = _recommendations_payload(
+        cash_reserve=0.05, max_position_weight=0.15,
+        max_trade_dollar_amount=2000.0, min_trade_dollar_amount=100.0,
+    )
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
+    assert 'id="rec-adjust-toggle"' in section
+    assert 'id="rec-adjust-panel"' in section
+    assert "cashReserve: 0.05" in section
+    assert "maxPositionWeight: 0.15" in section
+    assert "maxTradeDollarAmount: 2000.0" in section
+    assert "minTradeDollarAmount: 100.0" in section
+    assert 'data-price="50.000000"' in section  # 500.0 / 10.0
+    assert 'class="mono rec-sizing-value" data-original="10 sh · $500.00"' in section
+    assert 'id="rec-summary-line"' in section
+
+
+def test_phase2_report_omits_resize_widget_when_sizing_rules_are_missing(tmp_path: Path) -> None:
+    """Older recommendations_<date>.summary.json files predate the four sizing-rule
+    fields -- the section must degrade to a plain, non-interactive subtitle rather
+    than fail or render a broken widget."""
+    metadata, results, histories, issues, previous = _report_inputs()
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(
+        json.dumps(_recommendations_payload()), encoding="utf-8",
+    )
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
+    assert 'id="rec-adjust-toggle"' not in section
+    assert "Account value $10,000.00" in section
+
+
+def test_phase2_report_omits_resize_widget_when_there_are_no_buys(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    payload = _recommendations_payload(
+        recommendations=[], cash_reserve=0.05, max_position_weight=0.15,
+        max_trade_dollar_amount=2000.0, min_trade_dollar_amount=100.0,
+    )
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
+    assert 'id="rec-adjust-toggle"' not in section
 
 
 def test_phase2_report_ranking_tables_use_accent_edge_not_badge_pill(tmp_path: Path) -> None:
