@@ -536,6 +536,19 @@ _REPORT_STYLES = """\
     .badge-serious { color:var(--serious-fg); background:var(--serious-bg); border-color:var(--serious-border); }
     .badge-critical { color:var(--critical-fg); background:var(--critical-bg); border-color:var(--critical-border); }
     .badge-neutral { color:var(--neutral-fg); background:var(--neutral-bg); border-color:var(--neutral-border); }
+    /* Symbol quick-jump strip above Symbol Analysis: same-page links styled like
+       .badge (same status colors, no new ones) so the strip doubles as an
+       at-a-glance overview of the whole set's classifications. */
+    .quickjump-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin-bottom:8px; }
+    .quickjump-row { display:flex; flex-wrap:wrap; gap:8px; }
+    .symbol-chip { display:inline-flex; align-items:center; padding:3px 11px; border-radius:999px; font-size:13px;
+      font-weight:600; font-family:var(--mono); text-decoration:none; border:1px solid transparent; white-space:nowrap; }
+    .symbol-chip:hover { text-decoration:underline; }
+    .symbol-chip-good { color:var(--good-fg); background:var(--good-bg); border-color:var(--good-border); }
+    .symbol-chip-warning { color:var(--warning-fg); background:var(--warning-bg); border-color:var(--warning-border); }
+    .symbol-chip-serious { color:var(--serious-fg); background:var(--serious-bg); border-color:var(--serious-border); }
+    .symbol-chip-critical { color:var(--critical-fg); background:var(--critical-bg); border-color:var(--critical-border); }
+    .symbol-chip-neutral { color:var(--neutral-fg); background:var(--neutral-bg); border-color:var(--neutral-border); }
     /* Score gauge: a thin 0-100 bar so relative strength reads at a glance
        without comparing two numbers by eye. */
     .gauge-row { display:inline-flex; align-items:center; gap:8px; }
@@ -1607,6 +1620,7 @@ def _render_phase2_html(
     risk_html = _ranking_table(risk_order, risk_rank, empty_message="No measured risk scores were available.")
     candidate_validation_html = _signal_validation_notice_html(signal_validation, "Strong Candidate")
     risk_validation_html = _signal_validation_notice_html(signal_validation, "High Risk")
+    quickjump_html = _symbol_quickjump_html(entries)
     detail_html = "".join(_result_section(entry) for entry in entries)
     changes_html = _changes_table(entries)
     quality_section_html = (
@@ -1661,6 +1675,7 @@ def _render_phase2_html(
   <div class="card">{changes_html}</div>
   {quality_section_html}
   <h2 id="symbols">Symbol Analysis</h2>
+  {quickjump_html}
   {detail_html or '<p>No symbol results were available.</p>'}
   <details class="run-footer" id="run-details">
   <summary><span class="chevron">&#9662;</span> Run details</summary>
@@ -1727,6 +1742,26 @@ def _grouped_lists_html(groups: Sequence[tuple[str, Sequence[tuple[str, Any]]]])
         if parts:
             sections.append(f"<section><h4>{_escape(group_title)}</h4>{''.join(parts)}</section>")
     return "".join(sections)
+
+
+def _symbol_quickjump_html(entries: list[dict[str, Any]]) -> str:
+    """A same-page jump strip above the symbol cards: one status-colored chip per
+    entry, linking to that card's existing anchor id. Order matches ``entries``
+    as given -- this doesn't re-sort or re-rank anything.
+    """
+    if not entries:
+        return ""
+    chips = "".join(
+        f'<a class="symbol-chip symbol-chip-{_CLASSIFICATION_STATUS.get(str(entry["result"].get("classification") or ""), "neutral")}" '
+        f'href="#{_symbol_anchor_id(str(entry["result"].get("symbol", "")))}">{_escape(entry["result"].get("symbol", ""))}</a>'
+        for entry in entries
+    )
+    return (
+        '<div class="card">'
+        '<div class="quickjump-label">Jump to symbol</div>'
+        f'<div class="quickjump-row">{chips}</div>'
+        "</div>"
+    )
 
 
 def _result_section(entry: dict[str, Any]) -> str:

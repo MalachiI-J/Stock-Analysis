@@ -558,6 +558,22 @@ def test_phase2_report_symbol_card_merges_score_and_gauge_into_one_stat_box(tmp_
     assert 'class="stock-rank-line muted">rank 1 of candidates' in aapl_card
 
 
+def test_phase2_report_symbol_quickjump_strip_links_and_colors_by_classification(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    strip = content.split('id="symbols"')[1].split('id="symbol-AAPL"')[0]
+    assert "Jump to symbol" in strip
+    # AAPL is Strong Candidate (good), TSLA is High Risk (critical), SPY is Watch (warning).
+    assert '<a class="symbol-chip symbol-chip-good" href="#symbol-AAPL">AAPL</a>' in strip
+    assert '<a class="symbol-chip symbol-chip-critical" href="#symbol-TSLA">TSLA</a>' in strip
+    assert '<a class="symbol-chip symbol-chip-warning" href="#symbol-SPY">SPY</a>' in strip
+    # It's the very first thing under the heading, before any symbol card.
+    assert content.index('id="symbols"') < content.index('<div class="quickjump-row">') < content.index('id="symbol-AAPL"')
+
+
 def test_phase2_report_advisory_only_notice_is_a_single_sentence(tmp_path: Path) -> None:
     metadata, results, histories, issues, previous = _report_inputs()
 
