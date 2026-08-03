@@ -12,6 +12,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
 PHASE2_CSV_FIELDS: tuple[str, ...] = (
@@ -342,6 +343,11 @@ _REPORT_STYLES = """\
          to match that old composited appearance, so nothing else needed to
          be re-tuned to compensate. */
       --page:#10130f; --surface:#1c1f1b; --border:rgba(255,255,255,0.14);
+      /* Raised-card background only (.card/.stock) -- a barely-there diagonal
+         gradient for depth, not a visibly "colored" card. Both stops stay close
+         to --surface on purpose; see [data-theme="light"] for why light mode's
+         version is even more restrained. */
+      --card-surface:linear-gradient(160deg, #20241e 0%, #191c16 100%);
       --ink:#e7e5df; --ink-2:#8a8d87; --muted:#8a8d87;
       --line:rgba(255,255,255,0.10); --th-bg:rgba(255,255,255,0.035);
       --page-grid-a:rgba(150,180,200,0.05); --page-grid-b:rgba(150,180,200,0.04);
@@ -376,6 +382,9 @@ _REPORT_STYLES = """\
     [data-theme="light"] {
       color-scheme: light;
       --page:#F7F6F2; --surface:#FFFFFF; --border:rgba(0,0,0,0.10);
+      /* Light surfaces have far less headroom before a gradient reads as a
+         smudge rather than depth -- keep this stop pair tighter than dark mode's. */
+      --card-surface:linear-gradient(160deg, #FFFFFF 0%, #FBFAF7 100%);
       --ink:#1a1c18; --ink-2:#6b6f68; --muted:#6b6f68;
       --line:rgba(0,0,0,0.08); --th-bg:rgba(0,0,0,0.025);
       --page-grid-a:rgba(90,110,130,0.05); --page-grid-b:rgba(90,110,130,0.04);
@@ -478,13 +487,23 @@ _REPORT_STYLES = """\
        elements (.stat, .lists section, details.raw, .notice, the chart)
        deliberately don't get it — they should read as set INTO the page,
        not floating above it. */
-    .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px 18px; margin:14px 0 22px;
+    .card { background:var(--card-surface); border:1px solid var(--border); border-radius:10px; padding:16px 18px; margin:14px 0 22px;
       box-shadow:var(--card-shadow); }
     .card > table { margin:0; }
-    .notice { padding:14px 16px; border:1px solid var(--border); border-left:3px solid var(--muted);
+    /* border-left bumped 3px -> 4px so the neutral/status accent still reads
+       clearly now that nearby .card/.stock surfaces carry a gradient. */
+    .notice { padding:14px 16px; border:1px solid var(--border); border-left:4px solid var(--muted);
       background:var(--surface); color:var(--ink-2); border-radius:8px; margin:18px 0; }
     .notice-good { border-left-color:var(--good-border); }
     .notice-critical { border-left-color:var(--critical-border); }
+    /* Collapsed-by-default detail inside a .notice — same ▸/▾ marker convention
+       as details.raw, but inline text-sized rather than a boxed panel. */
+    .notice details { margin-top:6px; font-size:12.5px; }
+    .notice details > summary { cursor:pointer; color:var(--muted); list-style:none; user-select:none; }
+    .notice details > summary::-webkit-details-marker { display:none; }
+    .notice details > summary::before { content:"▸ "; }
+    .notice details[open] > summary::before { content:"▾ "; }
+    .notice details p { margin:6px 0 0; }
     .regime-head { display:flex; align-items:center; gap:12px; }
     .regime-confidence { color:var(--ink-2); font-size:13px; font-family:var(--mono); }
     .card ul { list-style:none; margin:6px 0 0; padding:0; }
@@ -528,11 +547,26 @@ _REPORT_STYLES = """\
     .badge-serious { color:var(--serious-fg); background:var(--serious-bg); border-color:var(--serious-border); }
     .badge-critical { color:var(--critical-fg); background:var(--critical-bg); border-color:var(--critical-border); }
     .badge-neutral { color:var(--neutral-fg); background:var(--neutral-bg); border-color:var(--neutral-border); }
+    /* Symbol quick-jump strip above Symbol Analysis: same-page links styled like
+       .badge (same status colors, no new ones) so the strip doubles as an
+       at-a-glance overview of the whole set's classifications. */
+    .quickjump-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin-bottom:8px; }
+    .quickjump-row { display:flex; flex-wrap:wrap; gap:8px; }
+    .symbol-chip { display:inline-flex; align-items:center; padding:3px 11px; border-radius:999px; font-size:13px;
+      font-weight:600; font-family:var(--mono); text-decoration:none; border:1px solid transparent; white-space:nowrap; }
+    .symbol-chip:hover { text-decoration:underline; }
+    .symbol-chip-good { color:var(--good-fg); background:var(--good-bg); border-color:var(--good-border); }
+    .symbol-chip-warning { color:var(--warning-fg); background:var(--warning-bg); border-color:var(--warning-border); }
+    .symbol-chip-serious { color:var(--serious-fg); background:var(--serious-bg); border-color:var(--serious-border); }
+    .symbol-chip-critical { color:var(--critical-fg); background:var(--critical-bg); border-color:var(--critical-border); }
+    .symbol-chip-neutral { color:var(--neutral-fg); background:var(--neutral-bg); border-color:var(--neutral-border); }
     /* Score gauge: a thin 0-100 bar so relative strength reads at a glance
        without comparing two numbers by eye. */
     .gauge-row { display:inline-flex; align-items:center; gap:8px; }
     .gauge { position:relative; width:56px; height:5px; border-radius:999px; background:var(--track-bg); overflow:hidden; flex:0 0 auto; }
-    .gauge.gauge-lg { width:100%; height:7px; }
+    /* Compact variant for inside a .stat box: full width of the box, slimmer
+       than the old full-size gauge it replaces (see .scores below). */
+    .gauge.gauge-stat { width:100%; height:4px; margin-top:7px; }
     .gauge .gauge-fill { position:absolute; top:0; left:0; bottom:0; border-radius:999px; }
     .gauge-good .gauge-fill { background:var(--good-fg); }
     .gauge-warning .gauge-fill { background:var(--warning-fg); }
@@ -544,10 +578,11 @@ _REPORT_STYLES = """\
     .delta-good { color:var(--good-fg); } .delta-critical { color:var(--critical-fg); } .delta-neutral { color:var(--muted); }
     .chip { display:inline-flex; align-items:center; padding:2px 9px; border-radius:999px; font-size:11.5px;
       color:var(--ink-2); background:var(--chip-bg); border:1px solid var(--border); white-space:nowrap; }
-    .stock { border:1px solid var(--border); background:var(--surface); border-radius:10px; padding:20px; margin:20px 0; scroll-margin-top:52px;
+    .stock { border:1px solid var(--border); background:var(--card-surface); border-radius:10px; padding:20px; margin:20px 0; scroll-margin-top:52px;
       box-shadow:var(--card-shadow); }
     .stock-head { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
     .stock-head h3 { margin:0; font-family:var(--mono); }
+    .stock-rank-line { margin:2px 0 0; font-size:12px; }
     .scores { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:14px 0; }
     .stat { background:var(--inset-surface); border:1px solid var(--border); border-top:2px solid var(--border); border-radius:8px; padding:12px 14px; }
     .stat.stat-good { border-top-color:var(--good-accent-bar); }
@@ -556,10 +591,6 @@ _REPORT_STYLES = """\
     .stat .stat-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
     .stat .stat-value { font-size:1.5rem; font-weight:600; margin-top:3px; }
     .stat .stat-sub { margin-top:5px; }
-    .primary-gauges { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; margin:14px 0 18px; }
-    .primary-gauges .gauge-label { display:flex; justify-content:space-between; font-size:12px; color:var(--muted);
-      text-transform:uppercase; letter-spacing:.05em; margin-bottom:5px; }
-    .primary-gauges .gauge-label .mono { font-size:13px; color:var(--ink); text-transform:none; letter-spacing:normal; }
     .chart-wrap { overflow-x:auto; }
     .price-chart { width:100%; min-width:660px; height:auto; background:var(--inset-surface); }
     .legend { font-size:12px; font-family:var(--mono); } .muted { color:var(--muted); }
@@ -578,9 +609,11 @@ _REPORT_STYLES = """\
     details.raw .raw-body { padding:0 14px 14px; }
     details.raw table { margin:8px 0 14px; }
 
-    /* Footer run-details disclosure: a hairline rule + generous top margin so
-       it reads as trailing metadata, not part of the Research Disclaimer text
-       above it. Chevron rotates via a plain CSS transform on [open] — no JS. */
+    /* Footer run-details disclosure: a hairline rule + generous top margin so it
+       reads as trailing, optional content set apart from the symbol cards above
+       it. Chevron rotates via a plain CSS transform on [open] — no JS. Also
+       houses the Methodology note (see _render_phase2_html), folded in here
+       rather than given its own always-visible section. */
     details.run-footer { margin-top:52px; padding-top:20px; border-top:1px solid var(--line); scroll-margin-top:52px; }
     details.run-footer > summary { cursor:pointer; list-style:none; user-select:none;
       display:inline-flex; align-items:center; gap:6px; color:var(--muted);
@@ -589,6 +622,9 @@ _REPORT_STYLES = """\
     details.run-footer > summary .chevron { display:inline-block; transition:transform .2s ease; }
     details.run-footer[open] > summary .chevron { transform:rotate(180deg); }
     details.run-footer .run-footer-body { margin-top:12px; max-width:480px; }
+    details.run-footer .run-footer-body h5 { margin:0 0 6px; font-size:11px; text-transform:uppercase;
+      letter-spacing:.05em; color:var(--muted); }
+    details.run-footer .run-footer-body p { margin:0 0 12px; font-size:13px; }
     details.run-footer table.metadata { margin:0; }
 
     /* Sticky jump nav — CSS-only "current section" cue via :target on the
@@ -1197,6 +1233,23 @@ _THEME_SCRIPT = """\
   </script>
 """
 
+# A trend-line mark on a dark backdrop, in the same bull-phase green used by the
+# hero and `good`-status accents elsewhere. Inlined as a data URI so the report
+# stays a single self-contained file -- no sidecar .ico/.png to ship alongside it.
+# The dark backdrop is fixed (not theme-reactive): a <link rel="icon"> loads once
+# and doesn't re-run on the in-page theme toggle, so it should look right against
+# either a light or dark browser tab bar regardless of which report theme is active.
+_FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<rect width="24" height="24" rx="6" fill="#10130f"/>'
+    '<polyline points="4,18 10,11 13,14 21,4" fill="none" stroke="#5CF08A" '
+    'stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>'
+    '<polyline points="15,4 21,4 21,9" fill="none" stroke="#5CF08A" '
+    'stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>'
+    "</svg>"
+)
+_FAVICON_DATA_URI = "data:image/svg+xml," + quote(_FAVICON_SVG)
+
 
 def _latest_signal_validation_summary(reports_dir: Path) -> dict[str, Any] | None:
     """Best-effort load of the most recent ``signal_validation_*.json`` artifact
@@ -1267,13 +1320,16 @@ def _signal_validation_notice_html(summary: Mapping[str, Any] | None, classifica
         )
     return (
         f'<div class="notice {status}">'
-        f"<strong>Historical signal validation ({_escape(classification)}):</strong> across "
-        f"{bucket.get('sample_size')} classified instance(s) ({bucket.get('distinct_symbols')} distinct symbol(s)) "
-        f"in the full backtested history, mean symbol-weighted forward {_escape(str(horizon))}-session excess "
-        f"return vs {_escape(str(benchmark))} was {symbol_mean:+.2%} ({ci_text})."
+        f"<strong>Historical signal validation ({_escape(classification)}):</strong> mean symbol-weighted "
+        f"forward {_escape(str(horizon))}-session excess return vs {_escape(str(benchmark))} was "
+        f"{symbol_mean:+.2%}."
+        '<details><summary>details</summary><p>'
+        f"Across {bucket.get('sample_size')} classified instance(s) ({bucket.get('distinct_symbols')} distinct "
+        f"symbol(s)) in the full backtested history ({ci_text})."
         f"{concentration_note} This is a descriptive historical pattern across the whole dataset, from "
         f"<span class=\"mono\">{_escape(str(run_id))}</span> — not a live prediction for the symbols ranked "
         "below, and not a recommendation. See README's \"Evaluation honesty\" section."
+        "</p></details>"
         "</div>"
     )
 
@@ -1592,9 +1648,12 @@ def _render_phase2_html(
     risk_html = _ranking_table(risk_order, risk_rank, empty_message="No measured risk scores were available.")
     candidate_validation_html = _signal_validation_notice_html(signal_validation, "Strong Candidate")
     risk_validation_html = _signal_validation_notice_html(signal_validation, "High Risk")
+    quickjump_html = _symbol_quickjump_html(entries)
     detail_html = "".join(_result_section(entry) for entry in entries)
     changes_html = _changes_table(entries)
-    quality_html = _quality_table(quality_issues)
+    quality_section_html = (
+        f"<h2>Data-Quality Concerns</h2>{_quality_table(quality_issues)}" if quality_issues else ""
+    )
     regime_badge = _badge(metadata.get("market_regime"), _REGIME_STATUS)
 
     return f"""<!DOCTYPE html>
@@ -1603,6 +1662,7 @@ def _render_phase2_html(
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Stock Analyzer — {_escape(report_date)}</title>
+  <link rel="icon" type="image/svg+xml" href="{_FAVICON_DATA_URI}" />
   <style>
 {_REPORT_STYLES}
   </style>
@@ -1630,9 +1690,9 @@ def _render_phase2_html(
   <h2 id="market-regime">Market Regime</h2>
   <div class="card regime"><div class="regime-head">{regime_badge}<span class="regime-confidence">confidence {_score(metadata.get('market_regime_confidence'))}</span></div><h4>Market-regime reasons</h4>{regime_reasons}</div>
   <h2 id="recommendations">Today's Recommendations</h2>
-  <div class="notice"><strong>Advisory only.</strong> Sized suggestions only — nothing here has been bought or
-  sold. Model context (<span class="mono">predict</span> / <span class="mono">predict-v5</span>) is displayed
-  information only, never a gate on any recommendation. See <span class="mono">python main.py recommend</span>.</div>
+  <div class="notice"><strong>Advisory only.</strong> Nothing here has been bought or sold, and model context
+  (<span class="mono">predict</span> / <span class="mono">predict-v5</span>) is informational only — never a
+  gate on any recommendation. <span class="muted mono">python main.py recommend</span></div>
   {recommendations_html}
   <h2 id="candidates">Candidate Ranking</h2>
   {candidate_validation_html}
@@ -1642,18 +1702,18 @@ def _render_phase2_html(
   <div class="card">{risk_html}</div>
   <h2 id="changes">Changes From Previous Stored Analysis</h2>
   <div class="card">{changes_html}</div>
-  <h2>Data-Quality Concerns</h2>
-  {quality_html}
+  {quality_section_html}
   <h2 id="symbols">Symbol Analysis</h2>
+  {quickjump_html}
   {detail_html or '<p>No symbol results were available.</p>'}
-  <h2>Methodology</h2>
-  <p>This report presents deterministic, explainable Phase 2 classifications using data available through the stated as-of date. Opportunity, measured risk, and confidence are separate 0–100 scales. Missing inputs remain unavailable rather than being silently treated as zero.</p>
-  <p>Charts use adjusted closing prices supplied to the report and trailing, non-centered 20-, 50-, and 200-session simple moving averages. Rows later than the report/as-of date are excluded from charts. Candidate ranking uses higher opportunity, then higher confidence, lower risk, and symbol as a deterministic tie-breaker. Highest-risk ranking is descending by measured risk.</p>
-  <h2>Research Disclaimer</h2>
-  <p>This software is for educational and research use only. It does not provide personalized financial advice or recommend trades. Historical analysis does not guarantee future performance. Free market data may be delayed, revised, incomplete, or affected by survivorship and static-watchlist bias.</p>
   <details class="run-footer" id="run-details">
   <summary><span class="chevron">&#9662;</span> Run details</summary>
-  <div class="run-footer-body"><table class="metadata"><tbody>{footer_html}</tbody></table></div>
+  <div class="run-footer-body">
+  <h5>Methodology</h5>
+  <p>This report presents deterministic, explainable Phase 2 classifications using data available through the stated as-of date. Opportunity, measured risk, and confidence are separate 0–100 scales. Missing inputs remain unavailable rather than being silently treated as zero.</p>
+  <p>Charts use adjusted closing prices supplied to the report and trailing, non-centered 20-, 50-, and 200-session simple moving averages. Rows later than the report/as-of date are excluded from charts. Candidate ranking uses higher opportunity, then higher confidence, lower risk, and symbol as a deterministic tie-breaker. Highest-risk ranking is descending by measured risk.</p>
+  <table class="metadata"><tbody>{footer_html}</tbody></table>
+  </div>
   </details>
   </div>
 </body>
@@ -1713,6 +1773,26 @@ def _grouped_lists_html(groups: Sequence[tuple[str, Sequence[tuple[str, Any]]]])
     return "".join(sections)
 
 
+def _symbol_quickjump_html(entries: list[dict[str, Any]]) -> str:
+    """A same-page jump strip above the symbol cards: one status-colored chip per
+    entry, linking to that card's existing anchor id. Order matches ``entries``
+    as given -- this doesn't re-sort or re-rank anything.
+    """
+    if not entries:
+        return ""
+    chips = "".join(
+        f'<a class="symbol-chip symbol-chip-{_CLASSIFICATION_STATUS.get(str(entry["result"].get("classification") or ""), "neutral")}" '
+        f'href="#{_symbol_anchor_id(str(entry["result"].get("symbol", "")))}">{_escape(entry["result"].get("symbol", ""))}</a>'
+        for entry in entries
+    )
+    return (
+        '<div class="card">'
+        '<div class="quickjump-label">Jump to symbol</div>'
+        f'<div class="quickjump-row">{chips}</div>'
+        "</div>"
+    )
+
+
 def _result_section(entry: dict[str, Any]) -> str:
     result = entry["result"]
     symbol = str(result.get("symbol", ""))
@@ -1750,18 +1830,13 @@ def _result_section(entry: dict[str, Any]) -> str:
     flags_html = "".join(f'<span class="chip">{_escape(flag)}</span>' for flag in _as_list(result.get("flags")))
     return f"""<article class="stock" id="{_symbol_anchor_id(symbol)}">
 <div class="stock-head"><h3>{_escape(symbol)}</h3>{classification_badge}{flags_html}</div>
+<p class="stock-rank-line muted">rank {_display(entry.get('candidate_rank'))} of candidates &middot; risk rank {_display(entry.get('risk_rank'))}</p>
 <p><strong>Primary reason:</strong> {_display(result.get('primary_reason'))}<br />
 <strong>Data through:</strong> {_display(result.get('data_through_date'))} &nbsp; <strong>Trend state:</strong> {_display(result.get('trend_state'))}</p>
 <div class="scores">
-<div class="stat stat-{classification_status}"><div class="stat-label">Opportunity</div><div class="stat-value">{_score(result.get('opportunity_score'))}</div></div>
-<div class="stat stat-{risk_status}"><div class="stat-label">Measured risk</div><div class="stat-value">{_score(result.get('risk_score'))}</div><div class="stat-sub">{risk_level_badge}</div></div>
+<div class="stat stat-{classification_status}"><div class="stat-label">Opportunity</div><div class="stat-value">{_score(result.get('opportunity_score'))}</div>{_gauge_html(result.get('opportunity_score'), classification_status, stat=True)}</div>
+<div class="stat stat-{risk_status}"><div class="stat-label">Measured risk</div><div class="stat-value">{_score(result.get('risk_score'))}</div>{_gauge_html(result.get('risk_score'), risk_status, stat=True)}<div class="stat-sub">{risk_level_badge}</div></div>
 <div class="stat"><div class="stat-label">Confidence</div><div class="stat-value">{_score(result.get('confidence_score'))}</div></div>
-<div class="stat"><div class="stat-label">Candidate rank</div><div class="stat-value">{_display(entry.get('candidate_rank'))}</div></div>
-<div class="stat"><div class="stat-label">Risk rank</div><div class="stat-value">{_display(entry.get('risk_rank'))}</div></div>
-</div>
-<div class="primary-gauges">
-<div><div class="gauge-label"><span>Opportunity</span><span class="mono">{_score(result.get('opportunity_score'))}</span></div>{_gauge_html(result.get('opportunity_score'), classification_status, large=True)}</div>
-<div><div class="gauge-label"><span>Measured risk</span><span class="mono">{_score(result.get('risk_score'))}</span></div>{_gauge_html(result.get('risk_score'), risk_status, large=True)}</div>
 </div>
 <h4>Adjusted Price and Moving Averages</h4>{chart}
 <div class="lists">{list_html}</div>
@@ -2275,13 +2350,17 @@ def _badge(value: Any, status_map: Mapping[str, str]) -> str:
     return f'<span class="badge badge-{status}">{_escape(label)}</span>'
 
 
-def _gauge_html(value: Any, status: str, large: bool = False) -> str:
-    """A thin 0-100 bar so relative strength reads without comparing two numbers by eye."""
+def _gauge_html(value: Any, status: str, stat: bool = False) -> str:
+    """A thin 0-100 bar so relative strength reads without comparing two numbers by eye.
+
+    ``stat=True`` renders the full-width compact variant meant to sit inside a
+    ``.stat`` box, directly under the number it illustrates.
+    """
     number = _finite_number(value)
     if number is None:
         return ""
     pct = max(0.0, min(100.0, number))
-    classes = f"gauge gauge-{status}" + (" gauge-lg" if large else "")
+    classes = f"gauge gauge-{status}" + (" gauge-stat" if stat else "")
     return f'<span class="{classes}"><span class="gauge-fill" style="width:{pct:.1f}%"></span></span>'
 
 

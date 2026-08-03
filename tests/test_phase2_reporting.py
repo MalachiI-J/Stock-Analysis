@@ -4,6 +4,7 @@ import csv
 import json
 from datetime import date, timedelta
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 
@@ -203,14 +204,16 @@ def test_phase2_report_contains_complete_offline_research_content(tmp_path: Path
         "Weakening conditions",
         "Changes From Previous Stored Analysis",
         "Methodology",
-        "Research Disclaimer",
-        "Historical analysis does not guarantee future performance",
         "SPY is above its 200-day average",
         "Long-term trend is positive",
     ):
         assert expected in content
+    assert "Research Disclaimer" not in content
     assert "Run Metadata" not in content
     assert "Stock Scrapper Phase 2" not in content
+    # Methodology now lives inside the run-details disclosure, not its own section.
+    assert "<h5>Methodology</h5>" in content
+    assert content.index("<h5>Methodology</h5>") > content.index('id="run-details"')
     for series in ("adjusted-price", "sma-20", "sma-50", "sma-200"):
         assert f'data-series="{series}"' in content
     assert "<svg" in content
@@ -230,6 +233,21 @@ def test_phase2_report_contains_complete_offline_research_content(tmp_path: Path
     assert "Reviewed &lt;adjusted close&gt;" in content
     assert "Future issue must not leak" not in content
     assert "9999" not in content
+
+
+def test_phase2_report_includes_inline_svg_favicon(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    head = content.split("</head>")[0]
+    assert '<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,' in head
+    href = head.split('href="')[1].split('"')[0]
+    decoded = unquote(href)
+    assert decoded.startswith("data:image/svg+xml,<svg ")
+    assert "#5CF08A" in decoded
+    assert "<rect" in decoded and "<polyline" in decoded
 
 
 def _signal_validation_payload(**bucket_overrides: dict[str, object]) -> dict[str, object]:
@@ -524,6 +542,79 @@ def test_phase2_report_changes_table_classification_badges_are_unchanged(tmp_pat
     changes_section = content.split("Changes From Previous Stored Analysis")[1].split("Data-Quality Concerns")[0]
     assert 'class="badge badge-good">Strong Candidate' in changes_section
     assert "data-status" not in changes_section
+
+
+def test_phase2_report_omits_data_quality_section_when_there_are_no_issues(tmp_path: Path) -> None:
+    metadata, results, histories, _issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, [], previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "Data-Quality Concerns" not in content
+    assert "No data-quality concerns were supplied" not in content
+
+
+def test_phase2_report_symbol_card_merges_score_and_gauge_into_one_stat_box(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    aapl_card = content.split('id="symbol-AAPL"')[1].split('id="symbol-')[0]
+    scores_block = aapl_card.split('<div class="scores">')[1].split('<h4>Adjusted Price')[0]
+    # Opportunity/Measured risk each appear as one stat box with an inline gauge —
+    # no separate full-width gauge section duplicating the same two numbers.
+    assert "primary-gauges" not in aapl_card
+    assert scores_block.count("Opportunity") == 1
+    assert scores_block.count("Measured risk") == 1
+    assert 'class="gauge gauge-good gauge-stat"' in scores_block
+    # Candidate/Risk rank moved out of the .scores stat grid into a secondary line.
+    assert "Candidate rank" not in aapl_card
+    assert "Risk rank" not in aapl_card
+    assert 'class="stock-rank-line muted">rank 1 of candidates' in aapl_card
+
+
+def test_phase2_report_symbol_quickjump_strip_links_and_colors_by_classification(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    strip = content.split('id="symbols"')[1].split('id="symbol-AAPL"')[0]
+    assert "Jump to symbol" in strip
+    # AAPL is Strong Candidate (good), TSLA is High Risk (critical), SPY is Watch (warning).
+    assert '<a class="symbol-chip symbol-chip-good" href="#symbol-AAPL">AAPL</a>' in strip
+    assert '<a class="symbol-chip symbol-chip-critical" href="#symbol-TSLA">TSLA</a>' in strip
+    assert '<a class="symbol-chip symbol-chip-warning" href="#symbol-SPY">SPY</a>' in strip
+    # It's the very first thing under the heading, before any symbol card.
+    assert content.index('id="symbols"') < content.index('<div class="quickjump-row">') < content.index('id="symbol-AAPL"')
+
+
+def test_phase2_report_advisory_only_notice_is_a_single_sentence(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "Sized suggestions only" not in content
+    assert "See <span class=\"mono\">python main.py recommend</span>." not in content
+    assert "python main.py recommend" in content
+
+
+def test_phase2_report_signal_validation_notice_collapses_detail_by_default(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    (tmp_path / "signal_validation_backtest-test-signalvalidation-001.json").write_text(
+        json.dumps(_signal_validation_payload()), encoding="utf-8",
+    )
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    notice = content.split('<strong>Historical signal validation (Strong Candidate):</strong>')[1].split("</div>")[0]
+    headline, _, detail = notice.partition("<details>")
+    assert "mean symbol-weighted forward 21-session excess return vs SPY was +0.99%." in headline
+    assert "classified instance(s)" not in headline
+    assert "classified instance(s)" in detail
 
 
 def test_phase2_report_is_deterministic_when_generation_metadata_is_fixed(tmp_path: Path) -> None:
