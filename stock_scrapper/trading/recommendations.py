@@ -147,9 +147,17 @@ def build_recommendations(
             continue
         target_dollars = min(max_trade_dollar_amount, max_position_dollars, spendable)
         if target_dollars < min_trade_dollar_amount:
+            if target_dollars == max_position_dollars:
+                bottleneck = (
+                    f"{rules['max_position_weight']:.0%} position cap "
+                    f"(${max_position_dollars:,.2f} of ${account_value:,.2f} account value)"
+                )
+            elif target_dollars == spendable:
+                bottleneck = f"spendable cash (${spendable:,.2f})"
+            else:
+                bottleneck = f"max_trade_dollar_amount (${max_trade_dollar_amount:,.2f})"
             skipped.append(
-                f"{result.symbol}: affordable size (${target_dollars:,.2f}) is below "
-                f"min_trade_dollar_amount (${min_trade_dollar_amount:,.2f})"
+                f"{result.symbol}: {bottleneck} is below min_trade_dollar_amount (${min_trade_dollar_amount:,.2f})"
             )
             if spendable < min_trade_dollar_amount:
                 break  # no cash left for anyone further down the list either

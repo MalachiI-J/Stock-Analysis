@@ -1408,7 +1408,17 @@ def _account_adjust_widget_html(
         var targetDollars = Math.min(rules.maxTradeDollarAmount, maxPositionDollars, spendable);
         if (targetDollars < rules.minTradeDollarAmount) {{
           item.classList.add("rec-item-excluded");
-          valueSpan.textContent = "Not sized — below the " + money(rules.minTradeDollarAmount) + " minimum trade";
+          var bottleneck;
+          if (targetDollars === maxPositionDollars) {{
+            bottleneck = Math.round(rules.maxPositionWeight * 100) + "% position cap (" +
+              money(maxPositionDollars) + " of " + money(accountValue) + " account value)";
+          }} else if (targetDollars === spendable) {{
+            bottleneck = "spendable cash (" + money(spendable) + ")";
+          }} else {{
+            bottleneck = "max_trade_dollar_amount (" + money(rules.maxTradeDollarAmount) + ")";
+          }}
+          valueSpan.textContent = "Not sized — " + bottleneck + " is below the " +
+            money(rules.minTradeDollarAmount) + " minimum trade";
           if (spendable < rules.minTradeDollarAmount) exhausted = true;
           return;
         }}
