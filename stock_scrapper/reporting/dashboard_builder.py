@@ -26,6 +26,7 @@ from stock_scrapper.reporting.report_builder import (
     _REPORT_STYLES,
     _THEME_SCRIPT,
     _badge,
+    _market_hero_html,
     _score,
 )
 from stock_scrapper.trading.recommendations import RecommendationRunResult, TradeRecommendation
@@ -182,9 +183,10 @@ def render_dashboard_html(
 <body>
   <div class="page-glow" aria-hidden="true"></div>
   <div class="page-fade" aria-hidden="true"></div>
+{_market_hero_html()}
   <nav class="term-nav" aria-label="Report sections">
     <div class="term-nav-links">
-    <a href="#recommend">Recommendations</a><a href="#digest">Digest</a><a href="#holdings">Holdings</a>
+    <a href="#top">Home</a><a href="#recommend">Recommendations</a><a href="#digest">Digest</a><a href="#holdings">Holdings</a>
     </div>
     <div class="theme-toggle" role="group" aria-label="Theme">
       <button type="button" class="theme-btn" data-set-theme="light" aria-pressed="false" title="Light mode" aria-label="Light mode">&#9728;</button>

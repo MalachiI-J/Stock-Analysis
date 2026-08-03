@@ -25,6 +25,15 @@ def _digest(**overrides: object) -> dict[str, object]:
     return build_digest(**base)  # type: ignore[arg-type]
 
 
+def test_render_dashboard_html_includes_the_market_hero_banner() -> None:
+    html = render_dashboard_html(
+        as_of_date="2026-01-15", market_regime="Risk-On", market_regime_confidence=75.0,
+        digest=_digest(), recommend=None, phase2_report_href=None,
+    )
+    assert 'class="market-hero" id="top"' in html
+    assert '<a href="#top">Home</a>' in html
+
+
 def test_render_dashboard_html_includes_market_regime_and_report_link() -> None:
     html = render_dashboard_html(
         as_of_date="2026-01-15", market_regime="Risk-On", market_regime_confidence=75.0,
