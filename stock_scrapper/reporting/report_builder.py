@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from stock_scrapper.analysis.signal_validation import load_latest_signal_validation
+
 
 PHASE2_CSV_FIELDS: tuple[str, ...] = (
     "report_date",
@@ -518,6 +520,25 @@ _REPORT_STYLES = """\
     .rec-symbol { font-size:15px; font-weight:600; }
     .rec-reason { color:var(--muted); margin-top:4px; }
     .rec-context { font-size:12.5px; margin-top:6px; }
+    /* Historical outcome range (p10/p90) and best-time-to-sell -- BUY-only context,
+       see _best_time_to_sell_html() and the "checkpoints_compared" data. */
+    .rec-outcome { font-size:12.5px; margin-top:6px; color:var(--ink-2); }
+    .rec-exit { margin-top:10px; padding-top:10px; border-top:1px solid var(--line); }
+    .rec-exit-label { font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
+    .rec-exit-headline { font-weight:600; font-size:14px; margin-top:3px; }
+    .rec-exit-headline.status-good { color:var(--good-fg); }
+    .rec-exit-headline.status-neutral { color:var(--ink); }
+    .rec-exit-note { font-size:12.5px; color:var(--ink-2); margin-top:3px; }
+    .rec-exit-recalc { font-size:11.5px; margin-top:5px; }
+    /* Same ▸/▾ marker convention as details.raw and .notice details. */
+    .rec-exit details { margin-top:8px; font-size:12.5px; }
+    .rec-exit details > summary { cursor:pointer; color:var(--muted); list-style:none; user-select:none; }
+    .rec-exit details > summary::-webkit-details-marker { display:none; }
+    .rec-exit details > summary::before { content:"▸ "; }
+    .rec-exit details[open] > summary::before { content:"▾ "; }
+    .rec-exit-checkpoints { list-style:none; margin:6px 0 0; padding:0; }
+    .rec-exit-checkpoints li { padding:3px 0; border-bottom:1px solid var(--line); color:var(--ink-2); }
+    .rec-exit-checkpoints li:last-child { border-bottom:none; }
     /* Client-side "what if" resize of the already-chosen BUY list only — never a
        server round-trip, never re-runs candidate selection, never saves anything.
        See _account_adjust_widget_html() in report_builder.py. */
@@ -1251,30 +1272,10 @@ _FAVICON_SVG = (
 _FAVICON_DATA_URI = "data:image/svg+xml," + quote(_FAVICON_SVG)
 
 
-def _latest_signal_validation_summary(reports_dir: Path) -> dict[str, Any] | None:
-    """Best-effort load of the most recent ``signal_validation_*.json`` artifact
-    (written by ``main.py validate-signals``) from the same reports directory.
-
-    ``validate-signals`` requires a fresh full-history backtest and is a manual,
-    occasional diagnostic (see README's "Evaluation honesty" section) — it is not
-    re-run as part of every daily report. This surfaces its latest known result as
-    a dated annotation rather than recomputing it, so the daily pipeline stays
-    fast. Returns ``None`` (silently — this is supplementary context, not core
-    report content) if no such artifact exists yet or it can't be parsed.
-    """
-    try:
-        candidates = sorted(
-            Path(reports_dir).glob("signal_validation_*.json"),
-            key=lambda path: path.stat().st_mtime,
-        )
-    except OSError:
-        return None
-    if not candidates:
-        return None
-    try:
-        return json.loads(candidates[-1].read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+# Re-exported under the report_builder-internal name every existing call site here
+# already uses; the actual lookup lives in signal_validation.py since main.py's
+# `recommend` handler now needs the identical "latest artifact" lookup too.
+_latest_signal_validation_summary = load_latest_signal_validation
 
 
 def _signal_validation_notice_html(summary: Mapping[str, Any] | None, classification: str) -> str:
@@ -1443,6 +1444,14 @@ def _account_adjust_widget_html(
       return "$" + value.toLocaleString("en-US", {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
     }}
 
+    function signedMoney(value) {{
+      return (value >= 0 ? "+" : "-") + "$" + Math.abs(value).toLocaleString("en-US", {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+    }}
+
+    function pct(value) {{
+      return (value >= 0 ? "+" : "") + (value * 100).toFixed(1) + "%";
+    }}
+
     function applyResize() {{
       var accountValue = parseFloat(accountValueInput.value);
       var availableCash = parseFloat(availableCashInput.value);
@@ -1458,11 +1467,17 @@ def _account_adjust_widget_html(
       items.forEach(function (item) {{
         var valueSpan = item.querySelector(".rec-sizing-value");
         if (!valueSpan) return;
+        // The outcome-range line's percentages never change on resize -- only their
+        // dollar translation does, recomputed from this item's own targetDollars below.
+        var outcomeSpan = item.querySelector(".rec-outcome-value");
+        var outcomeP10 = item.hasAttribute("data-outcome-p10") ? parseFloat(item.getAttribute("data-outcome-p10")) : null;
+        var outcomeP90 = item.hasAttribute("data-outcome-p90") ? parseFloat(item.getAttribute("data-outcome-p90")) : null;
         var price = parseFloat(item.getAttribute("data-price"));
         item.classList.remove("rec-item-excluded");
         if (exhausted) {{
           item.classList.add("rec-item-excluded");
           valueSpan.textContent = "Not sized — no cash left at this level";
+          if (outcomeSpan) outcomeSpan.textContent = "—";
           return;
         }}
         var targetDollars = Math.min(rules.maxTradeDollarAmount, maxPositionDollars, spendable);
@@ -1479,6 +1494,7 @@ def _account_adjust_widget_html(
           }}
           valueSpan.textContent = "Not sized — " + bottleneck + " is below the " +
             money(rules.minTradeDollarAmount) + " minimum trade";
+          if (outcomeSpan) outcomeSpan.textContent = "—";
           if (spendable < rules.minTradeDollarAmount) exhausted = true;
           return;
         }}
@@ -1486,10 +1502,16 @@ def _account_adjust_widget_html(
         if (shares < 1) {{
           item.classList.add("rec-item-excluded");
           valueSpan.textContent = "Not sized — price too high for the affordable size";
+          if (outcomeSpan) outcomeSpan.textContent = "—";
           return;
         }}
         var estimatedDollars = shares * price;
         valueSpan.textContent = shares + " sh \\u00B7 " + money(estimatedDollars);
+        if (outcomeSpan && outcomeP10 !== null && outcomeP90 !== null) {{
+          outcomeSpan.textContent = "Historical pattern: " + pct(outcomeP10) + " to " + pct(outcomeP90) +
+            " excess return (~" + signedMoney(targetDollars * outcomeP10) + " to " +
+            signedMoney(targetDollars * outcomeP90) + " on this size)";
+        }}
         spendable -= estimatedDollars;
       }});
       if (summaryLine) {{
@@ -1509,6 +1531,11 @@ def _account_adjust_widget_html(
           var original = valueSpan.getAttribute("data-original");
           if (original !== null) valueSpan.textContent = original;
         }}
+        var outcomeSpan = item.querySelector(".rec-outcome-value");
+        if (outcomeSpan) {{
+          var outcomeOriginal = outcomeSpan.getAttribute("data-original");
+          if (outcomeOriginal !== null) outcomeSpan.textContent = outcomeOriginal;
+        }}
       }});
       if (summaryLine) summaryLine.textContent = summaryLine.getAttribute("data-original");
       note.hidden = true;
@@ -1524,6 +1551,67 @@ def _account_adjust_widget_html(
   }})();
   </script>"""
     return subtitle + widget
+
+
+def _checkpoint_week_label(sessions: Any) -> str:
+    """~1 week / ~2 weeks / etc, from a session count (roughly 5 sessions/week) --
+    a plain-language label, not a new precision claim (see add_business_days)."""
+    number = _finite_number(sessions)
+    if number is None:
+        return "unknown"
+    weeks = max(1, round(number / 5))
+    return f"~{weeks} week" + ("" if weeks == 1 else "s")
+
+
+def _best_time_to_sell_html(item: Mapping[str, Any]) -> str:
+    """Best-time-to-sell card for one BUY: which forward checkpoint (if any)
+    historically, meaningfully outperformed the standard evaluation horizon for this
+    classification -- see ``compute_checkpoint_comparisons`` in
+    ``stock_scrapper.analysis.signal_validation``. Degrades to a plain "hold to
+    standard horizon" headline when nothing cleared that bar (the normal case, not
+    an error) or no ``validate-signals`` artifact exists yet at all.
+    """
+    best_exit_sessions = _finite_number(item.get("best_exit_sessions"))
+    best_exit_date = item.get("best_exit_date")
+    if not best_exit_date:
+        return ""
+    if best_exit_sessions is not None:
+        headline = f"{_checkpoint_week_label(best_exit_sessions)} out &middot; around {_escape(str(best_exit_date))}"
+        headline_status = "good"
+        explanation = "This window historically stood out among the checkpoints compared for this setup."
+    else:
+        headline = f"Hold until next month &middot; past {_escape(str(best_exit_date))}"
+        headline_status = "neutral"
+        explanation = "No shorter window meaningfully outperformed the standard ~1 month horizon."
+
+    checkpoints = item.get("checkpoints_compared")
+    checkpoint_rows = []
+    if isinstance(checkpoints, list):
+        for checkpoint in checkpoints:
+            if not isinstance(checkpoint, Mapping):
+                continue
+            p10 = _finite_number(checkpoint.get("p10_excess_return"))
+            p90 = _finite_number(checkpoint.get("p90_excess_return"))
+            range_text = f"{p10:+.1%} to {p90:+.1%}" if p10 is not None and p90 is not None else "not enough history yet"
+            checkpoint_rows.append(
+                f"<li>{_checkpoint_week_label(checkpoint.get('sessions'))} "
+                f"({_display(checkpoint.get('date'))}): {_escape(range_text)}</li>"
+            )
+    details_html = (
+        f'<details><summary>see all checkpoints compared</summary>'
+        f'<ul class="rec-exit-checkpoints">{"".join(checkpoint_rows)}</ul></details>'
+        if checkpoint_rows else ""
+    )
+    return (
+        '<div class="rec-exit">'
+        '<div class="rec-exit-label muted">Best time to sell</div>'
+        f'<div class="rec-exit-headline status-{headline_status}">{headline}</div>'
+        f'<div class="rec-exit-note">{_escape(explanation)}</div>'
+        '<div class="rec-exit-recalc muted">Recalculated every time this report runs '
+        "&mdash; re-run for current guidance.</div>"
+        f"{details_html}"
+        "</div>"
+    )
 
 
 def _recommendations_section_html(summary: Mapping[str, Any] | None) -> str:
@@ -1574,6 +1662,37 @@ def _recommendations_section_html(summary: Mapping[str, Any] | None) -> str:
             price_attr = ""
             if resizable and shares is not None and dollars is not None and shares > 0:
                 price_attr = f' data-price="{dollars / shares:.6f}"'
+
+            # Historical outcome range and best-time-to-sell are BUY-only context (see
+            # stock_scrapper.trading.recommendations._outcome_context) — SELL rows call
+            # rows(sells) without resizable=True, so this block never runs for them.
+            outcome_html = ""
+            exit_html = ""
+            if resizable:
+                outcome_p10 = _finite_number(item.get("outcome_p10"))
+                outcome_p90 = _finite_number(item.get("outcome_p90"))
+                if outcome_p10 is not None and outcome_p90 is not None:
+                    dollar_text = ""
+                    if dollars is not None:
+                        dollar_text = (
+                            f" (~{_signed_money(dollars * outcome_p10)} to "
+                            f"{_signed_money(dollars * outcome_p90)} on this size)"
+                        )
+                    outcome_text = (
+                        f"Historical pattern: {outcome_p10:+.1%} to {outcome_p90:+.1%} "
+                        f"excess return{dollar_text}"
+                    )
+                    price_attr += f' data-outcome-p10="{outcome_p10}" data-outcome-p90="{outcome_p90}"'
+                    outcome_html = (
+                        '<div class="rec-outcome mono rec-outcome-value" '
+                        f'data-original="{_escape(outcome_text)}">{_escape(outcome_text)}</div>'
+                    )
+                else:
+                    classification_label = _display(item.get("classification"))
+                    outcome_text = f"Not enough historical data yet for {classification_label} to show an outcome range."
+                    outcome_html = f'<div class="rec-outcome muted">{_escape(outcome_text)}</div>'
+                exit_html = _best_time_to_sell_html(item)
+
             cards.append(
                 f'<div class="rec-card"{price_attr}>'
                 '<div class="rec-card-head">'
@@ -1582,6 +1701,8 @@ def _recommendations_section_html(summary: Mapping[str, Any] | None) -> str:
                 "</div>"
                 f'<div class="rec-reason">{_display(item.get("reason"))}</div>'
                 f"{context_html}"
+                f"{outcome_html}"
+                f"{exit_html}"
                 "</div>"
             )
         return '<div class="rec-list">' + "".join(cards) + "</div>"
@@ -2284,6 +2405,11 @@ def _finite_number(value: Any) -> float | None:
 def _sortable_number(value: Any, default: float) -> float:
     number = _finite_number(value)
     return default if number is None else number
+
+
+def _signed_money(value: float) -> str:
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}${abs(value):,.2f}"
 
 
 def _canonical_json(value: Any) -> str:

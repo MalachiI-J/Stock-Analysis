@@ -320,3 +320,146 @@ def test_render_recommendations_text_lists_skipped_candidates() -> None:
 
     assert "Considered but not recommended" in text
     assert "no current price" in text
+
+
+def test_build_recommendations_buy_falls_back_to_standard_horizon_when_no_signal_validation() -> None:
+    from datetime import date
+
+    from stock_scrapper.utilities.business_days import add_business_days
+
+    results = {"NVDA": _result("NVDA", "Strong Candidate")}
+    result = build_recommendations(
+        as_of_date="2026-01-15", results_by_symbol=results, holdings=[], positions=[],
+        latest_price_by_symbol={"NVDA": 50.0}, rules=_rules(),
+    )
+
+    buy = result.recommendations[0]
+    assert buy.classification == "Strong Candidate"
+    assert buy.outcome_p10 is None
+    assert buy.outcome_p90 is None
+    assert buy.best_exit_sessions is None
+    assert buy.checkpoints_compared == []
+    assert buy.best_exit_date == add_business_days(date(2026, 1, 15), 21).isoformat()
+
+
+def test_build_recommendations_buy_uses_custom_standard_horizon_days() -> None:
+    from datetime import date
+
+    from stock_scrapper.utilities.business_days import add_business_days
+
+    results = {"NVDA": _result("NVDA", "Strong Candidate")}
+    result = build_recommendations(
+        as_of_date="2026-01-15", results_by_symbol=results, holdings=[], positions=[],
+        latest_price_by_symbol={"NVDA": 50.0}, rules=_rules(), standard_horizon_days=10,
+    )
+
+    buy = result.recommendations[0]
+    assert buy.best_exit_date == add_business_days(date(2026, 1, 15), 10).isoformat()
+
+
+def test_build_recommendations_buy_uses_meaningfully_better_checkpoint() -> None:
+    from datetime import date
+
+    from stock_scrapper.utilities.business_days import add_business_days
+
+    results = {"NVDA": _result("NVDA", "Strong Candidate")}
+    signal_validation = {
+        "best_exit_by_classification": {
+            "Strong Candidate": {
+                "standard_horizon_sessions": 21,
+                "best_checkpoint_sessions": 26,
+                "best_checkpoint_meaningfully_better": True,
+                "checkpoints": [
+                    {
+                        "sessions": 21, "outcome_sample_size": 40,
+                        "p10_excess_return": -0.02, "p90_excess_return": 0.06,
+                    },
+                    {
+                        "sessions": 26, "outcome_sample_size": 40,
+                        "p10_excess_return": 0.01, "p90_excess_return": 0.09,
+                    },
+                ],
+            },
+        },
+    }
+
+    result = build_recommendations(
+        as_of_date="2026-01-15", results_by_symbol=results, holdings=[], positions=[],
+        latest_price_by_symbol={"NVDA": 50.0}, rules=_rules(),
+        signal_validation=signal_validation, standard_horizon_days=21,
+    )
+
+    buy = result.recommendations[0]
+    # outcome_p10/p90 come from the *standard*-horizon checkpoint, not the winner.
+    assert buy.outcome_p10 == -0.02
+    assert buy.outcome_p90 == 0.06
+    assert buy.best_exit_sessions == 26
+    assert buy.best_exit_date == add_business_days(date(2026, 1, 15), 26).isoformat()
+    assert [c["sessions"] for c in buy.checkpoints_compared] == [21, 26]
+    assert buy.checkpoints_compared[1]["date"] == add_business_days(date(2026, 1, 15), 26).isoformat()
+    assert buy.checkpoints_compared[1]["p10_excess_return"] == 0.01
+
+
+def test_build_recommendations_buy_holds_to_standard_when_nothing_meaningfully_better() -> None:
+    from datetime import date
+
+    from stock_scrapper.utilities.business_days import add_business_days
+
+    results = {"NVDA": _result("NVDA", "Strong Candidate")}
+    signal_validation = {
+        "best_exit_by_classification": {
+            "Strong Candidate": {
+                "standard_horizon_sessions": 21,
+                "best_checkpoint_sessions": None,
+                "best_checkpoint_meaningfully_better": False,
+                "checkpoints": [
+                    {
+                        "sessions": 21, "outcome_sample_size": 40,
+                        "p10_excess_return": -0.02, "p90_excess_return": 0.06,
+                    },
+                ],
+            },
+        },
+    }
+
+    result = build_recommendations(
+        as_of_date="2026-01-15", results_by_symbol=results, holdings=[], positions=[],
+        latest_price_by_symbol={"NVDA": 50.0}, rules=_rules(),
+        signal_validation=signal_validation, standard_horizon_days=21,
+    )
+
+    buy = result.recommendations[0]
+    assert buy.outcome_p10 == -0.02
+    assert buy.best_exit_sessions is None
+    assert buy.best_exit_date == add_business_days(date(2026, 1, 15), 21).isoformat()
+
+
+def test_build_recommendations_sell_items_have_no_outcome_context() -> None:
+    holding = HoldingAssessment(
+        symbol="AAPL", shares=10.0, average_cost_basis=100.0, latest_price=90.0,
+        classification="Avoid", primary_reason="weak", rule_based_exit_reason="Classification-based exit",
+        price_stop_reason=None, recommendation="SELL",
+    )
+    position = PortfolioPosition(symbol="AAPL", shares=10.0, average_cost_basis=100.0, earliest_opened_date="2026-01-01")
+    signal_validation = {
+        "best_exit_by_classification": {
+            "Avoid": {
+                "standard_horizon_sessions": 21, "best_checkpoint_sessions": 5,
+                "best_checkpoint_meaningfully_better": True, "checkpoints": [],
+            },
+        },
+    }
+
+    result = build_recommendations(
+        as_of_date="2026-01-15", results_by_symbol={}, holdings=[holding], positions=[position],
+        latest_price_by_symbol={"AAPL": 90.0}, rules=_rules(), signal_validation=signal_validation,
+    )
+
+    sell = result.recommendations[0]
+    assert sell.action == "SELL"
+    assert sell.classification is None
+    assert sell.outcome_p10 is None
+    assert sell.outcome_p90 is None
+    assert sell.best_exit_sessions is None
+    assert sell.best_exit_date is None
+    assert sell.checkpoints_compared == []

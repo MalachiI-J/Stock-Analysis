@@ -30,8 +30,10 @@ consistent with the rest of this project's no-scipy/no-scikit-learn design.
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 # Ordered from most to least favorable — used only to report mean excess return in a
@@ -45,6 +47,12 @@ CLASSIFICATION_ORDER: tuple[str, ...] = ("Strong Candidate", "Candidate", "Watch
 # handful of stocks (or one) going on a single big run can then look like a broad,
 # statistically "significant" population effect when it is really one or two anecdotes.
 MIN_DISTINCT_SYMBOLS_FOR_TRUST = 4
+
+# Below this many individual forward-return observations, a p10/p90 percentile range is
+# noisy enough (e.g. the "10th percentile" of 5 values is really just picking one of
+# them) that it reads as more precise than it is. Below this floor, the range is left as
+# ``None`` rather than shown -- see ClassificationBucket.p10_excess_return/p90_excess_return.
+MIN_OUTCOME_SAMPLE_SIZE = 20
 
 
 def _finite(value: Any) -> float | None:
@@ -163,6 +171,23 @@ def _symbol_mean_confidence_interval(
     return mean - z * standard_error, mean + z * standard_error
 
 
+def _percentile(sorted_values: Sequence[float], fraction: float) -> float:
+    """Linear-interpolation percentile (the same convention numpy's default uses),
+    hand-rolled consistent with the rest of this module. ``sorted_values`` must already
+    be sorted ascending and non-empty; ``fraction`` is in ``[0, 1]``.
+    """
+    n = len(sorted_values)
+    if n == 1:
+        return sorted_values[0]
+    position = fraction * (n - 1)
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return sorted_values[int(position)]
+    weight = position - lower
+    return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * weight
+
+
 @dataclass(slots=True)
 class ClassificationBucket:
     """One classification's forward-performance summary, measured against every other
@@ -191,6 +216,13 @@ class ClassificationBucket:
     symbol_mean_excess_return_ci_low: float | None = None
     symbol_mean_excess_return_ci_high: float | None = None
     concentration_warning: bool = False
+    # The realistic spread of *individual* outcomes (10th/90th percentile of the same
+    # per-observation excess-return values averaged into mean_excess_return), not a CI
+    # on the mean -- a CI answers "how confident are we in the average," this answers
+    # "how wide do real outcomes actually get." None below MIN_OUTCOME_SAMPLE_SIZE.
+    p10_excess_return: float | None = None
+    p90_excess_return: float | None = None
+    outcome_sample_size: int = 0
 
 
 @dataclass(slots=True)
@@ -289,6 +321,10 @@ def validate_signals(
         distinct_symbols = len(per_symbol_means)
         symbol_mean_excess = sum(per_symbol_means) / distinct_symbols if distinct_symbols else None
         ci_low, ci_high = _symbol_mean_confidence_interval(per_symbol_means)
+        p10_excess = p90_excess = None
+        if n >= MIN_OUTCOME_SAMPLE_SIZE:
+            p10_excess = _percentile(sorted_values, 0.10)
+            p90_excess = _percentile(sorted_values, 0.90)
 
         buckets.append(
             ClassificationBucket(
@@ -305,6 +341,9 @@ def validate_signals(
                 symbol_mean_excess_return_ci_low=ci_low,
                 symbol_mean_excess_return_ci_high=ci_high,
                 concentration_warning=distinct_symbols < MIN_DISTINCT_SYMBOLS_FOR_TRUST,
+                p10_excess_return=p10_excess,
+                p90_excess_return=p90_excess,
+                outcome_sample_size=n,
             )
         )
 
@@ -345,6 +384,155 @@ def validate_signals(
         monotonic=monotonic,
         monotonic_symbol_weighted=monotonic_symbol_weighted,
     )
+
+
+# Roughly 1, 2, 3, 4 (standard), 5, and 6 weeks out. The standard evaluation horizon
+# (usually 21) is folded into whatever set is actually used at call time -- see
+# compute_checkpoint_comparisons -- so it's always one of the checkpoints compared,
+# never a separate hardcoded number that could silently drift from config.
+CHECKPOINT_SESSIONS: tuple[int, ...] = (5, 10, 15, 21, 26, 31)
+
+
+@dataclass(slots=True)
+class CheckpointOutcome:
+    """One forward-horizon checkpoint's realized-outcome range and symbol-weighted
+    mean/CI -- computed exactly like ClassificationBucket's own fields, just at a
+    (possibly) different horizon than the standard one.
+    """
+
+    sessions: int
+    outcome_sample_size: int = 0
+    p10_excess_return: float | None = None
+    p90_excess_return: float | None = None
+    symbol_mean_excess_return: float | None = None
+    symbol_mean_excess_return_ci_low: float | None = None
+    symbol_mean_excess_return_ci_high: float | None = None
+
+
+@dataclass(slots=True)
+class BestExitAnalysis:
+    """Whether some forward checkpoint meaningfully outperforms the standard horizon
+    for one classification, and which one -- see compute_checkpoint_comparisons.
+    """
+
+    classification: str
+    standard_horizon_sessions: int
+    best_checkpoint_sessions: int | None = None
+    best_checkpoint_meaningfully_better: bool = False
+    checkpoints: list[CheckpointOutcome] = field(default_factory=list)
+
+
+def compute_checkpoint_comparisons(
+    signals: Sequence[Any],
+    histories: Mapping[str, list[dict[str, Any]]],
+    *,
+    benchmark_symbol: str,
+    standard_horizon_days: int,
+    checkpoint_sessions: Sequence[int] = CHECKPOINT_SESSIONS,
+) -> dict[str, BestExitAnalysis]:
+    """For every classification, compute the realized-outcome range at each of
+    ``checkpoint_sessions`` (plus ``standard_horizon_days``, folded in if not already
+    among them), and determine whether any checkpoint's symbol-weighted mean is
+    meaningfully better than the standard horizon's.
+
+    "Meaningfully better" requires two things, both deliberately strict: the
+    checkpoint's 95% CI must sit entirely above the standard horizon's (its CI low
+    above the standard's CI high -- not just a higher point estimate, which is exactly
+    the multiple-comparisons trap this function exists to avoid, see the module
+    docstring), and the checkpoint's own outcome_sample_size must clear
+    MIN_OUTCOME_SAMPLE_SIZE. Among checkpoints that clear both bars, the one with the
+    highest symbol-weighted mean wins. If none clear the bar, that's a normal,
+    expected result -- ``best_checkpoint_sessions`` stays ``None`` and the standard
+    horizon is used as-is.
+
+    Reuses the exact same per-observation gathering ``validate_signals`` does, just
+    called once per checkpoint horizon instead of once, since ``forward_excess_return``
+    has to be recomputed from scratch at each horizon (a longer horizon needs more
+    trailing history to exist, so its usable sample can differ from a shorter one's).
+    """
+    benchmark_history = histories.get(benchmark_symbol.upper(), [])
+    benchmark_index = _date_index(benchmark_history)
+    symbol_indices: dict[str, dict[str, int]] = {}
+
+    # Dedupe while preserving order, so the standard horizon is always included exactly
+    # once regardless of whether it happens to already be one of checkpoint_sessions.
+    horizons = list(dict.fromkeys([*checkpoint_sessions, standard_horizon_days]))
+
+    checkpoints_by_classification: dict[str, list[CheckpointOutcome]] = {
+        name: [] for name in CLASSIFICATION_ORDER
+    }
+    for horizon in horizons:
+        excess_by_classification: dict[str, list[float]] = {name: [] for name in CLASSIFICATION_ORDER}
+        excess_by_symbol: dict[str, dict[str, list[float]]] = {name: {} for name in CLASSIFICATION_ORDER}
+        for signal in signals:
+            classification = _get(signal, "classification")
+            if classification not in excess_by_classification:
+                continue
+            symbol = str(_get(signal, "symbol") or "").upper()
+            signal_date = str(_get(signal, "signal_date") or "")[:10]
+            if not symbol or not signal_date:
+                continue
+            symbol_history = histories.get(symbol, [])
+            if symbol not in symbol_indices:
+                symbol_indices[symbol] = _date_index(symbol_history)
+            excess = forward_excess_return(
+                symbol_history, benchmark_history, signal_date, horizon,
+                symbol_index=symbol_indices[symbol], benchmark_index=benchmark_index,
+            )
+            if excess is None:
+                continue
+            excess_by_classification[classification].append(excess)
+            excess_by_symbol[classification].setdefault(symbol, []).append(excess)
+
+        for classification in CLASSIFICATION_ORDER:
+            values = excess_by_classification[classification]
+            n = len(values)
+            p10_excess = p90_excess = None
+            if n >= MIN_OUTCOME_SAMPLE_SIZE:
+                sorted_values = sorted(values)
+                p10_excess = _percentile(sorted_values, 0.10)
+                p90_excess = _percentile(sorted_values, 0.90)
+            per_symbol_means = [sum(v) / len(v) for v in excess_by_symbol[classification].values()]
+            symbol_mean = sum(per_symbol_means) / len(per_symbol_means) if per_symbol_means else None
+            ci_low, ci_high = _symbol_mean_confidence_interval(per_symbol_means)
+            checkpoints_by_classification[classification].append(
+                CheckpointOutcome(
+                    sessions=horizon,
+                    outcome_sample_size=n,
+                    p10_excess_return=p10_excess,
+                    p90_excess_return=p90_excess,
+                    symbol_mean_excess_return=symbol_mean,
+                    symbol_mean_excess_return_ci_low=ci_low,
+                    symbol_mean_excess_return_ci_high=ci_high,
+                )
+            )
+
+    results: dict[str, BestExitAnalysis] = {}
+    for classification in CLASSIFICATION_ORDER:
+        checkpoints = checkpoints_by_classification[classification]
+        standard = next((c for c in checkpoints if c.sessions == standard_horizon_days), None)
+        best_sessions: int | None = None
+        meaningfully_better = False
+        if standard is not None and standard.symbol_mean_excess_return_ci_high is not None:
+            candidates = [
+                c for c in checkpoints
+                if c.sessions != standard_horizon_days
+                and c.outcome_sample_size >= MIN_OUTCOME_SAMPLE_SIZE
+                and c.symbol_mean_excess_return_ci_low is not None
+                and c.symbol_mean_excess_return_ci_low > standard.symbol_mean_excess_return_ci_high
+            ]
+            if candidates:
+                best = max(candidates, key=lambda c: c.symbol_mean_excess_return)
+                best_sessions = best.sessions
+                meaningfully_better = True
+        results[classification] = BestExitAnalysis(
+            classification=classification,
+            standard_horizon_sessions=standard_horizon_days,
+            best_checkpoint_sessions=best_sessions,
+            best_checkpoint_meaningfully_better=meaningfully_better,
+            checkpoints=checkpoints,
+        )
+    return results
 
 
 def render_signal_validation_text(result: SignalValidationResult) -> str:
@@ -427,3 +615,29 @@ def render_signal_validation_text(result: SignalValidationResult) -> str:
             "the overlapping/clustered observations above."
         )
     return "\n".join(lines)
+
+
+def load_latest_signal_validation(reports_dir: Path) -> dict[str, Any] | None:
+    """Best-effort load of the most recent ``signal_validation_*.json`` artifact
+    (written by ``main.py validate-signals``) from ``reports_dir``.
+
+    ``validate-signals`` requires a fresh full-history backtest and is a manual,
+    occasional diagnostic (see README's "Evaluation honesty" section) — it is not
+    re-run as part of every daily ``recommend``/report. This surfaces its latest known
+    result as a dated annotation rather than recomputing it. Returns ``None`` (silently
+    — this is supplementary context, never required for a report or a recommendation
+    run) if no such artifact exists yet or it can't be parsed.
+    """
+    try:
+        candidates = sorted(
+            Path(reports_dir).glob("signal_validation_*.json"),
+            key=lambda path: path.stat().st_mtime,
+        )
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    try:
+        return json.loads(candidates[-1].read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None

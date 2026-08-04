@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 import pytest
 
 from stock_scrapper.analysis.signal_validation import (
+    MIN_OUTCOME_SAMPLE_SIZE,
+    compute_checkpoint_comparisons,
     forward_excess_return,
     render_signal_validation_text,
     two_proportion_z_test,
@@ -20,6 +24,13 @@ def _signal(symbol: str, signal_date: str, classification: str) -> dict[str, obj
 
 def _dates(count: int) -> list[str]:
     return [f"2024-01-{index + 1:02d}" for index in range(count)]
+
+
+def _long_dates(count: int) -> list[str]:
+    """Like ``_dates``, but safe past a single month (real calendar arithmetic) --
+    for fixtures that need dozens/hundreds of trailing rows."""
+    start = date(2020, 1, 1)
+    return [(start + timedelta(days=index)).isoformat() for index in range(count)]
 
 
 def test_forward_excess_return_computes_symbol_minus_benchmark() -> None:
@@ -308,3 +319,139 @@ def test_render_signal_validation_text_includes_key_sections() -> None:
     assert "symbol-weighted" in text
     assert "SPY" in text
     assert "fewer than" in text  # single-symbol bucket triggers the concentration footnote
+
+
+def test_validate_signals_leaves_percentiles_none_below_sample_size_floor() -> None:
+    dates = _dates(10)
+    histories = {
+        "SPY": _history(dates, [100] * 10),
+        "AAA": _history(dates, [100, 100, 100, 100, 100, 110, 100, 100, 100, 100]),
+    }
+    signals = [_signal("AAA", "2024-01-01", "Strong Candidate")]
+
+    result = validate_signals(signals, histories, benchmark_symbol="SPY", horizon_days=5)
+
+    bucket = {b.classification: b for b in result.buckets}["Strong Candidate"]
+    assert bucket.outcome_sample_size == 1
+    assert bucket.p10_excess_return is None
+    assert bucket.p90_excess_return is None
+    # Mean/median still populate regardless -- only the percentile range needs the floor.
+    assert bucket.mean_excess_return == pytest.approx(0.10)
+
+
+def test_validate_signals_computes_percentile_range_when_sample_size_clears_floor() -> None:
+    horizon = 5
+    n = 25
+    spacing = horizon + 1  # keeps every signal's entry/future window from overlapping
+    total_days = n * spacing + horizon + 2
+    dates = _long_dates(total_days)
+    prices = [100.0] * total_days
+    signals = []
+    for index in range(n):
+        entry_index = index * spacing
+        prices[entry_index + horizon] = 100.0 * (1 + index / 100.0)  # 0%, 1%, ..., 24%
+        signals.append(_signal("AAA", dates[entry_index], "Strong Candidate"))
+    histories = {"SPY": _history(dates, [100.0] * total_days), "AAA": _history(dates, prices)}
+
+    result = validate_signals(signals, histories, benchmark_symbol="SPY", horizon_days=horizon)
+
+    bucket = {b.classification: b for b in result.buckets}["Strong Candidate"]
+    assert bucket.outcome_sample_size == 25
+    # Linear-interpolation percentile of 0%, 1%, ..., 24%: p10 -> position 2.4, p90 -> position 21.6.
+    assert bucket.p10_excess_return == pytest.approx(0.024, abs=1e-6)
+    assert bucket.p90_excess_return == pytest.approx(0.216, abs=1e-6)
+
+
+def _checkpoint_fixture(
+    *, better_horizon: int | None, better_return: float = 0.05, base_return: float = 0.01,
+    signals_per_symbol: int = 4, symbol_count: int = 5,
+) -> tuple[list[dict[str, object]], dict[str, list[dict[str, object]]]]:
+    """Builds a fixture where every symbol's every signal has the exact same excess
+    return at each checkpoint horizon (zero cross-symbol variance -> the symbol-weighted
+    CI degenerates to a single point), so "meaningfully better" reduces to a plain
+    greater-than comparison on deterministic numbers instead of a statistical judgment
+    call. ``better_horizon`` (if given) gets ``better_return``; every other checkpoint
+    horizon gets ``base_return`` for every signal.
+    """
+    from stock_scrapper.analysis.signal_validation import CHECKPOINT_SESSIONS
+
+    spacing = max(CHECKPOINT_SESSIONS) + 10
+    total_days = signals_per_symbol * spacing + max(CHECKPOINT_SESSIONS) + 5
+    dates = _long_dates(total_days)
+    histories: dict[str, list[dict[str, object]]] = {"SPY": _history(dates, [100.0] * total_days)}
+    signals: list[dict[str, object]] = []
+    for symbol_index in range(symbol_count):
+        symbol = f"SYM{symbol_index}"
+        prices = [100.0] * total_days
+        for signal_index in range(signals_per_symbol):
+            entry_index = signal_index * spacing
+            for horizon in CHECKPOINT_SESSIONS:
+                return_for_horizon = better_return if horizon == better_horizon else base_return
+                prices[entry_index + horizon] = 100.0 * (1 + return_for_horizon)
+            signals.append(_signal(symbol, dates[entry_index], "Strong Candidate"))
+        histories[symbol] = _history(dates, prices)
+    return signals, histories
+
+
+def test_compute_checkpoint_comparisons_picks_meaningfully_better_checkpoint() -> None:
+    signals, histories = _checkpoint_fixture(better_horizon=26)
+
+    results = compute_checkpoint_comparisons(
+        signals, histories, benchmark_symbol="SPY", standard_horizon_days=21,
+    )
+
+    analysis = results["Strong Candidate"]
+    assert analysis.best_checkpoint_meaningfully_better is True
+    assert analysis.best_checkpoint_sessions == 26
+    sessions_seen = sorted(c.sessions for c in analysis.checkpoints)
+    assert sessions_seen == [5, 10, 15, 21, 26, 31]
+    winner = next(c for c in analysis.checkpoints if c.sessions == 26)
+    assert winner.p10_excess_return == pytest.approx(0.05)
+    assert winner.outcome_sample_size == 20
+
+
+def test_compute_checkpoint_comparisons_no_winner_when_nothing_beats_standard() -> None:
+    signals, histories = _checkpoint_fixture(better_horizon=None)
+
+    results = compute_checkpoint_comparisons(
+        signals, histories, benchmark_symbol="SPY", standard_horizon_days=21,
+    )
+
+    analysis = results["Strong Candidate"]
+    assert analysis.best_checkpoint_meaningfully_better is False
+    assert analysis.best_checkpoint_sessions is None
+    assert len(analysis.checkpoints) == 6
+
+
+def test_compute_checkpoint_comparisons_requires_outcome_sample_size_floor() -> None:
+    # Only 3 signals per symbol per checkpoint (well below MIN_OUTCOME_SAMPLE_SIZE=20
+    # when spread across just enough symbols), even though checkpoint 26's numbers
+    # would otherwise "win" on the numbers alone.
+    signals_per_symbol = 3
+    symbol_count = 5
+    assert signals_per_symbol * symbol_count < MIN_OUTCOME_SAMPLE_SIZE
+    signals, histories = _checkpoint_fixture(
+        better_horizon=26, signals_per_symbol=signals_per_symbol, symbol_count=symbol_count,
+    )
+
+    results = compute_checkpoint_comparisons(
+        signals, histories, benchmark_symbol="SPY", standard_horizon_days=21,
+    )
+
+    analysis = results["Strong Candidate"]
+    assert analysis.best_checkpoint_meaningfully_better is False
+    assert analysis.best_checkpoint_sessions is None
+
+
+def test_compute_checkpoint_comparisons_folds_in_standard_horizon_even_if_not_a_checkpoint() -> None:
+    signals, histories = _checkpoint_fixture(better_horizon=None)
+
+    results = compute_checkpoint_comparisons(
+        signals, histories, benchmark_symbol="SPY", standard_horizon_days=17,
+        checkpoint_sessions=(5, 10, 15, 21, 26, 31),
+    )
+
+    analysis = results["Strong Candidate"]
+    assert analysis.standard_horizon_sessions == 17
+    sessions_seen = sorted(c.sessions for c in analysis.checkpoints)
+    assert sessions_seen == [5, 10, 15, 17, 21, 26, 31]

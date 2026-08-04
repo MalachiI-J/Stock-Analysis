@@ -697,3 +697,145 @@ def test_symbol_without_history_does_not_inherit_another_symbols_data_date(
     with paths["csv"].open("r", encoding="utf-8", newline="") as handle:
         by_symbol = {row["symbol"]: row for row in csv.DictReader(handle)}
     assert by_symbol["MISSING"]["data_through_date"] == ""
+
+
+def test_phase2_report_shows_historical_outcome_range_with_dollar_equivalent(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    payload = _recommendations_payload(recommendations=[
+        {
+            "symbol": "NVDA", "action": "BUY", "shares": 10.0, "estimated_dollars": 500.0,
+            "reason": "Strong trend", "classification": "Strong Candidate",
+            "outcome_p10": -0.03, "outcome_p90": 0.087,
+            "best_exit_sessions": None, "best_exit_date": "2025-01-28", "checkpoints_compared": [],
+        },
+    ])
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
+    assert "Historical pattern: -3.0% to +8.7% excess return" in section
+    assert "-$15.00 to +$43.50 on this size" in section
+    assert 'data-outcome-p10="-0.03"' in section
+    assert 'data-outcome-p90="0.087"' in section
+    assert 'class="rec-outcome mono rec-outcome-value"' in section
+
+
+def test_phase2_report_shows_insufficient_history_message_when_outcome_range_missing(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    payload = _recommendations_payload(recommendations=[
+        {
+            "symbol": "NVDA", "action": "BUY", "shares": 10.0, "estimated_dollars": 500.0,
+            "reason": "Strong trend", "classification": "Strong Candidate",
+            "outcome_p10": None, "outcome_p90": None,
+            "best_exit_sessions": None, "best_exit_date": "2025-01-28", "checkpoints_compared": [],
+        },
+    ])
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
+    assert "Not enough historical data yet for Strong Candidate to show an outcome range." in section
+    assert "data-outcome-p10" not in section
+
+
+def test_phase2_report_best_time_to_sell_shows_good_headline_when_checkpoint_wins(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    payload = _recommendations_payload(recommendations=[
+        {
+            "symbol": "NVDA", "action": "BUY", "shares": 10.0, "estimated_dollars": 500.0,
+            "reason": "Strong trend", "classification": "Strong Candidate",
+            "outcome_p10": -0.03, "outcome_p90": 0.087,
+            "best_exit_sessions": 26, "best_exit_date": "2025-02-04",
+            "checkpoints_compared": [
+                {"sessions": 21, "date": "2025-01-28", "p10_excess_return": -0.02, "p90_excess_return": 0.06, "outcome_sample_size": 40},
+                {"sessions": 26, "date": "2025-02-04", "p10_excess_return": 0.01, "p90_excess_return": 0.09, "outcome_sample_size": 40},
+            ],
+        },
+    ])
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
+    assert '<div class="rec-exit-headline status-good">~5 weeks out &middot; around 2025-02-04</div>' in section
+    assert "This window historically stood out among the checkpoints compared for this setup." in section
+    assert "Recalculated every time this report runs" in section
+    assert "see all checkpoints compared" in section
+    assert "~4 weeks (2025-01-28): -2.0% to +6.0%" in section
+    assert "~5 weeks (2025-02-04): +1.0% to +9.0%" in section
+
+
+def test_phase2_report_best_time_to_sell_shows_hold_headline_when_nothing_wins(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    payload = _recommendations_payload(recommendations=[
+        {
+            "symbol": "NVDA", "action": "BUY", "shares": 10.0, "estimated_dollars": 500.0,
+            "reason": "Strong trend", "classification": "Strong Candidate",
+            "outcome_p10": -0.02, "outcome_p90": 0.06,
+            "best_exit_sessions": None, "best_exit_date": "2025-01-28",
+            "checkpoints_compared": [
+                {"sessions": 21, "date": "2025-01-28", "p10_excess_return": -0.02, "p90_excess_return": 0.06, "outcome_sample_size": 40},
+            ],
+        },
+    ])
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
+    assert '<div class="rec-exit-headline status-neutral">Hold until next month &middot; past 2025-01-28</div>' in section
+    assert "No shorter window meaningfully outperformed the standard ~1 month horizon." in section
+
+
+def test_phase2_report_omits_outcome_and_exit_blocks_for_sell_items(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    payload = _recommendations_payload(recommendations=[
+        {
+            "symbol": "AAPL", "action": "SELL", "shares": 5.0, "estimated_dollars": 900.0,
+            "reason": "Exit rule triggered", "classification": "Avoid",
+            "outcome_p10": -0.05, "outcome_p90": 0.02,
+            "best_exit_sessions": 5, "best_exit_date": "2025-01-07",
+            "checkpoints_compared": [{"sessions": 5, "date": "2025-01-07", "p10_excess_return": -0.05, "p90_excess_return": 0.02, "outcome_sample_size": 40}],
+        },
+    ])
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
+    sell_section = section.split("Sell —")[1]
+    assert "rec-outcome" not in sell_section
+    assert "rec-exit" not in sell_section
+    assert "Best time to sell" not in sell_section
+
+
+def test_phase2_report_resize_widget_js_recomputes_outcome_range(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    payload = _recommendations_payload(
+        cash_reserve=0.05, max_position_weight=0.15,
+        max_trade_dollar_amount=2000.0, min_trade_dollar_amount=100.0,
+        recommendations=[
+            {
+                "symbol": "NVDA", "action": "BUY", "shares": 10.0, "estimated_dollars": 500.0,
+                "reason": "Strong trend", "classification": "Strong Candidate",
+                "outcome_p10": -0.03, "outcome_p90": 0.087,
+                "best_exit_sessions": None, "best_exit_date": "2025-01-28", "checkpoints_compared": [],
+            },
+        ],
+    )
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    assert "function signedMoney(value)" in content
+    assert "function pct(value)" in content
+    assert ".rec-outcome-value" in content
+    assert 'outcomeSpan.textContent = "—";' in content
