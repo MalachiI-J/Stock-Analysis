@@ -23,13 +23,21 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any, Mapping, Sequence
 
 from stock_scrapper.models.analysis_models import AnalysisResult
 from stock_scrapper.portfolio import HoldingAssessment, PortfolioPosition
+from stock_scrapper.utilities.business_days import add_business_days
 
 _BUY_ELIGIBLE_CLASSIFICATIONS_STRICT = ("Strong Candidate",)
 _BUY_ELIGIBLE_CLASSIFICATIONS_RELAXED = ("Strong Candidate", "Candidate")
+
+# Falls back to this when no signal_validation artifact is on file at all (main.py
+# validate-signals hasn't been run yet) -- matches config/prediction_rules.yaml's own
+# horizon_days default, so "Hold until next month" still resolves to a real date even
+# with zero historical-outcome data behind it.
+_DEFAULT_STANDARD_HORIZON_DAYS = 21
 
 
 @dataclass(slots=True)
@@ -44,6 +52,16 @@ class TradeRecommendation:
     model_probability: float | None = None
     predict_v5_excess_return: float | None = None
     predict_v5_low_confidence: bool = False
+    # BUY-only historical-outcome context (see stock_scrapper.analysis.signal_validation);
+    # SELL items leave all of these at their defaults. classification is the candidate's
+    # score_v1 classification at the time of this recommendation, used to look up the
+    # matching bucket/checkpoint data -- not necessarily anything about a held position.
+    classification: str | None = None
+    outcome_p10: float | None = None
+    outcome_p90: float | None = None
+    best_exit_sessions: int | None = None
+    best_exit_date: str | None = None
+    checkpoints_compared: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -71,6 +89,67 @@ class RecommendationRunResult:
     min_trade_dollar_amount: float | None = None
 
 
+def _outcome_context(
+    signal_validation: Mapping[str, Any] | None,
+    classification: str,
+    as_of: date,
+    default_standard_horizon_days: int,
+) -> dict[str, Any]:
+    """Historical-outcome context for one BUY's classification, from the latest
+    ``main.py validate-signals`` artifact (see ``_latest_signal_validation_summary``-
+    style loading in ``report_builder.py`` / ``main.py``'s ``recommend`` handler).
+
+    Degrades gracefully when there's no artifact yet, or this classification never
+    got a ``best_exit_by_classification`` entry (e.g. zero backtested samples): the
+    range/best-exit-sessions/checkpoints all come back empty, but ``best_exit_date``
+    still resolves against ``default_standard_horizon_days`` -- "hold to the standard
+    horizon" is always a real date, even with no richer data behind it yet.
+    """
+    entry = None
+    if isinstance(signal_validation, Mapping):
+        by_classification = signal_validation.get("best_exit_by_classification")
+        if isinstance(by_classification, Mapping):
+            candidate = by_classification.get(classification)
+            if isinstance(candidate, Mapping):
+                entry = candidate
+
+    if entry is None:
+        exit_date = add_business_days(as_of, default_standard_horizon_days).isoformat()
+        return {
+            "outcome_p10": None, "outcome_p90": None,
+            "best_exit_sessions": None, "best_exit_date": exit_date,
+            "checkpoints_compared": [],
+        }
+
+    standard_sessions = int(entry.get("standard_horizon_sessions") or default_standard_horizon_days)
+    checkpoints = [c for c in (entry.get("checkpoints") or []) if isinstance(c, Mapping)]
+    checkpoints_sorted = sorted(checkpoints, key=lambda c: c.get("sessions") or 0)
+    standard_checkpoint = next((c for c in checkpoints_sorted if c.get("sessions") == standard_sessions), None)
+
+    meaningfully_better = bool(entry.get("best_checkpoint_meaningfully_better"))
+    best_sessions = entry.get("best_checkpoint_sessions") if meaningfully_better else None
+    effective_sessions = int(best_sessions) if best_sessions is not None else standard_sessions
+
+    checkpoints_compared = [
+        {
+            "sessions": checkpoint.get("sessions"),
+            "date": add_business_days(as_of, int(checkpoint.get("sessions") or 0)).isoformat(),
+            "p10_excess_return": checkpoint.get("p10_excess_return"),
+            "p90_excess_return": checkpoint.get("p90_excess_return"),
+            "outcome_sample_size": checkpoint.get("outcome_sample_size"),
+        }
+        for checkpoint in checkpoints_sorted
+    ]
+
+    return {
+        "outcome_p10": standard_checkpoint.get("p10_excess_return") if standard_checkpoint else None,
+        "outcome_p90": standard_checkpoint.get("p90_excess_return") if standard_checkpoint else None,
+        "best_exit_sessions": int(best_sessions) if best_sessions is not None else None,
+        "best_exit_date": add_business_days(as_of, effective_sessions).isoformat(),
+        "checkpoints_compared": checkpoints_compared,
+    }
+
+
 def build_recommendations(
     *,
     as_of_date: str,
@@ -82,11 +161,14 @@ def build_recommendations(
     model_probability_by_symbol: Mapping[str, float] | None = None,
     predict_v5_excess_return_by_symbol: Mapping[str, float] | None = None,
     predict_v5_low_confidence_by_symbol: Mapping[str, bool] | None = None,
+    signal_validation: Mapping[str, Any] | None = None,
+    standard_horizon_days: int = _DEFAULT_STANDARD_HORIZON_DAYS,
 ) -> RecommendationRunResult:
     """Compute SELL signals for held positions and sized BUY candidates for the rest."""
     model_probability_by_symbol = model_probability_by_symbol or {}
     predict_v5_excess_return_by_symbol = predict_v5_excess_return_by_symbol or {}
     predict_v5_low_confidence_by_symbol = predict_v5_low_confidence_by_symbol or {}
+    as_of = date.fromisoformat(as_of_date)
     held_symbols = {position.symbol for position in positions}
     account_value = float(rules["account_value"])
     available_cash = float(rules["available_cash"])
@@ -180,6 +262,7 @@ def build_recommendations(
             skipped.append(f"{result.symbol}: price (${price:,.2f}) is too high for the affordable size")
             continue
         estimated_dollars = shares * price
+        outcome = _outcome_context(signal_validation, result.classification, as_of, standard_horizon_days)
         recommendations.append(
             TradeRecommendation(
                 symbol=result.symbol, action="BUY", shares=float(shares),
@@ -187,6 +270,12 @@ def build_recommendations(
                 model_probability=model_probability_by_symbol.get(result.symbol),
                 predict_v5_excess_return=predict_v5_excess_return_by_symbol.get(result.symbol),
                 predict_v5_low_confidence=predict_v5_low_confidence_by_symbol.get(result.symbol, False),
+                classification=result.classification,
+                outcome_p10=outcome["outcome_p10"],
+                outcome_p90=outcome["outcome_p90"],
+                best_exit_sessions=outcome["best_exit_sessions"],
+                best_exit_date=outcome["best_exit_date"],
+                checkpoints_compared=outcome["checkpoints_compared"],
             )
         )
         spendable -= estimated_dollars

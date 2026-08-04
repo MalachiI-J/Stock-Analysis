@@ -18,7 +18,12 @@ import yaml
 from stock_scrapper.analysis.repository import results_from_saved_run
 from stock_scrapper.analysis.scoring_config import validate_scoring_config
 from stock_scrapper.analysis.risk_diagnostics import investigate_classification, render_risk_diagnostics_text
-from stock_scrapper.analysis.signal_validation import render_signal_validation_text, validate_signals
+from stock_scrapper.analysis.signal_validation import (
+    compute_checkpoint_comparisons,
+    load_latest_signal_validation,
+    render_signal_validation_text,
+    validate_signals,
+)
 from stock_scrapper.analysis.service import AnalysisBatch, AnalysisService
 from stock_scrapper.backtesting.config import BacktestConfig, load_backtesting_config
 from stock_scrapper.backtesting.engine import PortfolioBacktestResult, run_portfolio_backtest
@@ -1936,6 +1941,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 as_of_text = str(saved.get("as_of_date"))[:10]
             effective = _parse_date(as_of_text, field="as-of date")
             trading_rules = load_trading_rules(base_dir)
+            # Unconditional (unlike the predict/predict-v5 block below, which is skipped
+            # under --no-model): the standard evaluation horizon and the latest
+            # validate-signals artifact drive best-time-to-sell context independent of
+            # whether the experimental prediction models ran this time.
+            standard_horizon_days = int(load_prediction_rules(base_dir).get("horizon_days", 21))
+            signal_validation = load_latest_signal_validation(Path(config["reports_dir"]))
             initialize_database(config["database_path"])
             conn = create_connection(config["database_path"])
             try:
@@ -2012,6 +2023,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 model_probability_by_symbol=model_probability_by_symbol,
                 predict_v5_excess_return_by_symbol=predict_v5_excess_return_by_symbol,
                 predict_v5_low_confidence_by_symbol=predict_v5_low_confidence_by_symbol,
+                signal_validation=signal_validation,
+                standard_horizon_days=standard_horizon_days,
             )
             text = render_recommendations_text(outcome)
             print(text)
@@ -2040,6 +2053,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "model_probability": rec.model_probability,
                             "predict_v5_excess_return": rec.predict_v5_excess_return,
                             "predict_v5_low_confidence": rec.predict_v5_low_confidence,
+                            "classification": rec.classification,
+                            "outcome_p10": rec.outcome_p10,
+                            "outcome_p90": rec.outcome_p90,
+                            "best_exit_sessions": rec.best_exit_sessions,
+                            "best_exit_date": rec.best_exit_date,
+                            "checkpoints_compared": rec.checkpoints_compared,
                         }
                         for rec in outcome.recommendations
                     ],
@@ -2635,12 +2654,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result.signals, histories,
                 benchmark_symbol=typed.benchmark, horizon_days=horizon_days,
             )
+            # Which forward checkpoint (if any) meaningfully beats the standard horizon
+            # per classification — feeds the recommend report's best-time-to-sell block.
+            # Same signals/histories, so this is directly comparable to `validation` above.
+            best_exit_by_classification = compute_checkpoint_comparisons(
+                result.signals, histories,
+                benchmark_symbol=typed.benchmark, standard_horizon_days=horizon_days,
+            )
             print(f"backtest run: {result.run.run_id}")
             print(render_signal_validation_text(validation))
             report_path = Path(config["reports_dir"]) / f"signal_validation_{result.run.run_id}.json"
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_path.write_text(
-                json.dumps({"backtest_run_id": result.run.run_id, **asdict(validation)}, indent=2),
+                json.dumps(
+                    {
+                        "backtest_run_id": result.run.run_id,
+                        **asdict(validation),
+                        "best_exit_by_classification": {
+                            classification: asdict(analysis)
+                            for classification, analysis in best_exit_by_classification.items()
+                        },
+                    },
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
             print(f"report: {report_path}")

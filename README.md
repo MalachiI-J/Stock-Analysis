@@ -75,6 +75,28 @@ ride along in `recommendations_<date>.summary.json` for exactly this purpose; th
 button is silently omitted for older summary files written before this existed, or
 when there are no BUYs to resize, rather than rendering a broken widget.
 
+Each BUY card also carries a **historical outcome range** and a **best-time-to-sell**
+block, both sourced from the latest `main.py validate-signals` artifact (see
+"Evaluation honesty" below) — descriptive history, never a live prediction. The
+outcome range is the 10th/90th percentile of that classification's actual forward
+excess returns (not a confidence interval on the mean — a CI answers "how sure are we
+of the average," this answers "how wide do real outcomes get"), shown as both a
+percentage range and its dollar-equivalent on that BUY's current size; below 20
+underlying observations it's left unshown with a plain "not enough history yet"
+note rather than a range built on too little data
+(`stock_scrapper.analysis.signal_validation.MIN_OUTCOME_SAMPLE_SIZE`). Best-time-to-sell
+compares the standard ~1-month (21-session) evaluation horizon against five other
+forward checkpoints (~1, 2, 3, 5, and 6 weeks) and only recommends a shorter or longer
+window when its 95% CI sits entirely above the standard horizon's — not just a higher
+point estimate, which is exactly the multiple-comparisons trap a naive "pick the best
+number" approach would fall into. When nothing clears that bar (the normal case), the
+card reads "Hold until next month" instead of asserting a false edge. An expandable "see
+all checkpoints compared" detail shows the real numbers behind the headline. All of this
+is recalculated fresh on every `recommend` run and both dates are approximate calendar
+translations of a session count (`stock_scrapper.utilities.business_days`, weekday-only,
+not market-holiday-aware) — re-run `recommend` for current guidance, don't treat a stale
+report's dates as still accurate.
+
 `recommend-review` closes the accountability loop: the backtester and the
 predictor's walk-forward folds both validate the underlying rules against
 history, but neither tells you whether one specific past `recommend` run —

@@ -1101,6 +1101,11 @@ def test_recommend_command_writes_sized_buy_recommendation(
             "symbol": "AAA", "action": "BUY", "shares": 10.0,
             "estimated_dollars": 500.0, "reason": "Strong trend", "model_probability": None,
             "predict_v5_excess_return": None, "predict_v5_low_confidence": False,
+            # No signal_validation artifact is on file in this test -- outcome range
+            # and best-exit-checkpoint context stay empty, but best_exit_date still
+            # resolves against the real config/prediction_rules.yaml horizon_days (21).
+            "classification": "Strong Candidate", "outcome_p10": None, "outcome_p90": None,
+            "best_exit_sessions": None, "best_exit_date": "2025-01-29", "checkpoints_compared": [],
         }
     ]
     # Sizing-rule constants a report needs for its client-side "what if" resize widget.
@@ -1108,6 +1113,68 @@ def test_recommend_command_writes_sized_buy_recommendation(
     assert summary["max_position_weight"] == 0.5
     assert summary["max_trade_dollar_amount"] == 1000.0
     assert summary["min_trade_dollar_amount"] == 10.0
+
+
+def test_recommend_command_uses_latest_signal_validation_artifact_for_outcome_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When a main.py validate-signals artifact is on file, recommend threads its
+    best_exit_by_classification data through onto the matching BUY(s)."""
+    from stock_scrapper.database import create_connection, initialize_database, upsert_price_history
+
+    _install_startup(monkeypatch, tmp_path)
+    _install_recommend_saved_run(monkeypatch)
+    _install_recommend_trading_rules(monkeypatch)
+    config = _config(tmp_path)
+    initialize_database(config["database_path"])
+    conn = create_connection(config["database_path"])
+    try:
+        upsert_price_history(conn, _seed_price_row("AAA", "2024-12-31", 50.0))
+        conn.commit()
+    finally:
+        conn.close()
+
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "signal_validation_backtest-001.json").write_text(
+        json.dumps({
+            "backtest_run_id": "backtest-001",
+            "best_exit_by_classification": {
+                "Strong Candidate": {
+                    "classification": "Strong Candidate",
+                    "standard_horizon_sessions": 21,
+                    "best_checkpoint_sessions": 26,
+                    "best_checkpoint_meaningfully_better": True,
+                    "checkpoints": [
+                        {
+                            "sessions": 21, "outcome_sample_size": 40,
+                            "p10_excess_return": -0.02, "p90_excess_return": 0.06,
+                        },
+                        {
+                            "sessions": 26, "outcome_sample_size": 40,
+                            "p10_excess_return": 0.01, "p90_excess_return": 0.09,
+                        },
+                    ],
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    assert cli.main(["recommend", "--run-id", "saved-run", "--no-model"]) == int(ExitCode.SUCCESS)
+
+    summary_path = reports_dir / "recommendations_2024-12-31.summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    buy = summary["recommendations"][0]
+    assert buy["outcome_p10"] == -0.02
+    assert buy["outcome_p90"] == 0.06
+    assert buy["best_exit_sessions"] == 26
+    from datetime import date
+
+    from stock_scrapper.utilities.business_days import add_business_days
+    assert buy["best_exit_date"] == add_business_days(date(2024, 12, 31), 26).isoformat()
+    assert [c["sessions"] for c in buy["checkpoints_compared"]] == [21, 26]
 
 
 def test_recommend_command_attaches_predict_v5_context_to_buy_recommendations(
