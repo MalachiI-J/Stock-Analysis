@@ -517,25 +517,43 @@ _REPORT_STYLES = """\
     .rec-list { display:flex; flex-direction:column; gap:8px; }
     .rec-card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:12px 16px; }
     .rec-card-head { display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
-    .rec-symbol { font-size:15px; font-weight:600; }
+    /* The two things that matter at a glance: which symbol, and how much of it. */
+    .rec-symbol, .rec-sizing-value { font-size:16px; font-weight:600; }
     .rec-reason { color:var(--muted); margin-top:4px; }
     .rec-context { font-size:12.5px; margin-top:6px; }
-    /* Historical outcome range (p10/p90) and best-time-to-sell -- BUY-only context,
-       see _best_time_to_sell_html() and the "checkpoints_compared" data. */
-    .rec-outcome { font-size:12.5px; margin-top:6px; color:var(--ink-2); }
-    .rec-exit { margin-top:10px; padding-top:10px; border-top:1px solid var(--line); }
+    /* Historical outcome range (p10/p90) -- BUY-only context, folded into
+       .rec-details below; see _best_time_to_sell_html() and "checkpoints_compared". */
+    .rec-outcome { font-size:12.5px; color:var(--ink-2); }
+    /* Best-time-to-sell callout: promoted right after the header, reading as a
+       second headline rather than another detail line. Reuses the existing
+       status-good/status-neutral modifiers so this is driven by the same data the
+       headline text already reflects, never separate per-item logic. */
+    .rec-exit-callout { margin-top:8px; padding:8px 12px; border-radius:8px;
+      border:1px solid var(--border); background:var(--hover-bg); }
+    .rec-exit-callout.status-good { background:var(--good-bg); border-color:var(--good-border); }
     .rec-exit-label { font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
     .rec-exit-headline { font-weight:600; font-size:14px; margin-top:3px; }
     .rec-exit-headline.status-good { color:var(--good-fg); }
     .rec-exit-headline.status-neutral { color:var(--ink); }
-    .rec-exit-note { font-size:12.5px; color:var(--ink-2); margin-top:3px; }
+    .rec-exit-note { font-size:12.5px; color:var(--ink-2); }
     .rec-exit-recalc { font-size:11.5px; margin-top:5px; }
-    /* Same ▸/▾ marker convention as details.raw and .notice details. */
-    .rec-exit details { margin-top:8px; font-size:12.5px; }
-    .rec-exit details > summary { cursor:pointer; color:var(--muted); list-style:none; user-select:none; }
-    .rec-exit details > summary::-webkit-details-marker { display:none; }
-    .rec-exit details > summary::before { content:"▸ "; }
-    .rec-exit details[open] > summary::before { content:"▾ "; }
+    /* Everything but the header stat and the promoted callout -- reason, model
+       context, historical pattern, exit explanation, recalc note, checkpoints --
+       collapses behind this one toggle. Same ▸/▾ marker convention as details.raw
+       and .notice details. When sizing failed, the callout itself moves in here
+       too (see rows() in report_builder.py and applyResize()/reset() in the
+       resize widget's JS), since an unsized position isn't actionable right now. */
+    .rec-details { margin-top:8px; font-size:12.5px; }
+    .rec-details > summary { cursor:pointer; color:var(--muted); list-style:none; user-select:none; }
+    .rec-details > summary::-webkit-details-marker { display:none; }
+    .rec-details > summary::before { content:"▸ "; }
+    .rec-details[open] > summary::before { content:"▾ "; }
+    .rec-details-body > * + * { margin-top:6px; }
+    .rec-details details { margin-top:8px; }
+    .rec-details details > summary { cursor:pointer; color:var(--muted); list-style:none; user-select:none; }
+    .rec-details details > summary::-webkit-details-marker { display:none; }
+    .rec-details details > summary::before { content:"▸ "; }
+    .rec-details details[open] > summary::before { content:"▾ "; }
     .rec-exit-checkpoints { list-style:none; margin:6px 0 0; padding:0; }
     .rec-exit-checkpoints li { padding:3px 0; border-bottom:1px solid var(--line); color:var(--ink-2); }
     .rec-exit-checkpoints li:last-child { border-bottom:none; }
@@ -1440,6 +1458,27 @@ def _account_adjust_widget_html(
       minTradeDollarAmount: {min_trade_dollar_amount!r}
     }};
 
+    // The best-time-to-sell callout is only promoted out of Details while its item
+    // is actually sized (see rows() in report_builder.py). Record where the server
+    // originally put it, once, so reset() can restore that exact original layout
+    // rather than assuming "always promoted".
+    document.querySelectorAll("[data-price]").forEach(function (item) {{
+      var callout = item.querySelector(".rec-exit-callout");
+      if (callout) item.dataset.calloutHome = callout.parentElement === item ? "card" : "details";
+    }});
+
+    function collapseCallout(item) {{
+      var callout = item.querySelector(".rec-exit-callout");
+      var body = item.querySelector(".rec-details-body");
+      if (callout && body && callout.parentElement !== body) body.insertBefore(callout, body.firstChild);
+    }}
+
+    function promoteCallout(item) {{
+      var callout = item.querySelector(".rec-exit-callout");
+      var details = item.querySelector(".rec-details");
+      if (callout && details && callout.parentElement !== item) item.insertBefore(callout, details);
+    }}
+
     function money(value) {{
       return "$" + value.toLocaleString("en-US", {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
     }}
@@ -1478,6 +1517,7 @@ def _account_adjust_widget_html(
           item.classList.add("rec-item-excluded");
           valueSpan.textContent = "Not sized — no cash left at this level";
           if (outcomeSpan) outcomeSpan.textContent = "—";
+          collapseCallout(item);
           return;
         }}
         var targetDollars = Math.min(rules.maxTradeDollarAmount, maxPositionDollars, spendable);
@@ -1495,6 +1535,7 @@ def _account_adjust_widget_html(
           valueSpan.textContent = "Not sized — " + bottleneck + " is below the " +
             money(rules.minTradeDollarAmount) + " minimum trade";
           if (outcomeSpan) outcomeSpan.textContent = "—";
+          collapseCallout(item);
           if (spendable < rules.minTradeDollarAmount) exhausted = true;
           return;
         }}
@@ -1503,6 +1544,7 @@ def _account_adjust_widget_html(
           item.classList.add("rec-item-excluded");
           valueSpan.textContent = "Not sized — price too high for the affordable size";
           if (outcomeSpan) outcomeSpan.textContent = "—";
+          collapseCallout(item);
           return;
         }}
         var estimatedDollars = shares * price;
@@ -1512,6 +1554,7 @@ def _account_adjust_widget_html(
             " excess return (~" + signedMoney(targetDollars * outcomeP10) + " to " +
             signedMoney(targetDollars * outcomeP90) + " on this size)";
         }}
+        promoteCallout(item);
         spendable -= estimatedDollars;
       }});
       if (summaryLine) {{
@@ -1535,6 +1578,11 @@ def _account_adjust_widget_html(
         if (outcomeSpan) {{
           var outcomeOriginal = outcomeSpan.getAttribute("data-original");
           if (outcomeOriginal !== null) outcomeSpan.textContent = outcomeOriginal;
+        }}
+        if (item.dataset.calloutHome === "card") {{
+          promoteCallout(item);
+        }} else if (item.dataset.calloutHome === "details") {{
+          collapseCallout(item);
         }}
       }});
       if (summaryLine) summaryLine.textContent = summaryLine.getAttribute("data-original");
@@ -1563,24 +1611,44 @@ def _checkpoint_week_label(sessions: Any) -> str:
     return f"~{weeks} week" + ("" if weeks == 1 else "s")
 
 
-def _best_time_to_sell_html(item: Mapping[str, Any]) -> str:
-    """Best-time-to-sell card for one BUY: which forward checkpoint (if any)
+def _short_date_label(iso_date: str) -> str:
+    """"2026-08-22" -> "Aug 22" -- a scannable headline date, not a new precision
+    claim. The ISO form stays available in checkpoints_compared, where consistency
+    with best_exit_date matters more than scannability."""
+    try:
+        parsed = date.fromisoformat(iso_date)
+    except ValueError:
+        return iso_date
+    return f"{parsed:%b} {parsed.day}"
+
+
+def _best_time_to_sell_html(item: Mapping[str, Any]) -> tuple[str, str]:
+    """Best-time-to-sell context for one BUY: which forward checkpoint (if any)
     historically, meaningfully outperformed the standard evaluation horizon for this
     classification -- see ``compute_checkpoint_comparisons`` in
     ``stock_scrapper.analysis.signal_validation``. Degrades to a plain "hold to
     standard horizon" headline when nothing cleared that bar (the normal case, not
     an error) or no ``validate-signals`` artifact exists yet at all.
+
+    Returns ``(callout_html, detail_html)``: the callout is the promoted headline
+    meant to sit right after the card header; the detail is the supporting
+    explanation/recalc-note/checkpoints list meant to live behind the card's
+    collapsed "details" toggle. Both are "" when there's nothing to show.
     """
     best_exit_sessions = _finite_number(item.get("best_exit_sessions"))
     best_exit_date = item.get("best_exit_date")
     if not best_exit_date:
-        return ""
+        return "", ""
     if best_exit_sessions is not None:
-        headline = f"{_checkpoint_week_label(best_exit_sessions)} out &middot; around {_escape(str(best_exit_date))}"
+        short_date = _short_date_label(str(best_exit_date))
+        headline = f"{_checkpoint_week_label(best_exit_sessions)} out &middot; around {_escape(short_date)}"
         headline_status = "good"
         explanation = "This window historically stood out among the checkpoints compared for this setup."
     else:
-        headline = f"Hold until next month &middot; past {_escape(str(best_exit_date))}"
+        # No date here: the hold case is always roughly the same ~month-out
+        # horizon regardless of the specific date, so a date added clutter without
+        # information -- and "past {date}" read like the date already happened.
+        headline = "Hold &middot; check back in about a month"
         headline_status = "neutral"
         explanation = "No shorter window meaningfully outperformed the standard ~1 month horizon."
 
@@ -1597,21 +1665,24 @@ def _best_time_to_sell_html(item: Mapping[str, Any]) -> str:
                 f"<li>{_checkpoint_week_label(checkpoint.get('sessions'))} "
                 f"({_display(checkpoint.get('date'))}): {_escape(range_text)}</li>"
             )
-    details_html = (
+    checkpoints_html = (
         f'<details><summary>see all checkpoints compared</summary>'
         f'<ul class="rec-exit-checkpoints">{"".join(checkpoint_rows)}</ul></details>'
         if checkpoint_rows else ""
     )
-    return (
-        '<div class="rec-exit">'
+    callout_html = (
+        f'<div class="rec-exit-callout status-{headline_status}">'
         '<div class="rec-exit-label muted">Best time to sell</div>'
         f'<div class="rec-exit-headline status-{headline_status}">{headline}</div>'
+        "</div>"
+    )
+    detail_html = (
         f'<div class="rec-exit-note">{_escape(explanation)}</div>'
         '<div class="rec-exit-recalc muted">Recalculated every time this report runs '
         "&mdash; re-run for current guidance.</div>"
-        f"{details_html}"
-        "</div>"
+        f"{checkpoints_html}"
     )
+    return callout_html, detail_html
 
 
 def _recommendations_section_html(summary: Mapping[str, Any] | None) -> str:
@@ -1663,11 +1734,13 @@ def _recommendations_section_html(summary: Mapping[str, Any] | None) -> str:
             if resizable and shares is not None and dollars is not None and shares > 0:
                 price_attr = f' data-price="{dollars / shares:.6f}"'
 
+            reason_html = f'<div class="rec-reason">{_display(item.get("reason"))}</div>'
+
             # Historical outcome range and best-time-to-sell are BUY-only context (see
             # stock_scrapper.trading.recommendations._outcome_context) — SELL rows call
-            # rows(sells) without resizable=True, so this block never runs for them.
-            outcome_html = ""
-            exit_html = ""
+            # rows(sells) without resizable=True, so this branch never runs for them,
+            # and a SELL card keeps its plain (uncollapsed) reason + context layout.
+            callout_html = ""
             if resizable:
                 outcome_p10 = _finite_number(item.get("outcome_p10"))
                 outcome_p90 = _finite_number(item.get("outcome_p90"))
@@ -1691,7 +1764,29 @@ def _recommendations_section_html(summary: Mapping[str, Any] | None) -> str:
                     classification_label = _display(item.get("classification"))
                     outcome_text = f"Not enough historical data yet for {classification_label} to show an outcome range."
                     outcome_html = f'<div class="rec-outcome muted">{_escape(outcome_text)}</div>'
-                exit_html = _best_time_to_sell_html(item)
+                callout_html, exit_detail_html = _best_time_to_sell_html(item)
+
+                # Everything but the header stat and the promoted callout collapses
+                # behind one "details" toggle, so the card reads as: symbol/price,
+                # best-time-to-sell, then a single quiet line for the rest.
+                details_body = f"{reason_html}{context_html}{outcome_html}{exit_detail_html}"
+
+                # A sizing failure (shares/dollars never resolved) means the position
+                # isn't actionable right now -- the callout isn't promoted for it, it
+                # folds into Details along with everything else instead. Checked here
+                # for the Python-rendered initial state; applyResize()/reset() in the
+                # widget's JS handle the equivalent transition after a live resize.
+                is_not_sized = shares is None or dollars is None or shares <= 0
+                if is_not_sized and callout_html:
+                    details_body = callout_html + details_body
+                    callout_html = ""
+
+                body_html = (
+                    f'<details class="rec-details"><summary>details</summary>'
+                    f'<div class="rec-details-body">{details_body}</div></details>'
+                )
+            else:
+                body_html = f"{reason_html}{context_html}"
 
             cards.append(
                 f'<div class="rec-card"{price_attr}>'
@@ -1699,10 +1794,8 @@ def _recommendations_section_html(summary: Mapping[str, Any] | None) -> str:
                 f'<span class="mono rec-symbol">{_display(item.get("symbol"))}</span>'
                 f'<span class="mono rec-sizing-value" data-original="{_escape(sizing_text)}">{_escape(sizing_text)}</span>'
                 "</div>"
-                f'<div class="rec-reason">{_display(item.get("reason"))}</div>'
-                f"{context_html}"
-                f"{outcome_html}"
-                f"{exit_html}"
+                f"{callout_html}"
+                f"{body_html}"
                 "</div>"
             )
         return '<div class="rec-list">' + "".join(cards) + "</div>"

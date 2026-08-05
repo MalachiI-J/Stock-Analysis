@@ -762,7 +762,7 @@ def test_phase2_report_best_time_to_sell_shows_good_headline_when_checkpoint_win
 
     content = paths["html"].read_text(encoding="utf-8")
     section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
-    assert '<div class="rec-exit-headline status-good">~5 weeks out &middot; around 2025-02-04</div>' in section
+    assert '<div class="rec-exit-headline status-good">~5 weeks out &middot; around Feb 4</div>' in section
     assert "This window historically stood out among the checkpoints compared for this setup." in section
     assert "Recalculated every time this report runs" in section
     assert "see all checkpoints compared" in section
@@ -789,7 +789,7 @@ def test_phase2_report_best_time_to_sell_shows_hold_headline_when_nothing_wins(t
 
     content = paths["html"].read_text(encoding="utf-8")
     section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
-    assert '<div class="rec-exit-headline status-neutral">Hold until next month &middot; past 2025-01-28</div>' in section
+    assert '<div class="rec-exit-headline status-neutral">Hold &middot; check back in about a month</div>' in section
     assert "No shorter window meaningfully outperformed the standard ~1 month horizon." in section
 
 
@@ -839,3 +839,65 @@ def test_phase2_report_resize_widget_js_recomputes_outcome_range(tmp_path: Path)
     assert "function pct(value)" in content
     assert ".rec-outcome-value" in content
     assert 'outcomeSpan.textContent = "—";' in content
+    assert "function collapseCallout(item)" in content
+    assert "function promoteCallout(item)" in content
+
+
+def test_phase2_report_promotes_best_time_to_sell_callout_and_collapses_the_rest(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    payload = _recommendations_payload(recommendations=[
+        {
+            "symbol": "NVDA", "action": "BUY", "shares": 10.0, "estimated_dollars": 500.0,
+            "reason": "Strong trend", "model_probability": 0.6,
+            "predict_v5_excess_return": 0.234, "predict_v5_low_confidence": True,
+            "classification": "Strong Candidate",
+            "outcome_p10": -0.03, "outcome_p90": 0.087,
+            "best_exit_sessions": 26, "best_exit_date": "2025-02-04",
+            "checkpoints_compared": [],
+        },
+    ])
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
+    card = section.split('class="rec-card"')[1]
+    # The callout sits between the header and the details toggle -- promoted, not
+    # buried behind it.
+    head_end = card.index("</div>")
+    callout_index = card.index('class="rec-exit-callout')
+    details_index = card.index('class="rec-details"')
+    assert head_end < callout_index < details_index
+    # Reason, model context, historical pattern, and the exit explanation are all
+    # folded into the one details toggle rather than sitting always-visible.
+    details_body = card[details_index:]
+    assert "Strong trend" in details_body
+    assert "model 60% beats benchmark" in details_body
+    assert "Historical pattern" in details_body
+    assert "This window historically stood out" in details_body
+    assert "Strong trend" not in card[:details_index]
+
+
+def test_phase2_report_collapses_callout_when_item_is_not_sized_initially(tmp_path: Path) -> None:
+    metadata, results, histories, issues, previous = _report_inputs()
+    payload = _recommendations_payload(recommendations=[
+        {
+            "symbol": "NVDA", "action": "BUY", "shares": None, "estimated_dollars": None,
+            "reason": "Strong trend", "classification": "Strong Candidate",
+            "outcome_p10": -0.03, "outcome_p90": 0.087,
+            "best_exit_sessions": 26, "best_exit_date": "2025-02-04",
+            "checkpoints_compared": [],
+        },
+    ])
+    (tmp_path / "recommendations_2024-12-31.summary.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    paths = write_phase2_reports(tmp_path, "2024-12-31", metadata, results, histories, issues, previous_results=previous)
+
+    content = paths["html"].read_text(encoding="utf-8")
+    section = content.split("Today's Recommendations")[1].split("Candidate Ranking")[0]
+    card = section.split('class="rec-card"')[1]
+    details_index = card.index('class="rec-details"')
+    callout_index = card.index('class="rec-exit-callout')
+    # Not sized -- the callout isn't promoted, it lives inside the details toggle.
+    assert callout_index > details_index
