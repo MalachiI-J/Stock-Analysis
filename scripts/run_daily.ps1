@@ -2,31 +2,36 @@
 Runs the daily Stock Scrapper pipeline unattended: collects/validates/analyzes/reports
 (`main.py run`), writes a plain-language buy/watch/sell digest (`main.py digest`),
 computes sized advisory trade recommendations (`main.py recommend` — suggestions
-only, nothing is ever bought or sold automatically), builds a combined local HTML
-dashboard (`main.py dashboard` — today's digest, recommendations, and portfolio
-holdings in one page, cheap to build since it reads `recommend`'s own saved output
-rather than retraining predict/predict-v5), shows a combined summary as a Windows
-toast notification, opens the dashboard (falling back to that day's canonical Phase 2
-HTML report if the dashboard wasn't produced) in the default browser, then deletes log
-files and unreferenced report artifacts (old digest/recommendations/dashboard/
-data-health/screener files; never analysis/backtest reports tied to a saved run) older
-than the configured retention window (`main.py cleanup-logs --include-reports`).
+only, nothing is ever bought or sold automatically), then regenerates the canonical
+Phase 2 HTML report (`main.py report`, no args — reuses the analysis run `main.py run`
+already saved, so this is a cheap rebuild, not a re-analysis) so that report picks up
+the recommendations that didn't exist yet when `run` first built it. Also builds the
+combined local HTML dashboard (`main.py dashboard` — today's digest, recommendations,
+and portfolio holdings in one page, cheap to build since it reads `recommend`'s own
+saved output rather than retraining predict/predict-v5) as a secondary artifact. Shows
+a combined summary as a Windows toast notification, opens that day's canonical Phase 2
+HTML report — the one with account value/cash, sized buy/sell recommendations, and the
+per-symbol charts, favicon included (falling back to the dashboard if the report step
+above didn't produce a file) — in the default browser, then deletes log files and
+unreferenced report artifacts (old digest/recommendations/dashboard/data-health/
+screener files; never analysis/backtest reports tied to a saved run) older than the
+configured retention window (`main.py cleanup-logs --include-reports`).
 Intended to be invoked by Windows Task Scheduler once per day, after the market close
 plus the configured provider delay (see market_data.provider_delay_minutes in
 config/settings.yaml).
 
-If `run`, `digest`, or `recommend` exits nonzero, a distinct "Stock Scrapper daily
-run FAILED" toast fires instead of the usual summary — a silent absence of the usual
-toast is easy to miss and is exactly how a prior pipeline interruption went unnoticed
-for a while; a failure now always produces its own visible notification, listing each
-step's exit code and the log file to check.
+If `run`, `digest`, `recommend`, or the post-recommend `report` rebuild exits nonzero,
+a distinct "Stock Scrapper daily run FAILED" toast fires instead of the usual summary —
+a silent absence of the usual toast is easy to miss and is exactly how a prior pipeline
+interruption went unnoticed for a while; a failure now always produces its own visible
+notification, listing each step's exit code and the log file to check.
 
 The toast notification and report auto-open both require an interactive logon
 session, which is why this task is registered with LogonType=Interactive rather
 than running detached. The report is located by its documented canonical filename
 pattern (`stock_summary_<date>_candidates_<hash>.html`) rather than by parsing
-`main.py run`'s output; if `run` failed to produce a report for today, opening is
-skipped and noted in the log rather than treated as a fatal error. Auto-open is
+`main.py report`'s output; if that step failed to produce a report for today, opening
+falls back to the dashboard rather than treating it as a fatal error. Auto-open is
 gated by `open_reports_automatically` in config/settings.yaml, so it can be
 turned off without editing this script.
 
@@ -62,6 +67,13 @@ $digestExit = $LASTEXITCODE
 cmd.exe /c "`"$pythonExe`" main.py recommend >> `"$logFile`" 2>&1"
 $recommendExit = $LASTEXITCODE
 
+# Rebuilds the same canonical report `run` already wrote, now that recommend's output
+# exists on disk -- cheap (reuses the saved analysis run, no re-collection/re-analysis)
+# and is what makes the auto-opened report actually show today's buy/sell advice
+# instead of the "run recommend first" placeholder `run` alone would have left behind.
+cmd.exe /c "`"$pythonExe`" main.py report >> `"$logFile`" 2>&1"
+$reportRebuildExit = $LASTEXITCODE
+
 cmd.exe /c "`"$pythonExe`" main.py dashboard >> `"$logFile`" 2>&1"
 $dashboardExit = $LASTEXITCODE
 
@@ -69,17 +81,17 @@ $today = Get-Date -Format "yyyy-MM-dd"
 $summaryPath = Join-Path $RepoRoot "reports\digest_$today.summary.json"
 $recommendPath = Join-Path $RepoRoot "reports\recommendations_$today.summary.json"
 
-# A nonzero exit from run/digest/recommend/dashboard must never pass silently: without
-# this, a failure just looks like "no toast appeared today" (the digest summary for
-# today's date was never written), which is easy to miss and is exactly how the
-# pipeline previously went uninterrupted-but-unnoticed. This check fires regardless of
-# whether either summary file exists, so a failure is always its own distinct,
-# visible notification.
-$pipelineFailed = ($runExit -ne 0) -or ($digestExit -ne 0) -or ($recommendExit -ne 0) -or ($dashboardExit -ne 0)
+# A nonzero exit from run/digest/recommend/report-rebuild/dashboard must never pass
+# silently: without this, a failure just looks like "no toast appeared today" (the
+# digest summary for today's date was never written), which is easy to miss and is
+# exactly how the pipeline previously went uninterrupted-but-unnoticed. This check
+# fires regardless of whether either summary file exists, so a failure is always its
+# own distinct, visible notification.
+$pipelineFailed = ($runExit -ne 0) -or ($digestExit -ne 0) -or ($recommendExit -ne 0) -or ($reportRebuildExit -ne 0) -or ($dashboardExit -ne 0)
 
 if ($pipelineFailed) {
     $failureTitle = "Stock Scrapper daily run FAILED"
-    $failureMessage = "run=$runExit digest=$digestExit recommend=$recommendExit dashboard=$dashboardExit`nSee $(Split-Path $logFile -Leaf) in logs\"
+    $failureMessage = "run=$runExit digest=$digestExit recommend=$recommendExit report=$reportRebuildExit dashboard=$dashboardExit`nSee $(Split-Path $logFile -Leaf) in logs\"
     try {
         & (Join-Path $PSScriptRoot "send_toast.ps1") -Title $failureTitle -Message $failureMessage *>> $logFile
     } catch {
@@ -112,30 +124,32 @@ if ($pipelineFailed) {
 
 $openReportsSetting = (& $pythonExe -c "from stock_scrapper.config import load_config; print(bool(load_config().get('open_reports_automatically', False)))").Trim()
 if ($openReportsSetting -eq "True") {
-    # Prefer the dashboard (digest + recommendations + holdings in one page, with a
-    # link to the full report) over opening the raw candidates report directly; fall
-    # back to the old behavior if the dashboard step above didn't produce a file, so
-    # this is never a regression from before the dashboard existed.
-    $dashboardFile = Join-Path $RepoRoot "reports\dashboard_$today.html"
-    if (Test-Path $dashboardFile) {
+    # Prefer the canonical Phase 2 report -- it has the account value/cash panel,
+    # sized buy/sell recommendations, every per-symbol chart, and the favicon, and by
+    # this point in the pipeline (after the post-recommend rebuild above) it reflects
+    # today's recommendations rather than the placeholder `run` alone would have left.
+    # Fall back to the dashboard if that rebuild didn't produce a file, so this is
+    # never a regression from before the report rebuild step existed.
+    $reportFile = Get-ChildItem -Path (Join-Path $RepoRoot "reports") -Filter "stock_summary_${today}_candidates_*.html" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($reportFile) {
         try {
-            Start-Process $dashboardFile
-            Add-Content -Path $logFile -Value "Opened dashboard: $dashboardFile"
+            Start-Process $reportFile.FullName
+            Add-Content -Path $logFile -Value "Opened report: $($reportFile.FullName)"
         } catch {
-            Add-Content -Path $logFile -Value "Dashboard auto-open skipped: $_"
+            Add-Content -Path $logFile -Value "Report auto-open skipped: $_"
         }
     } else {
-        $reportFile = Get-ChildItem -Path (Join-Path $RepoRoot "reports") -Filter "stock_summary_${today}_candidates_*.html" -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        if ($reportFile) {
+        $dashboardFile = Join-Path $RepoRoot "reports\dashboard_$today.html"
+        if (Test-Path $dashboardFile) {
             try {
-                Start-Process $reportFile.FullName
-                Add-Content -Path $logFile -Value "Dashboard not found; opened report instead: $($reportFile.FullName)"
+                Start-Process $dashboardFile
+                Add-Content -Path $logFile -Value "Report not found; opened dashboard instead: $dashboardFile"
             } catch {
-                Add-Content -Path $logFile -Value "Report auto-open skipped: $_"
+                Add-Content -Path $logFile -Value "Dashboard auto-open skipped: $_"
             }
         } else {
-            Add-Content -Path $logFile -Value "Auto-open skipped: no dashboard or stock_summary_${today}_candidates_*.html report found"
+            Add-Content -Path $logFile -Value "Auto-open skipped: no stock_summary_${today}_candidates_*.html report or dashboard found"
         }
     }
 } else {
@@ -145,6 +159,6 @@ if ($openReportsSetting -eq "True") {
 cmd.exe /c "`"$pythonExe`" main.py cleanup-logs --include-reports >> `"$logFile`" 2>&1"
 $cleanupExit = $LASTEXITCODE
 
-Add-Content -Path $logFile -Value "=== Stock Scrapper daily run finished $(Get-Date -Format o): run=$runExit digest=$digestExit recommend=$recommendExit dashboard=$dashboardExit cleanup=$cleanupExit ==="
+Add-Content -Path $logFile -Value "=== Stock Scrapper daily run finished $(Get-Date -Format o): run=$runExit digest=$digestExit recommend=$recommendExit report=$reportRebuildExit dashboard=$dashboardExit cleanup=$cleanupExit ==="
 
-exit ([Math]::Max($runExit, [Math]::Max($digestExit, [Math]::Max($recommendExit, [Math]::Max($dashboardExit, $cleanupExit)))))
+exit ([Math]::Max($runExit, [Math]::Max($digestExit, [Math]::Max($recommendExit, [Math]::Max($reportRebuildExit, [Math]::Max($dashboardExit, $cleanupExit))))))
